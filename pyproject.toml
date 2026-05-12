@@ -1,0 +1,33 @@
+[project]
+name = "marketing-agency"
+version = "0.1.0"
+description = "Multi-tenant AI performance marketing agency with LangGraph supervisor/worker agents"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.50",
+    "langchain-anthropic>=0.3.0",
+    "langchain-core>=0.3.0",
+    "pydantic>=2.9",
+    "pyyaml>=6.0.2",
+    "python-dotenv>=1.0",
+    "streamlit>=1.40",
+    "fpdf2>=2.8",
+    "requests>=2.32",
+    "anthropic>=0.40",
+]
+
+[project.optional-dependencies]
+strategist = ["tavily-python>=0.5", "apify-client>=1.8"]
+producer = []
+dev = ["pytest>=8.3", "ruff>=0.7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "agents*", "ui*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
