@@ -16,6 +16,7 @@ dependencies = [
     "anthropic>=0.40",
     "tavily-python>=0.5",
     "apify-client>=1.8",
+    "PyJWT>=2.9",
 ]
 
 [project.optional-dependencies]
