@@ -1,23 +1,24 @@
-"""Strategist worker — researches competitors, extracts winning hooks, writes
+"""Strategist worker - researches competitors, extracts winning hooks, writes
 findings to MASTER_CONTEXT.md, and generates a PDF report.
 
 Architecture: a LangGraph create_react_agent wraps ChatAnthropic with three
 tool families:
-  1. Discovery — Tavily (competitor search) + Apify (FB Ads Library scrape).
-  2. Analysis — longevity scorer (filters < 14-day ads as unproven).
-  3. State mutation — wraps ClientContext methods so the LLM can persist hooks,
+  1. Discovery - Tavily (competitor search) + Apify (FB Ads Library scrape).
+  2. Analysis - longevity scorer (filters < 14-day ads as unproven).
+  3. State mutation - wraps ClientContext methods so the LLM can persist hooks,
      referral motions, and narrative summaries straight into MASTER_CONTEXT.md.
 
-The state mutators are built as closures over the loaded ClientContext so the
-LLM never has to thread client_id through tool calls.
+Model selection is explicit per run (no env-var default): the caller must
+supply config['configurable']['model']. The Streamlit UI exposes this as a
+selectbox; main.py exposes it as --model.
 """
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
@@ -32,6 +33,7 @@ from core.context_schema import (
     ReferralMotion,
     WinningHook,
 )
+from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
 
 
@@ -48,7 +50,7 @@ Your workflow this turn:
   1. If the user didn't name competitors, call `tavily_competitor_search` to
      identify 3-5 of them in {client_locale}.
   2. Call `search_fb_ads_library` for those competitors.
-  3. Pass the raw ads through `score_ads_by_longevity` (min_days=14) — only
+  3. Pass the raw ads through `score_ads_by_longevity` (min_days=14) - only
      ads that have run >= 14 days count as proven hooks.
   4. For each *pattern* (not each ad), call `record_winning_hook`. A pattern
      is a recurring angle like "price comparison shock", not a one-off line.
@@ -132,7 +134,7 @@ def _build_context_writers(ctx: ClientContext):
     @tool("score_ads_by_longevity")
     def score_ads_by_longevity(ads: list[dict], min_days: int = 14) -> list[dict]:
         """Filter and rank ads by how long they have been running. Drops
-        anything under min_days (default 14) — proven hooks only."""
+        anything under min_days (default 14) - proven hooks only."""
         return score_ads(ads, min_days=min_days)
 
     @tool("generate_pdf_report")
@@ -172,7 +174,17 @@ def _format_brand_context(fm) -> str:
     return " | ".join(parts) if parts else "(none recorded - run an initial brand audit)"
 
 
-def strategist_node(state: AgentState) -> dict[str, Any]:
+def strategist_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    # Explicit per-run model selection - no env-var default.
+    model_name = (config or {}).get("configurable", {}).get("model")
+    if not model_name:
+        raise ValueError(
+            "Model not selected. The Strategist requires an explicit model "
+            "choice per run. Pass via config={'configurable': {'model': '<id>'}}. "
+            f"Supported: {', '.join(SUPPORTED_MODEL_IDS)}."
+        )
+    validate_model_id(model_name)
+
     ctx = ClientContext.load(state["client_id"])
     fm, _ = ctx.read()
 
@@ -182,11 +194,7 @@ def strategist_node(state: AgentState) -> dict[str, Any]:
         *_build_context_writers(ctx),
     ]
 
-    llm = ChatAnthropic(
-        model=os.getenv("STRATEGIST_MODEL", "claude-sonnet-4-6"),
-        max_tokens=4096,
-        temperature=0.2,
-    )
+    llm = ChatAnthropic(model=model_name, max_tokens=4096, temperature=0.2)
 
     system_prompt = SYSTEM_PROMPT.format(
         client_name=fm.client.name,
@@ -203,8 +211,9 @@ def strategist_node(state: AgentState) -> dict[str, Any]:
     # add_messages reducer would otherwise duplicate the original user input.
     new_messages = result["messages"][len(state["messages"]):]
 
-    # Surface the generated PDF path (if any) into shared artifacts.
+    # Surface the model used + generated PDF path into shared artifacts.
     artifacts = dict(state.get("artifacts") or {})
+    artifacts["model_used"] = model_name
     for msg in reversed(new_messages):
         if hasattr(msg, "name") and msg.name == "generate_pdf_report":
             artifacts["strategist_report_pdf"] = msg.content

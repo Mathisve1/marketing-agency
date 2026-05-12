@@ -1,4 +1,4 @@
-"""Streamlit Command Center — Phase 1 shell.
+"""Streamlit Command Center - Phase 1 + 2 shell.
 
 Run with:  streamlit run ui/app.py
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core.client_context import ClientContext, list_clients
+from core.models import SUPPORTED_MODELS
 from core.supervisor import build_supervisor_graph, initial_state
 
 
@@ -53,25 +54,50 @@ with tab_run:
         "Instruction for the Supervisor",
         placeholder="e.g. Research Colruyt's top-performing Facebook competitors and extract winning hooks.",
     )
+
+    # Explicit per-run model selection - no hidden default.
+    model_label = st.selectbox(
+        "Model",
+        options=list(SUPPORTED_MODELS.keys()),
+        index=0,
+        help=(
+            "Pick the model for this run. Sonnet 4.6 is faster and cheaper for "
+            "routine research; Opus 4.7 reasons more deeply but costs ~3x more."
+        ),
+    )
+    model_id = SUPPORTED_MODELS[model_label]
+
     if st.button("Dispatch", type="primary", disabled=not prompt.strip()):
         graph = build_supervisor_graph()
-        result = graph.invoke(
-            initial_state(selection, prompt),
-            config={"configurable": {"thread_id": f"{selection}-ui"}},
-        )
+        with st.spinner(f"Running supervisor with {model_id}..."):
+            result = graph.invoke(
+                initial_state(selection, prompt),
+                config={"configurable": {
+                    "thread_id": f"{selection}-ui",
+                    "model": model_id,
+                }},
+            )
         if result.get("error"):
             st.error(result["error"])
         else:
-            st.success(f"Routed to: **{result['current_agent']}**  (task: {result['task_type']})")
+            st.success(
+                f"Routed to: **{result['current_agent']}**  "
+                f"(task: {result['task_type']}, model: `{model_id}`)"
+            )
             for msg in result["messages"]:
                 st.markdown(f"**{msg.__class__.__name__}**: {msg.content}")
+            artifacts = result.get("artifacts") or {}
+            if artifacts:
+                st.divider()
+                st.caption("Artifacts produced this run:")
+                st.json(artifacts)
 
 with tab_ctx:
     st.markdown(body)
 
 with tab_hooks:
     if not fm.winning_hooks:
-        st.info("No winning hooks yet — the Strategist will populate these on first run.")
+        st.info("No winning hooks yet - the Strategist will populate these on first run.")
     else:
         for h in fm.winning_hooks:
             st.markdown(f"**{h.id}** · {h.pattern}  \n_{h.description}_")
@@ -82,7 +108,7 @@ with tab_hooks:
 
 with tab_constraints:
     if not fm.negative_constraints:
-        st.info("No negative constraints yet — the Analyst writes these from live performance data.")
+        st.info("No negative constraints yet - the Analyst writes these from live performance data.")
     else:
         for c in fm.negative_constraints:
             st.markdown(f"**{c.id}** ({c.severity.value}) · {c.rule}")
