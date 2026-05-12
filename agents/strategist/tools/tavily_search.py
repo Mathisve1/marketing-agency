@@ -1,24 +1,57 @@
-"""Tavily competitor search tool — import-stable stub.
+"""LangChain tool: discover top competitors via Tavily web search.
 
-The full implementation lands in Phase 2 (2/2). Until then this module exposes
-the expected symbol so `agents/strategist/agent.py` imports cleanly and the
-LangGraph supervisor stays loadable.
+Returns the top `limit` search results for "competitors of {brand} in {country}".
+The Strategist's react-agent LLM extracts competitor brand names from the
+titles and snippets in its next reasoning step.
 """
 from __future__ import annotations
 
+import os
+from typing import Any
+
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from tavily import TavilyClient
+
+
+class TavilySearchInput(BaseModel):
+    brand: str = Field(..., description="Client brand name to find competitors of.")
+    country: str = Field(
+        "BE",
+        description="ISO 3166-1 alpha-2 country code for geographic scoping.",
+        pattern=r"^[A-Z]{2}$",
+    )
+    limit: int = Field(5, description="Number of search results to return.", ge=1, le=10)
 
 
 def make_tavily_competitor_search_tool():
     """Factory matching the pattern of make_fb_ads_search_tool."""
 
-    @tool("tavily_competitor_search")
+    @tool("tavily_competitor_search", args_schema=TavilySearchInput)
     def tavily_competitor_search(brand: str, country: str = "BE", limit: int = 5) -> list[dict]:
-        """Find the top `limit` competitor brands for `brand` in `country`.
-        Returns each competitor's name, website, and a one-line positioning
-        summary based on web search results."""
-        raise NotImplementedError(
-            "tavily_search not yet implemented — pending Phase 2 (2/2)."
+        """Search the web for top competitors of `brand` in `country`. Returns a
+        list of search results (title, url, snippet, score). Use this when the
+        user did not name competitors explicitly. Extract competitor brand names
+        from the titles/snippets, then pass them to search_fb_ads_library."""
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            raise RuntimeError("TAVILY_API_KEY is not set. Add it to .env.")
+
+        client = TavilyClient(api_key=api_key)
+        query = f"top competitors of {brand} consumer brand in {country}"
+        response: dict[str, Any] = client.search(
+            query=query,
+            search_depth="advanced",
+            max_results=limit * 2,  # over-fetch then trim, accounts for low-quality hits
         )
+        return [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "snippet": (r.get("content", "") or "")[:500],  # cap to keep LLM context tight
+                "score": r.get("score"),
+            }
+            for r in (response.get("results") or [])[:limit]
+        ]
 
     return tavily_competitor_search

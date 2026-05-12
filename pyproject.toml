@@ -14,10 +14,11 @@ dependencies = [
     "fpdf2>=2.8",
     "requests>=2.32",
     "anthropic>=0.40",
+    "tavily-python>=0.5",
+    "apify-client>=1.8",
 ]
 
 [project.optional-dependencies]
-strategist = ["tavily-python>=0.5", "apify-client>=1.8"]
 producer = []
 dev = ["pytest>=8.3", "ruff>=0.7"]
 
