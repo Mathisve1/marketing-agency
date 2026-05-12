@@ -69,12 +69,19 @@ def build_supervisor_graph(checkpointer: Optional[MemorySaver] = None):
     return g.compile(checkpointer=checkpointer or MemorySaver())
 
 
-def initial_state(client_id: str, user_message: str) -> AgentState:
-    """Helper for callers (CLI, Streamlit) to build a starting state."""
+def initial_state(
+    client_id: str,
+    user_message: str,
+    task_type: Optional[str] = None,
+) -> AgentState:
+    """Helper for callers (CLI, Streamlit) to build a starting state.
+
+    Pass `task_type` to skip the keyword router and route directly to a worker.
+    """
     return {
         "messages": [HumanMessage(content=user_message)],
         "client_id": client_id,
-        "task_type": None,
+        "task_type": task_type,
         "current_agent": None,
         "artifacts": {},
         "error": None,

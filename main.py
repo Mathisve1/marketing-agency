@@ -8,6 +8,9 @@ from core.models import SUPPORTED_MODEL_IDS
 from core.supervisor import build_supervisor_graph, initial_state
 
 
+TASK_TYPE_CHOICES = ["research", "produce", "analyze"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--client", required=True, help="client_id (folder under clients/)")
@@ -18,11 +21,17 @@ def main() -> int:
         choices=list(SUPPORTED_MODEL_IDS),
         help="Anthropic model ID (explicit per-run selection required).",
     )
+    parser.add_argument(
+        "--task-type",
+        choices=TASK_TYPE_CHOICES,
+        default=None,
+        help="Optional explicit task type. Omit to use the supervisor's keyword router.",
+    )
     args = parser.parse_args()
 
     graph = build_supervisor_graph()
     result = graph.invoke(
-        initial_state(args.client, args.prompt),
+        initial_state(args.client, args.prompt, task_type=args.task_type),
         config={"configurable": {
             "thread_id": f"{args.client}-cli",
             "model": args.model,
