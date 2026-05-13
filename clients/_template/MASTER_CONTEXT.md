@@ -1,5 +1,5 @@
 ---
-schema_version: 1
+schema_version: 2
 client:
   id: _template
   name: "[Client Name]"
@@ -11,10 +11,6 @@ brand:
   forbidden_terms: []
   primary_products: []
   brand_safety_notes: null
-
-winning_hooks: []
-referral_motions: []
-negative_constraints: []
 
 performance_benchmarks:
   roas_target: null

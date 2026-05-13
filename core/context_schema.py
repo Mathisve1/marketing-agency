@@ -1,7 +1,16 @@
-"""Pydantic models for MASTER_CONTEXT.md frontmatter.
+"""Pydantic models for MASTER_CONTEXT.md frontmatter + SQL DDL for the
+client's local SQLite database.
 
-The frontmatter is the canonical machine-readable surface shared across agents.
-The markdown body below it is free-form prose for LLM context only.
+V1.2 refactor: the three dynamic lists (winning_hooks, referral_motions,
+negative_constraints) moved from YAML frontmatter into a per-client
+SQLite database (clients/<id>/client_data.db). MASTER_CONTEXT.md now
+holds only static metadata: client identity, brand voice / forbidden
+terms / primary products, performance benchmarks, asset inventory paths.
+
+The Pydantic models for the dynamic items (WinningHook, ReferralMotion,
+NegativeConstraint) are kept verbatim - they're still the canonical
+in-memory representation, used as tool args / return types / SQL row
+adapters. Only their *storage location* changed.
 """
 from __future__ import annotations
 
@@ -45,11 +54,11 @@ class Brand(BaseModel):
 
 
 class WinningHook(BaseModel):
-    id: str = ""                       # blank on creation -> auto-assigned by ClientContext
+    id: str = ""                       # blank on creation -> auto-assigned via SQL
     pattern: str
     description: str
     source_ad_id: Optional[str] = None
-    days_active: Optional[int] = None  # longevity proxy
+    days_active: Optional[int] = None
     confidence: Confidence = Confidence.MEDIUM
     added_by: AddedBy
     added_at: datetime
@@ -89,14 +98,82 @@ class AssetInventory(BaseModel):
 
 
 class MasterContext(BaseModel):
-    """Top-level schema for MASTER_CONTEXT.md frontmatter."""
-    model_config = ConfigDict(extra="forbid")
+    """V1.2 frontmatter: STATIC client metadata only.
 
-    schema_version: int = 1
+    Dynamic lists (winning_hooks, referral_motions, negative_constraints)
+    moved to clients/<id>/client_data.db. Use ClientContext.get_winning_hooks
+    / get_referral_motions / get_negative_constraints to fetch them.
+
+    extra='ignore' rather than 'forbid' so pre-V1.2 YAML files (which still
+    carry the dropped list keys) load without error during the auto-migration.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    schema_version: int = 2
     client: ClientIdentity
     brand: Brand = Field(default_factory=Brand)
-    winning_hooks: list[WinningHook] = Field(default_factory=list)
-    referral_motions: list[ReferralMotion] = Field(default_factory=list)
-    negative_constraints: list[NegativeConstraint] = Field(default_factory=list)
     performance_benchmarks: PerformanceBenchmarks = Field(default_factory=PerformanceBenchmarks)
     asset_inventory: AssetInventory = Field(default_factory=AssetInventory)
+
+
+# --------------------------------------------------------------------------- #
+# SQL DDL - executed by ClientContext._init_db() on first load.
+# CHECK constraints mirror the Pydantic enum value-sets so the DB rejects
+# invalid rows even if a future caller bypasses Pydantic.
+# --------------------------------------------------------------------------- #
+
+SQL_DDL_WINNING_HOOKS = """
+CREATE TABLE IF NOT EXISTS winning_hooks (
+    id            TEXT PRIMARY KEY,
+    pattern       TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    source_ad_id  TEXT,
+    days_active   INTEGER,
+    confidence    TEXT NOT NULL CHECK(confidence IN ('high', 'medium', 'low')),
+    added_by      TEXT NOT NULL CHECK(added_by IN ('strategist', 'analyst', 'producer', 'human')),
+    added_at      TEXT NOT NULL
+)
+"""
+
+SQL_INDEX_WINNING_HOOKS = """
+CREATE INDEX IF NOT EXISTS idx_winning_hooks_confidence_added_at
+    ON winning_hooks (confidence, added_at DESC)
+"""
+
+SQL_DDL_REFERRAL_MOTIONS = """
+CREATE TABLE IF NOT EXISTS referral_motions (
+    id                TEXT PRIMARY KEY,
+    description       TEXT NOT NULL,
+    reference_path    TEXT NOT NULL,
+    pacing            TEXT,
+    camera_style      TEXT,
+    duration_seconds  INTEGER,
+    added_by          TEXT NOT NULL CHECK(added_by IN ('strategist', 'analyst', 'producer', 'human')),
+    added_at          TEXT NOT NULL
+)
+"""
+
+SQL_DDL_NEGATIVE_CONSTRAINTS = """
+CREATE TABLE IF NOT EXISTS negative_constraints (
+    id                  TEXT PRIMARY KEY,
+    rule                TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    severity            TEXT NOT NULL CHECK(severity IN ('hard', 'soft')),
+    added_by            TEXT NOT NULL CHECK(added_by IN ('strategist', 'analyst', 'producer', 'human')),
+    added_at            TEXT NOT NULL,
+    source_log_entries  TEXT NOT NULL DEFAULT '[]'
+)
+"""
+
+SQL_INDEX_NEGATIVE_CONSTRAINTS = """
+CREATE INDEX IF NOT EXISTS idx_negative_constraints_severity
+    ON negative_constraints (severity)
+"""
+
+ALL_DDL = (
+    SQL_DDL_WINNING_HOOKS,
+    SQL_INDEX_WINNING_HOOKS,
+    SQL_DDL_REFERRAL_MOTIONS,
+    SQL_DDL_NEGATIVE_CONSTRAINTS,
+    SQL_INDEX_NEGATIVE_CONSTRAINTS,
+)

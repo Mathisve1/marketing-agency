@@ -2,10 +2,11 @@
 
 V1.1 refactor: deprecated the separate pull_meta_insights and
 evaluate_performance tools. The Analyst LLM no longer routes raw
-insights JSON between tools - all data fetching, aggregation, and scoring
-happen in Python via the new analyze_campaign_performance tool, which
-returns a compressed text summary to the LLM. This eliminates the
-token-bomb problem and prevents the LLM from hallucinating arithmetic.
+insights JSON between tools.
+
+V1.2 refactor: dynamic lists moved to SQL. _existing_constrained_hook_ids
+now reads negative_constraints via ctx.get_negative_constraints() instead
+of fm.negative_constraints (the YAML field no longer exists).
 
 Pure functions (internal):
   - aggregate_by_hook        spend-weighted ROAS, summed CTR per hook
@@ -67,11 +68,7 @@ class HookEvaluation:
 
 
 def aggregate_by_hook(insights: list[dict]) -> dict[str, HookPerformance]:
-    """Group ad-level insights by hook_id; spend-weighted ROAS + summed CTR.
-
-    Rows without a parseable hook_id are skipped (e.g. brand-awareness
-    boosts where the media buyer did not follow the WH-/RM- convention).
-    """
+    """Group ad-level insights by hook_id; spend-weighted ROAS + summed CTR."""
     bucket: dict[str, list[dict]] = {}
     for row in insights:
         hook_id = row.get("hook_id")
@@ -175,10 +172,13 @@ def evaluate_hooks(
 
 
 def _existing_constrained_hook_ids(ctx: ClientContext) -> set[str]:
-    """Scan MASTER_CONTEXT.md's negative_constraints for hook IDs already covered."""
-    fm, _ = ctx.read()
+    """Scan SQL negative_constraints for hook IDs already covered.
+
+    V1.2: reads from client_data.db via ctx.get_negative_constraints()
+    rather than the YAML field that no longer exists.
+    """
     out: set[str] = set()
-    for c in fm.negative_constraints:
+    for c in ctx.get_negative_constraints():
         match = _HOOK_ID_IN_RULE_RX.search(c.rule)
         if match:
             out.add(match.group(1))
@@ -192,11 +192,7 @@ def _format_evaluation_summary(
     ctr_target: Optional[float],
     min_spend_usd: float,
 ) -> str:
-    """Render the evaluation results as a compact text block for the LLM.
-
-    10-100x smaller than the raw insights JSON. The LLM gets verdicts +
-    rules ready to copy into write_negative_constraint - nothing else.
-    """
+    """Render the evaluation results as a compact text block for the LLM."""
     failed = [e for e in evaluations if e.failed]
     passing = [e for e in evaluations if not e.failed and not e.reasons]
     insufficient = [e for e in evaluations if not e.failed and e.reasons]
@@ -283,13 +279,7 @@ def _format_evaluation_summary(
 
 
 def make_analyze_campaign_performance_tool(ctx: ClientContext):
-    """LangChain tool: fetch Meta insights, aggregate, evaluate, return summary.
-
-    Replaces the old two-tool flow (pull_meta_insights -> evaluate_performance)
-    with a single tool whose return value is a compressed text summary. The
-    LLM never sees the raw insights JSON - it only reads the verdict and
-    acts on failed hooks via write_negative_constraint.
-    """
+    """LangChain tool: fetch Meta insights, aggregate, evaluate, return summary."""
 
     @tool("analyze_campaign_performance")
     def analyze_campaign_performance(
@@ -304,11 +294,6 @@ def make_analyze_campaign_performance_tool(ctx: ClientContext):
 
         Failed hooks include a proposed_rule + proposed_reason that you can
         pass verbatim into write_negative_constraint.
-
-        time_preset:   Meta time window (e.g. 'last_14d', 'last_28d').
-                       Aliases like 'last_14_days' are accepted.
-        min_spend_usd: spend floor below which a hook is considered
-                       insufficient signal. Default $50 (industry standard).
         """
         fm, _ = ctx.read()
         benchmarks = fm.performance_benchmarks
@@ -349,7 +334,7 @@ def make_analyze_campaign_performance_tool(ctx: ClientContext):
 
 
 def make_constraint_writer(ctx: ClientContext):
-    """LangChain tool: write a HARD negative constraint into MASTER_CONTEXT.md."""
+    """LangChain tool: write a HARD negative constraint into client_data.db."""
 
     @tool("write_negative_constraint")
     def write_negative_constraint(
@@ -357,17 +342,11 @@ def make_constraint_writer(ctx: ClientContext):
         rule: str,
         reason: str,
     ) -> str:
-        """Persist a HARD negative constraint into MASTER_CONTEXT.md. The
+        """Persist a HARD negative constraint into client_data.db. The
         Producer will enforce it on all future video generations via the
         Kling negative_prompt. Returns the auto-assigned constraint ID
         (e.g. NC-007), or a SKIPPED message if a constraint for this hook
         already exists.
-
-        hook_id: e.g. 'WH-003' - the hook this constraint targets.
-        rule:    short rule text; must contain the hook_id substring so the
-                 'already constrained' guard can detect duplicates.
-        reason:  justification with metrics, typically the proposed_reason
-                 returned by analyze_campaign_performance.
         """
         existing = _existing_constrained_hook_ids(ctx)
         if hook_id in existing:

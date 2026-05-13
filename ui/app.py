@@ -1,4 +1,9 @@
-"""Streamlit Command Center."""
+"""Streamlit Command Center.
+
+V1.2: hooks / motions / constraints are fetched via ctx.get_*() SQL queries
+once per page load (right after ctx.read()) and then used to render the
+sidebar caption and the three corresponding tabs.
+"""
 from __future__ import annotations
 
 import json
@@ -17,7 +22,7 @@ st.title("Agency Command Center")
 
 
 # --------------------------------------------------------------------------- #
-# Mode selector - Client work (silo'd) vs Lead generation (global outreach).
+# Mode selector
 # --------------------------------------------------------------------------- #
 
 
@@ -187,7 +192,7 @@ if mode == "Lead generation":
                                 st.success(
                                     f"Promoted `{folder.name}` -> client `{new_id}`. "
                                     f"Seeded {h} hook(s) and {m} motion(s) into "
-                                    f"MASTER_CONTEXT.md. Switch to Client work mode "
+                                    f"client_data.db. Switch to Client work mode "
                                     f"and select `{new_id}` to continue."
                                 )
                             except FileExistsError:
@@ -203,7 +208,7 @@ if mode == "Lead generation":
 
 
 # --------------------------------------------------------------------------- #
-# CLIENT WORK MODE (existing UI)
+# CLIENT WORK MODE
 # --------------------------------------------------------------------------- #
 
 
@@ -232,11 +237,16 @@ if not selection:
 ctx = ClientContext.load(selection)
 fm, body = ctx.read()
 
+# V1.2: dynamic lists come from SQL. Fetched once per page render.
+hooks = ctx.get_winning_hooks()
+motions = ctx.get_referral_motions()
+constraints = ctx.get_negative_constraints()
+
 st.subheader(f"Client: {fm.client.name}")
 st.caption(
     f"Locale: {fm.client.locale} - Updated: {fm.client.last_updated} - "
-    f"{len(fm.winning_hooks)} hooks - {len(fm.referral_motions)} motions - "
-    f"{len(fm.negative_constraints)} constraints"
+    f"{len(hooks)} hooks - {len(motions)} motions - "
+    f"{len(constraints)} constraints"
 )
 
 tab_run, tab_ctx, tab_hooks, tab_motions, tab_constraints, tab_videos, tab_log = st.tabs([
@@ -319,10 +329,10 @@ with tab_ctx:
     st.markdown(body)
 
 with tab_hooks:
-    if not fm.winning_hooks:
+    if not hooks:
         st.info("No winning hooks yet - the Strategist will populate these on first run.")
     else:
-        for h in fm.winning_hooks:
+        for h in hooks:
             st.markdown(f"**{h.id}** - {h.pattern}  \n_{h.description}_")
             st.caption(
                 f"days_active={h.days_active} - confidence={h.confidence.value} - "
@@ -330,10 +340,10 @@ with tab_hooks:
             )
 
 with tab_motions:
-    if not fm.referral_motions:
+    if not motions:
         st.info("No referral motions yet.")
     else:
-        for m in fm.referral_motions:
+        for m in motions:
             st.markdown(f"**{m.id}** - {m.description}")
             st.caption(
                 f"pacing={m.pacing or '-'} - camera={m.camera_style or '-'} - "
@@ -341,10 +351,10 @@ with tab_motions:
             )
 
 with tab_constraints:
-    if not fm.negative_constraints:
+    if not constraints:
         st.info("No negative constraints yet.")
     else:
-        for c in fm.negative_constraints:
+        for c in constraints:
             st.markdown(f"**{c.id}** ({c.severity.value}) - {c.rule}")
             st.caption(f"Reason: {c.reason}")
 

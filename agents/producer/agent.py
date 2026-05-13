@@ -1,20 +1,8 @@
 """Producer worker - selects assets, compiles Kling brief, generates UGC video.
 
-Architecture: LangGraph create_react_agent with three tool categories:
-  1. Inspection - list_available_assets, read_master_context
-  2. Action     - generate_ugc_video (compile brief -> Kling Omni-Video submit
-                  -> poll -> download -> log to performance_log)
-  3. Memory writes happen inside generate_ugc_video itself, via
-     ctx.append_performance_entry, so the Analyst can later see what was made.
-
-Model selection is explicit per run via config['configurable']['model'],
-same contract as the Strategist.
-
-Kling Omni-Video: a single unified endpoint replaces the older V2V/I2V split.
-Assets are passed as image_list + video_list; the prompt references them
-via <<<image_n>>> / <<<video_n>>> tags. The Producer enforces the agency
-convention here (NOT in the API client): images = [character, product]
-in that exact order to match the tags baked into the brief's prompt.
+V1.2: hook + motion lookups use ctx.get_winning_hook(hook_id) /
+ctx.get_referral_motion(motion_id) single-row SQL queries instead of
+scanning fm.winning_hooks / fm.referral_motions lists.
 """
 from __future__ import annotations
 
@@ -76,13 +64,20 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
 
     @tool("read_master_context")
     def read_master_context() -> dict:
-        """Return winning_hooks, referral_motions, negative_constraints, and
-        brand from MASTER_CONTEXT.md so you can pick what to combine."""
+        """Return winning_hooks, referral_motions, negative_constraints (all
+        from client_data.db) and brand (from MASTER_CONTEXT.md) so you can
+        pick what to combine."""
         fm, _ = ctx.read()
         return {
-            "winning_hooks": [h.model_dump(mode="json") for h in fm.winning_hooks],
-            "referral_motions": [m.model_dump(mode="json") for m in fm.referral_motions],
-            "negative_constraints": [c.model_dump(mode="json") for c in fm.negative_constraints],
+            "winning_hooks": [
+                h.model_dump(mode="json") for h in ctx.get_winning_hooks()
+            ],
+            "referral_motions": [
+                m.model_dump(mode="json") for m in ctx.get_referral_motions()
+            ],
+            "negative_constraints": [
+                c.model_dump(mode="json") for c in ctx.get_negative_constraints()
+            ],
             "brand": fm.brand.model_dump(mode="json"),
         }
 
@@ -102,15 +97,14 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
         will inherit pacing + camera from the referral video). Omit motion_id
         to generate from character + product images alone.
         """
-        fm, _ = ctx.read()
-
-        hook = next((h for h in fm.winning_hooks if h.id == hook_id), None)
+        # V1.2: single-row SQL lookups
+        hook = ctx.get_winning_hook(hook_id)
         if hook is None:
             raise ValueError(f"hook_id {hook_id!r} not found in winning_hooks.")
 
         motion = None
         if motion_id:
-            motion = next((m for m in fm.referral_motions if m.id == motion_id), None)
+            motion = ctx.get_referral_motion(motion_id)
             if motion is None:
                 raise ValueError(f"motion_id {motion_id!r} not found in referral_motions.")
 
@@ -121,12 +115,14 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
         if not prod_path.exists():
             raise FileNotFoundError(f"Product asset not found: {prod_path}")
 
+        # Brand still lives in MASTER_CONTEXT.md; constraints come from SQL.
+        fm, _ = ctx.read()
         brief = compile_brief(
             hook=hook,
             motion=motion,
             character_image_path=char_path,
             product_image_path=prod_path,
-            negative_constraints=list(fm.negative_constraints),
+            negative_constraints=ctx.get_negative_constraints(),
             brand=fm.brand,
             duration=duration,
         )
@@ -134,7 +130,6 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
         # Agency convention enforced HERE (not in the API client):
         # images[0] -> <<<image_1>>> = character
         # images[1] -> <<<image_2>>> = product
-        # The brief's prompt already references these tags inline.
         images: list = [brief.character_image_path, brief.product_image_path]
         videos: Optional[list] = None
 
@@ -159,13 +154,11 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
 
         task = kling_client.wait_for_completion(task_id)
 
-        # Save to outputs/videos/<hook>-<motion-or-images>-<timestamp>.mp4
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         name = f"{hook_id}-{motion_id or 'images'}-{timestamp}.mp4"
         dest = ctx.root / "outputs" / "videos" / name
         kling_client.download_video(task, dest)
 
-        # Log this generation for the Analyst's feedback loop.
         ctx.append_performance_entry({
             "type": "video_generation",
             "hook_id": hook_id,
@@ -208,8 +201,6 @@ def producer_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     ctx = ClientContext.load(state["client_id"])
     fm, _ = ctx.read()
 
-    # Global audit log at <repo_root>/logs/kling-api.jsonl for cross-client
-    # cost reconciliation.
     audit_log = (ctx.clients_root.parent / "logs" / "kling-api.jsonl").resolve()
     kling_client = KlingClient(audit_log_path=audit_log)
 
@@ -217,13 +208,14 @@ def producer_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     llm = ChatAnthropic(model=model_name, max_tokens=4096, temperature=0.2)
 
+    # V1.2: counts via SQL
     system_prompt = SYSTEM_PROMPT.format(
         client_name=fm.client.name,
         client_locale=fm.client.locale,
         brand_context=_format_brand_context(fm),
-        hooks_count=len(fm.winning_hooks),
-        motions_count=len(fm.referral_motions),
-        constraints_count=len(fm.negative_constraints),
+        hooks_count=len(ctx.get_winning_hooks()),
+        motions_count=len(ctx.get_referral_motions()),
+        constraints_count=len(ctx.get_negative_constraints()),
     )
 
     react = create_react_agent(llm, tools, prompt=system_prompt)
@@ -231,7 +223,6 @@ def producer_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     new_messages = result["messages"][len(state["messages"]):]
 
-    # Collect any video paths produced this turn so the UI can render players.
     artifacts = dict(state.get("artifacts") or {})
     artifacts["model_used"] = model_name
     videos: list[str] = []

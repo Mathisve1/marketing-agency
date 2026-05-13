@@ -1,16 +1,9 @@
 """Strategist worker - researches competitors, extracts winning hooks, writes
-findings to MASTER_CONTEXT.md, and generates a PDF report.
+findings to MASTER_CONTEXT.md (static brand) + client_data.db (hooks/motions),
+and generates a PDF report.
 
-Architecture: a LangGraph create_react_agent wraps ChatAnthropic with three
-tool families:
-  1. Discovery - Tavily (competitor search) + Apify (FB Ads Library scrape).
-  2. Analysis - longevity scorer (filters < 14-day ads as unproven).
-  3. State mutation - wraps ClientContext methods so the LLM can persist hooks,
-     referral motions, and narrative summaries straight into MASTER_CONTEXT.md.
-
-Model selection is explicit per run (no env-var default): the caller must
-supply config['configurable']['model']. The Streamlit UI exposes this as a
-selectbox; main.py exposes it as --model.
+V1.2: hooks/motions/constraints come from SQL via ctx.get_*() rather than
+ctx.read()'s YAML frontmatter, which no longer carries those lists.
 """
 from __future__ import annotations
 
@@ -68,6 +61,8 @@ def _build_context_writers(ctx: ClientContext):
     """Wraps ClientContext mutators as LangChain tools.
 
     Each closure captures `ctx` so the LLM doesn't need to know client_id.
+    V1.2: hooks/motions/constraints write through to client_data.db; reads
+    via ctx.get_*() (no longer fm.X).
     """
 
     @tool("record_winning_hook")
@@ -78,7 +73,7 @@ def _build_context_writers(ctx: ClientContext):
         days_active: int,
         confidence: str,
     ) -> str:
-        """Persist a newly identified winning hook into MASTER_CONTEXT.md.
+        """Persist a newly identified winning hook into client_data.db.
         `confidence` must be one of: 'high', 'medium', 'low'. Returns the
         auto-assigned hook ID (e.g. WH-007)."""
         hook = WinningHook(
@@ -101,8 +96,8 @@ def _build_context_writers(ctx: ClientContext):
         duration_seconds: int,
     ) -> str:
         """Persist a referral motion (the visual pattern of a winning video ad)
-        into MASTER_CONTEXT.md. `reference_path` should be the relative path
-        under references/referral_videos/ once the asset is downloaded."""
+        into client_data.db. `reference_path` should be the relative path under
+        references/referral_videos/ once the asset is downloaded."""
         motion = ReferralMotion(
             description=description,
             reference_path=reference_path,
@@ -116,12 +111,15 @@ def _build_context_writers(ctx: ClientContext):
 
     @tool("read_existing_hooks")
     def read_existing_hooks() -> dict:
-        """Return existing winning_hooks and negative_constraints so we don't
-        duplicate work or violate prior constraints."""
-        fm, _ = ctx.read()
+        """Return existing winning_hooks and negative_constraints from
+        client_data.db so we don't duplicate work or violate prior constraints."""
         return {
-            "winning_hooks": [h.model_dump(mode="json") for h in fm.winning_hooks],
-            "negative_constraints": [c.model_dump(mode="json") for c in fm.negative_constraints],
+            "winning_hooks": [
+                h.model_dump(mode="json") for h in ctx.get_winning_hooks()
+            ],
+            "negative_constraints": [
+                c.model_dump(mode="json") for c in ctx.get_negative_constraints()
+            ],
         }
 
     @tool("append_research_summary")
@@ -148,8 +146,8 @@ def _build_context_writers(ctx: ClientContext):
             client_name=fm.client.name,
             title=title,
             executive_summary=executive_summary,
-            winning_hooks=fm.winning_hooks,
-            referral_motions=fm.referral_motions,
+            winning_hooks=ctx.get_winning_hooks(),
+            referral_motions=ctx.get_referral_motions(),
         )
         return str(path)
 
@@ -175,7 +173,6 @@ def _format_brand_context(fm) -> str:
 
 
 def strategist_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    # Explicit per-run model selection - no env-var default.
     model_name = (config or {}).get("configurable", {}).get("model")
     if not model_name:
         raise ValueError(
@@ -196,22 +193,23 @@ def strategist_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
 
     llm = ChatAnthropic(model=model_name, max_tokens=4096, temperature=0.2)
 
+    # V1.2: counts come from SQL, not YAML frontmatter.
+    existing_hooks = ctx.get_winning_hooks()
+    existing_constraints = ctx.get_negative_constraints()
+
     system_prompt = SYSTEM_PROMPT.format(
         client_name=fm.client.name,
         client_locale=fm.client.locale,
         brand_context=_format_brand_context(fm),
-        hooks_count=len(fm.winning_hooks),
-        constraints_count=len(fm.negative_constraints),
+        hooks_count=len(existing_hooks),
+        constraints_count=len(existing_constraints),
     )
 
     react = create_react_agent(llm, tools, prompt=system_prompt)
     result = react.invoke({"messages": state["messages"]})
 
-    # Return only the messages produced this turn - the supervisor's
-    # add_messages reducer would otherwise duplicate the original user input.
     new_messages = result["messages"][len(state["messages"]):]
 
-    # Surface the model used + generated PDF path into shared artifacts.
     artifacts = dict(state.get("artifacts") or {})
     artifacts["model_used"] = model_name
     for msg in reversed(new_messages):

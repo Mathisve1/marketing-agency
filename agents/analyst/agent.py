@@ -1,15 +1,8 @@
 """Analyst worker - pulls Meta performance, evaluates per-hook ROAS/CTR,
-writes HARD negative constraints into MASTER_CONTEXT.md.
+writes HARD negative constraints into client_data.db.
 
-V1.1 refactor: single combined tool analyze_campaign_performance replaces
-the old two-tool flow (pull_meta_insights + evaluate_performance). The
-LLM no longer sees raw insights JSON - the tool returns a compressed
-text summary with verdicts + ready-to-copy proposed_rule/reason pairs.
-
-Architecture: LangGraph create_react_agent with three tools (down from
-four): analyze_campaign_performance, write_negative_constraint,
-append_analyst_summary. Model selection is explicit per run via
-config['configurable']['model'], same contract as the Strategist.
+V1.2: hook + constraint COUNTS for the system prompt come from
+ctx.get_*() (SQL) instead of len(fm.X) (YAML).
 """
 from __future__ import annotations
 
@@ -36,7 +29,7 @@ Performance benchmarks:
   ROAS target: {roas_target}
   CTR target:  {ctr_target}
 
-The client has {hooks_count} winning hooks in MASTER_CONTEXT.md and
+The client has {hooks_count} winning hooks in client_data.db and
 {constraints_count} negative constraints already in force.
 
 Your workflow this turn:
@@ -90,13 +83,14 @@ def analyst_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     llm = ChatAnthropic(model=model_name, max_tokens=4096, temperature=0.2)
 
     benchmarks = fm.performance_benchmarks
+    # V1.2: counts via SQL
     system_prompt = SYSTEM_PROMPT.format(
         client_name=fm.client.name,
         client_locale=fm.client.locale,
         roas_target=benchmarks.roas_target if benchmarks.roas_target is not None else "(not set)",
         ctr_target=benchmarks.ctr_target if benchmarks.ctr_target is not None else "(not set)",
-        hooks_count=len(fm.winning_hooks),
-        constraints_count=len(fm.negative_constraints),
+        hooks_count=len(ctx.get_winning_hooks()),
+        constraints_count=len(ctx.get_negative_constraints()),
     )
 
     react = create_react_agent(llm, tools, prompt=system_prompt)
