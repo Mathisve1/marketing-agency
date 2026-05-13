@@ -7,11 +7,11 @@ Per-turn flow:
   3. Dispatch via conditional edge to the chosen worker.
   4. Worker returns; end after one hop.
 
-V1.3 (2/N): adds run_supervisor_async() so callers (Streamlit, MCP server,
-future CLI) can dispatch via graph.ainvoke() under a single asyncio.run()
-call. Worker nodes are still sync; LangGraph wraps each in a thread under
-ainvoke, which frees the calling event loop for other work and
-forward-aligns the codebase with future graph.astream() streaming.
+V1.3 (2/N): adds run_supervisor_async() for asyncio.run() dispatch.
+V1.3 (3/N): adds optional interrupt_before plumbing + resume_supervisor_async()
+            + get_pending_node() so the UI can gate Producer behind a Human-
+            in-the-Loop approval. Worker nodes still sync; MCP/CLI keep
+            no-interrupt behavior by passing interrupt_before=None.
 """
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ from core.router import route_task
 from core.state import AgentState
 
 
-# Task types that require a valid client silo (read/write MASTER_CONTEXT.md).
-# Outreach is intentionally absent - it operates on prospects/, not clients/.
 _CLIENT_SCOPED = {"research", "produce", "analyze"}
 
 
@@ -47,7 +45,6 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
             ClientContext.load(client_id)
         except (FileNotFoundError, ValueError) as e:
             return {"error": f"client load failed: {e}"}
-    # Outreach is global - no client_id, no ClientContext load.
 
     return {
         "task_type": task_type,
@@ -57,7 +54,6 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
 
 
 def _select_worker(state: AgentState):
-    """Maps the Supervisor's chosen task_type to a worker node name."""
     if state.get("error"):
         return END
     return {
@@ -68,12 +64,19 @@ def _select_worker(state: AgentState):
     }.get(state.get("current_agent"), END)
 
 
-def build_supervisor_graph(checkpointer: Optional[MemorySaver] = None):
+def build_supervisor_graph(
+    checkpointer: Optional[MemorySaver] = None,
+    interrupt_before: Optional[list[str]] = None,
+):
     """Compile the supervisor graph.
 
-    The returned compiled graph supports BOTH synchronous (graph.invoke)
-    and asynchronous (graph.ainvoke) dispatch out of the box. Use the
-    run_supervisor_async() helper below for the canonical async surface.
+    interrupt_before: optional list of node names to pause BEFORE executing.
+                     Default None = no interrupts (sync behavior, MCP/CLI).
+                     The Streamlit UI passes ['producer'] to gate paid
+                     Kling renders behind a human approval.
+
+    The returned compiled graph supports both invoke() (sync) and ainvoke()
+    (async). Use run_supervisor_async / resume_supervisor_async helpers.
     """
     g = StateGraph(AgentState)
     g.add_node("supervisor", supervisor_node)
@@ -89,7 +92,10 @@ def build_supervisor_graph(checkpointer: Optional[MemorySaver] = None):
     g.add_edge("analyst", END)
     g.add_edge("outreach", END)
 
-    return g.compile(checkpointer=checkpointer or MemorySaver())
+    return g.compile(
+        checkpointer=checkpointer or MemorySaver(),
+        interrupt_before=interrupt_before or [],
+    )
 
 
 def initial_state(
@@ -97,11 +103,6 @@ def initial_state(
     user_message: str,
     task_type: Optional[str] = None,
 ) -> AgentState:
-    """Helper for callers (CLI, Streamlit, MCP) to build a starting state.
-
-    Pass client_id=None + task_type='outreach' for global outreach runs.
-    Pass client_id='<slug>' for any client-scoped task type.
-    """
     return {
         "messages": [HumanMessage(content=user_message)],
         "client_id": client_id,
@@ -120,18 +121,41 @@ async def run_supervisor_async(
 ) -> dict[str, Any]:
     """Async dispatch wrapper around graph.ainvoke.
 
-    Callers use this to dispatch without reaching into LangGraph's surface
-    directly:
-
-        result = asyncio.run(
-            run_supervisor_async(graph, state, config=config)
-        )
-
-    Worker nodes are currently synchronous; LangGraph runs each in a
-    thread pool under the hood when ainvoke is used, so the caller's
-    event loop stays free for other concurrent work (Streamlit page
-    interactions, MCP transport bookkeeping). When we migrate workers
-    to true async + graph.astream() for token-level streaming, this
-    helper's signature stays unchanged - only the implementation swaps.
+    Pair with get_pending_node(graph, config=config) after invocation
+    to detect whether interrupt_before paused the graph.
     """
     return await graph.ainvoke(state, config=config or {})
+
+
+async def resume_supervisor_async(
+    graph,
+    *,
+    config: dict,
+) -> dict[str, Any]:
+    """Resume a paused supervisor graph after a HITL approval.
+
+    Pass None as the input - LangGraph picks up from the checkpoint
+    identified by config['configurable']['thread_id']. The config must
+    match the one used in the original run_supervisor_async call that
+    caused the pause.
+    """
+    return await graph.ainvoke(None, config=config)
+
+
+def get_pending_node(graph, *, config: dict) -> Optional[str]:
+    """Returns the name of the next node about to execute, or None when
+    the graph has completed (snapshot.next is empty).
+
+    The UI calls this immediately after run_supervisor_async to detect
+    an interrupt_before pause. Example:
+
+        result = asyncio.run(run_supervisor_async(graph, state, config=config))
+        if get_pending_node(graph, config=config) == "producer":
+            # Show HITL approval UI
+        else:
+            # Graph ran to completion - display result.
+    """
+    snapshot = graph.get_state(config=config)
+    if snapshot.next:
+        return snapshot.next[0]
+    return None
