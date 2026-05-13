@@ -1,17 +1,19 @@
-"""Meta Ads Insights API wrapper.
+"""Meta Ads Insights API wrapper - pure data layer (V1.1 refactor).
 
-Queries /v<version>/act_<AD_ACCOUNT_ID>/insights for ad-level performance
-metrics (spend, impressions, CTR, ROAS) and parses the agency-standard
-ad_name convention [Audience]_[WH-xxx]_[RM-yyy]_[Notes] to extract the
-hook_id and motion_id tags used in MASTER_CONTEXT.md.
+The older make_meta_insights_tool factory was deprecated in V1.1: the LLM
+no longer routes raw insights JSON between tools. The new
+analyze_campaign_performance tool (in context_writer.py) calls
+fetch_meta_insights_data() internally and returns only a compressed text
+summary to the LLM.
 
-Returns are capped at MAX_ADS_RETURNED (200) and sorted by spend descending
-so the LLM gets the most relevant signal without context-window blowout.
+Parses the agency-standard ad_name convention
+[Audience]_[WH-xxx]_[RM-yyy]_[Notes] to extract hook + motion tags.
+Results are capped at MAX_ADS_RETURNED (200) and sorted by spend desc.
 
-The Graph API version and base URL are env-overridable so Meta's quarterly
-version deprecations don't require a code release:
-  META_GRAPH_VERSION  (default: v19.0 - update to match your token's version)
-  META_API_BASE_URL   (derived from version if unset)
+Env-overridable:
+  META_GRAPH_VERSION       (default: v19.0)
+  META_API_BASE_URL        (derived from version if unset)
+  META_MAX_ADS_RETURNED    (default: 200)
 """
 from __future__ import annotations
 
@@ -20,8 +22,6 @@ import re
 from typing import Optional
 
 import requests
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field
 
 
 META_GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v19.0")
@@ -30,13 +30,8 @@ META_API_BASE = os.getenv(
     f"https://graph.facebook.com/{META_GRAPH_VERSION}",
 )
 HTTP_TIMEOUT_SEC = 60
-
-# Hard cap on rows returned to the LLM. After pagination + sort by spend desc,
-# we slice to this many rows. Prevents context-window blowout for accounts
-# with hundreds of active ads in a 14-day window.
 MAX_ADS_RETURNED = int(os.getenv("META_MAX_ADS_RETURNED", "200"))
 
-# Whitelist of Meta time_preset values per Graph API docs.
 SUPPORTED_TIME_PRESETS = {
     "today", "yesterday",
     "this_week_mon_today", "this_week_sun_today",
@@ -48,7 +43,6 @@ SUPPORTED_TIME_PRESETS = {
     "last_3d", "last_7d", "last_14d", "last_28d", "last_30d", "last_90d",
 }
 
-# Common informal names users write - map to Meta's canonical values.
 TIME_PRESET_ALIASES = {
     "last_3_days": "last_3d",
     "last_7_days": "last_7d",
@@ -68,11 +62,7 @@ _MOTION_ID_RX = re.compile(r"(RM-\d+)")
 
 
 def _parse_ad_name(ad_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Parse the agency convention [Audience]_[WH-xxx]_[RM-yyy]_[Notes].
-
-    Returns (audience_name, hook_id, motion_id). Any may be None if the
-    media buyer didn't follow the convention for that ad.
-    """
+    """Parse [Audience]_[WH-xxx]_[RM-yyy]_[Notes] -> (audience, hook_id, motion_id)."""
     if not ad_name:
         return None, None, None
     hook = _HOOK_ID_RX.search(ad_name)
@@ -86,9 +76,8 @@ def _parse_ad_name(ad_name: str) -> tuple[Optional[str], Optional[str], Optional
 
 
 def _extract_purchase_roas(raw: Optional[list]) -> Optional[float]:
-    """Meta returns purchase_roas as [{action_type, value}, ...]. Pick the
-    most representative number: omni_purchase > offsite_conversion.fb_pixel
-    > any parseable. Returns None when no usable value exists."""
+    """Meta returns purchase_roas as [{action_type, value}, ...]. Prefer
+    omni_purchase > offsite_conversion.fb_pixel_purchase > anything parseable."""
     if not raw:
         return None
     by_type = {item.get("action_type"): item.get("value") for item in raw}
@@ -117,90 +106,68 @@ def _normalise_time_preset(raw: str) -> str:
     )
 
 
-class MetaInsightsInput(BaseModel):
-    time_preset: str = Field(
-        "last_14d",
-        description=(
-            "Meta time preset. Common: last_7d, last_14d, last_28d, last_30d. "
-            "Aliases like 'last_14_days' are accepted."
-        ),
-    )
+def fetch_meta_insights_data(time_preset: str = "last_14d") -> list[dict]:
+    """Pull ad-level performance from Meta Ads Insights API. Returns at most
+    MAX_ADS_RETURNED rows, sorted by spend descending. Each row carries
+    spend, impressions, ctr, purchase_roas, and the hook_id / motion_id
+    parsed from ad_name per the agency convention
+    [Audience]_[WH-xxx]_[RM-yyy]_[Notes].
 
+    Plain Python function - NOT a LangChain tool. Called internally by the
+    Analyst's analyze_campaign_performance tool so the raw insights array
+    never crosses the LLM context boundary.
+    """
+    access_token = os.getenv("META_ACCESS_TOKEN")
+    ad_account = os.getenv("META_AD_ACCOUNT_ID")
+    if not access_token or not ad_account:
+        raise RuntimeError(
+            "META_ACCESS_TOKEN and META_AD_ACCOUNT_ID must be in .env "
+            "(consider per-client overrides in clients/<id>/.env)."
+        )
+    if not ad_account.startswith("act_"):
+        ad_account = f"act_{ad_account}"
 
-def make_meta_insights_tool():
-    """Factory matching the pattern of make_fb_ads_search_tool / make_tavily..."""
+    normalised = _normalise_time_preset(time_preset)
+    url = f"{META_API_BASE}/{ad_account}/insights"
+    params: Optional[dict] = {
+        "access_token": access_token,
+        "level": "ad",
+        "time_preset": normalised,
+        "fields": ",".join(INSIGHT_FIELDS),
+        "limit": min(MAX_ADS_RETURNED, 100),
+        "sort": "spend_descending",
+    }
 
-    @tool("pull_meta_insights", args_schema=MetaInsightsInput)
-    def pull_meta_insights(time_preset: str = "last_14d") -> list[dict]:
-        """Pull ad-level performance from Meta Ads Insights API. Returns at most
-        200 rows, sorted by spend descending (highest spend first). Each row
-        carries spend, impressions, ctr, purchase_roas, and the hook_id /
-        motion_id parsed from ad_name per the agency convention
-        [Audience]_[WH-xxx]_[RM-yyy]_[Notes]. Use this as the first step of
-        any analyst run; pass the result to `evaluate_performance`."""
-        access_token = os.getenv("META_ACCESS_TOKEN")
-        ad_account = os.getenv("META_AD_ACCOUNT_ID")
-        if not access_token or not ad_account:
+    rows: list[dict] = []
+    next_url: Optional[str] = url
+    fetch_cap = MAX_ADS_RETURNED * 3
+    while next_url and len(rows) < fetch_cap:
+        r = requests.get(next_url, params=params, timeout=HTTP_TIMEOUT_SEC)
+        if not r.ok:
             raise RuntimeError(
-                "META_ACCESS_TOKEN and META_AD_ACCOUNT_ID must be in .env "
-                "(consider per-client overrides in clients/<id>/.env)."
+                f"Meta API GET {next_url} -> {r.status_code}: {r.text}"
             )
-        if not ad_account.startswith("act_"):
-            ad_account = f"act_{ad_account}"
+        payload = r.json()
+        for item in payload.get("data", []):
+            ad_name = item.get("ad_name", "") or ""
+            audience, hook_id, motion_id = _parse_ad_name(ad_name)
+            impressions = int(item.get("impressions") or 0)
+            clicks = int(item.get("inline_link_clicks") or 0)
+            ctr = (clicks / impressions) if impressions else 0.0
+            rows.append({
+                "ad_id": item.get("ad_id"),
+                "ad_name": ad_name,
+                "spend": float(item.get("spend") or 0),
+                "impressions": impressions,
+                "inline_link_clicks": clicks,
+                "ctr": round(ctr, 6),
+                "purchase_roas": _extract_purchase_roas(item.get("purchase_roas")),
+                "audience_name": audience,
+                "hook_id": hook_id,
+                "motion_id": motion_id,
+            })
+        next_url = (payload.get("paging") or {}).get("next")
+        params = None
 
-        normalised = _normalise_time_preset(time_preset)
-        url = f"{META_API_BASE}/{ad_account}/insights"
-        params: Optional[dict] = {
-            "access_token": access_token,
-            "level": "ad",
-            "time_preset": normalised,
-            "fields": ",".join(INSIGHT_FIELDS),
-            "limit": min(MAX_ADS_RETURNED, 100),
-            # Hint server-side sort - Meta may or may not honor it depending
-            # on the API version. The client-side sort below is the actual
-            # safety net.
-            "sort": "spend_descending",
-        }
-
-        rows: list[dict] = []
-        next_url: Optional[str] = url
-        # Stop paginating once we have enough rows (with some headroom in case
-        # server-side sort isn't honored, so client-side sort still picks the
-        # right top-N).
-        fetch_cap = MAX_ADS_RETURNED * 3
-        while next_url and len(rows) < fetch_cap:
-            r = requests.get(next_url, params=params, timeout=HTTP_TIMEOUT_SEC)
-            if not r.ok:
-                raise RuntimeError(
-                    f"Meta API GET {next_url} -> {r.status_code}: {r.text}"
-                )
-            payload = r.json()
-            for item in payload.get("data", []):
-                ad_name = item.get("ad_name", "") or ""
-                audience, hook_id, motion_id = _parse_ad_name(ad_name)
-                impressions = int(item.get("impressions") or 0)
-                clicks = int(item.get("inline_link_clicks") or 0)
-                ctr = (clicks / impressions) if impressions else 0.0
-                rows.append({
-                    "ad_id": item.get("ad_id"),
-                    "ad_name": ad_name,
-                    "spend": float(item.get("spend") or 0),
-                    "impressions": impressions,
-                    "inline_link_clicks": clicks,
-                    "ctr": round(ctr, 6),
-                    "purchase_roas": _extract_purchase_roas(item.get("purchase_roas")),
-                    "audience_name": audience,
-                    "hook_id": hook_id,
-                    "motion_id": motion_id,
-                })
-            # Meta's pagination: paging.next is a full URL with cursor; clear
-            # params after first call so we don't double-append access_token.
-            next_url = (payload.get("paging") or {}).get("next")
-            params = None
-
-        # Defensive client-side sort + slice. Server-side sort is a hint;
-        # this is the actual contract with the LLM.
-        rows.sort(key=lambda r: r.get("spend") or 0, reverse=True)
-        return rows[:MAX_ADS_RETURNED]
-
-    return pull_meta_insights
+    rows.sort(key=lambda r: r.get("spend") or 0, reverse=True)
+    return rows[:MAX_ADS_RETURNED]

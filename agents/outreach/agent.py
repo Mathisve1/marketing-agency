@@ -1,10 +1,15 @@
 """Outreach worker - hunts for new client prospects.
 
+V1.1 refactor: the Apify FB Ads tool is wrapped with a 10-ad cap (sorted
+by days_active desc) before its payload reaches the LLM, preventing
+context bloat from 100-ad scrapes. The SYSTEM_PROMPT pivots from
+fabricated visual critiques to text/metadata-derivable strategic gaps.
+
 Workflow:
   1. Tavily competitor search to discover brand names in a target niche/country.
-  2. Apify FB Ads scrape for each brand's current Meta ad library.
-  3. Analyze each library: identify weaknesses, extract winning hooks
-     (longevity-proven) and referral motions.
+  2. Capped Apify FB Ads scrape for each brand's current Meta ad library.
+  3. Analyze each library STRICTLY on text + metadata: identify strategic
+     marketing gaps, extract winning hooks (longevity-proven), referral motions.
   4. Save audit JSON + render Brand Audit & Pitch PDF per prospect.
 
 Silo-less worker: state['client_id'] is None, no ClientContext loaded.
@@ -26,10 +31,14 @@ from agents.outreach.reporting.pitch_builder import (
     DEFAULT_FRAMEWORK_STRENGTHS,
     build_pitch_pdf,
 )
+from agents.strategist.analysis.longevity_scorer import score_ads
 from agents.strategist.tools.apify_fb_ads import make_fb_ads_search_tool
 from agents.strategist.tools.tavily_search import make_tavily_competitor_search_tool
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
+
+
+OUTREACH_MAX_ADS_TO_LLM = 10
 
 
 SYSTEM_PROMPT = """You are the Outreach agent for an AI performance marketing agency.
@@ -44,38 +53,100 @@ Your workflow this turn:
      - country code (e.g. "GB", "US", "BE", "NL", "DE")
      - target count (default 5; cap at the explicit number requested)
   2. Call `tavily_competitor_search` with brand=<niche> and country=<country>.
-     The query is framed as competitor discovery but works fine for category
-     discovery. Extract distinct brand names from the result titles + snippets.
-     Skip review sites, marketplaces, and blog roundups.
+     Extract distinct brand names from the result titles + snippets. Skip
+     review sites, marketplaces, and blog roundups.
   3. For each brand (up to the requested count):
      a. Slugify the name into a prospect_id (lowercase, alphanumeric +
         hyphens only, e.g. "gymshark" or "on-running").
      b. Call `search_fb_ads_library` with competitor_pages=[brand_name] and
-        country=<country> to scrape their current Meta ads.
-     c. Analyze the returned ads. Identify:
-        - 2-4 weaknesses (low diversity, dated creative, no UGC, polished
-          studio look, lack of social proof, etc.) - short bullets.
-        - 2-3 winning_hooks: recurring patterns from ads running >= 14 days.
-          Each hook needs: pattern, description, source_ad_id, days_active,
-          confidence ('high' | 'medium' | 'low').
-        - 0-2 referral_motions for visually distinctive video ads. Each
-          motion needs: description, reference_path (use a placeholder like
-          'references/referral_videos/PLACEHOLDER.mp4' since we don't have
-          the video downloaded yet), pacing, camera_style, duration_seconds.
-     d. Call `save_prospect_audit` with the prospect_id, prospect_name,
-        niche, country, locale (e.g. 'en-GB'), weaknesses, winning_hooks,
-        referral_motions, and competitor_ads (the raw scrape results,
-        capped at the top 5 by days_active).
-     e. Call `generate_pitch_pdf` with the prospect_id and a one-sentence
-        CTA (e.g. "15-minute call to walk through how we'd rebuild your
-        top-performing ad as UGC"). framework_strengths can be omitted to
-        use the agency defaults.
+        country=<country>. The tool returns the TOP 10 ads sorted by
+        days_active descending - long-running ads carry the most signal.
+
+     c. Analyze the returned ads STRICTLY on text and metadata. You CANNOT
+        see the videos, so do NOT critique visual quality (lighting,
+        framing, color grading, "polished look", studio aesthetic, etc.).
+
+        Identify 2-4 STRATEGIC MARKETING GAPS from the data you DO have.
+        Examples of legitimate gaps (use these as templates, derived from
+        the metadata in each ad row):
+          - Copy diversity: "Brand relies on a single copy angle across
+            all 10 long-running ads"   (count distinct body_text patterns)
+          - Creative freshness: "No fresh creative launched in 67+ days
+            (oldest start_date: 2026-02-15)"   (check newest start_date)
+          - Format mix: "Image-only ad library; no video presence on Meta"
+            (check media_type distribution)
+          - CTA repetition: "All 10 ads use the same CTA"
+            (count distinct cta_text)
+          - Framework: "Captions read as product-feature lists; no
+            Hook-Story-Offer narrative"   (inspect body_text structure)
+          - Audience signal: "Body text is generic - no persona-specific
+            language"   (qualitative read of body_text)
+
+        DO NOT fabricate gaps. If the data shows a healthy ad library
+        (diverse copy, fresh creative, varied CTAs), say so honestly and
+        cap the gaps list at fewer than 4.
+
+     d. Extract 2-3 winning_hooks from the body_text of the longest-running
+        ads. Each hook: {pattern, description, source_ad_id, days_active,
+        confidence: 'high'|'medium'|'low'}.
+
+     e. Extract 0-2 referral_motions ONLY for ads where media_type is VIDEO.
+        Each motion: {description, reference_path:
+        'references/referral_videos/PLACEHOLDER.mp4', pacing: null or
+        'inferred from ad title', camera_style: null, duration_seconds:
+        null}. DO NOT fabricate pacing/camera details you cannot verify
+        from the metadata alone.
+
+     f. Call `save_prospect_audit` with prospect_id, prospect_name, niche,
+        country, locale, weaknesses (the strategic gaps from step c),
+        winning_hooks, referral_motions, and competitor_ads (the top 10
+        scrape from step b).
+     g. Call `generate_pitch_pdf` with the prospect_id and a one-sentence
+        CTA.
   4. Report back: list of prospects audited with their pitch PDF paths.
 
-CRITICAL: Each Tavily search and Apify scrape costs money. Cap brand
-discovery at the user's requested count. If the user asks for 5 brands,
-audit exactly 5 - not 10. If you can only find 3 valid brands, audit 3
-and tell the user."""
+CRITICAL: Every Tavily search and Apify scrape costs money. Cap brand
+discovery at the user's requested count.
+
+CRITICAL: NEVER critique visual quality of ads. You only see metadata and
+text. Identify strategic gaps the brand could fix - never aesthetic
+judgments you cannot back up with the data."""
+
+
+def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
+    """Wraps the Strategist's search_fb_ads_library tool. Sorts the scraped
+    ads by days_active desc and caps the LLM-visible payload at `max_ads`.
+
+    Prevents two failure modes:
+      - Token bloat: a single Apify scrape can return 50-100 ads at 1-2 KB
+        each. 10 ads is enough strategic signal for a pitch.
+      - Distractor noise: short-running test ads bury the long-running
+        winners. Sorting by days_active surfaces only the proven creative
+        before the LLM sees it.
+    """
+    underlying = make_fb_ads_search_tool()
+
+    @tool("search_fb_ads_library")
+    def search_fb_ads_library(
+        competitor_pages: list[str],
+        country: str = "BE",
+        active_only: bool = True,
+    ) -> list[dict]:
+        """Scrape competitor Meta ads via Apify, then sort by days_active
+        descending and return only the top 10. Long-running ads carry the
+        most strategic signal; the cap keeps context tight."""
+        raw = underlying.invoke({
+            "competitor_pages": competitor_pages,
+            "country": country,
+            "max_ads_per_page": 50,
+            "active_only": active_only,
+        })
+        # score_ads adds the `days_active` field and sorts desc.
+        # min_days=0 keeps every ad - the cap is by count, not longevity.
+        scored = score_ads(raw, min_days=0)
+        return scored[:max_ads]
+
+    return search_fb_ads_library
 
 
 def _make_save_audit_tool():
@@ -95,9 +166,9 @@ def _make_save_audit_tool():
 
         Call this once per prospect, AFTER scraping their ads via
         search_fb_ads_library and analyzing the results. The audit captures
-        identified weaknesses, extracted winning hooks (longevity-proven),
-        referral motions for visual V2V, and a snapshot of the competitor's
-        ad library (top 5 by days_active). Returns the absolute path of the
+        identified strategic gaps, extracted winning hooks (longevity-proven),
+        referral motions, and a snapshot of the competitor's ad library
+        (capped at top 5 by days_active). Returns the absolute path of the
         saved audit.json.
 
         winning_hooks: list of {pattern, description, source_ad_id, days_active, confidence}
@@ -135,13 +206,12 @@ def _make_generate_pitch_tool():
         previously saved audit.json. Output is stored at
         prospects/<prospect_id>/pitch.pdf. Returns the absolute output path.
 
-        REQUIRES save_prospect_audit to have been called for this prospect_id
-        first - the pitch PDF reads from audit.json.
+        REQUIRES save_prospect_audit to have been called for this
+        prospect_id first.
 
-        cta: one sentence describing the next step (e.g. '15-minute call to
-             walk through how we'd rebuild your top-performing ad as UGC').
-        framework_strengths: optional list of agency value props to override
-                             the defaults. Pass None to use DEFAULT_FRAMEWORK_STRENGTHS.
+        cta: one sentence describing the next step.
+        framework_strengths: optional override of the agency's default
+                             value props.
         """
         store = ProspectStore(prospect_id)
         audit = store.read_audit()
@@ -179,12 +249,9 @@ def outreach_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         )
     validate_model_id(model_name)
 
-    # Silo-less worker - no ClientContext load. The Outreach agent operates
-    # globally and writes to prospects/<slug>/ via the ProspectStore.
-
     tools = [
         make_tavily_competitor_search_tool(),
-        make_fb_ads_search_tool(),
+        _make_capped_fb_ads_tool(),
         _make_save_audit_tool(),
         _make_generate_pitch_tool(),
     ]
@@ -195,7 +262,6 @@ def outreach_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
 
     new_messages = result["messages"][len(state["messages"]):]
 
-    # Surface audit JSON + pitch PDF paths to the UI's Lead Generation panel.
     artifacts = dict(state.get("artifacts") or {})
     artifacts["model_used"] = model_name
     audits: list[str] = []

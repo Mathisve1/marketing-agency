@@ -1,12 +1,21 @@
 """Performance evaluation + negative-constraint writer for the Analyst.
 
-Pure functions: aggregate_by_hook, evaluate_hooks.
-LangChain tool factories: make_evaluation_tool, make_constraint_writer,
-make_analyst_summary_writer.
+V1.1 refactor: deprecated the separate pull_meta_insights and
+evaluate_performance tools. The Analyst LLM no longer routes raw
+insights JSON between tools - all data fetching, aggregation, and scoring
+happen in Python via the new analyze_campaign_performance tool, which
+returns a compressed text summary to the LLM. This eliminates the
+token-bomb problem and prevents the LLM from hallucinating arithmetic.
 
-Failure rule: a hook fails when total_spend >= min_spend_usd (default $50)
-AND (ROAS < roas_target OR CTR < ctr_target). Thresholds are read from
-MASTER_CONTEXT.md's performance_benchmarks at evaluation time, not hard-coded.
+Pure functions (internal):
+  - aggregate_by_hook        spend-weighted ROAS, summed CTR per hook
+  - evaluate_hooks           apply pass/fail rule per hook
+  - _format_evaluation_summary  compressed text for the LLM
+
+LangChain tool factories (exposed to the LLM):
+  - make_analyze_campaign_performance_tool   data routing + scoring + format
+  - make_constraint_writer                   writes a HARD NegativeConstraint
+  - make_analyst_summary_writer              appends a narrative note
 """
 from __future__ import annotations
 
@@ -17,6 +26,7 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from agents.analyst.meta_insights import fetch_meta_insights_data
 from core.client_context import ClientContext
 from core.context_schema import (
     AddedBy,
@@ -26,10 +36,6 @@ from core.context_schema import (
 
 
 DEFAULT_MIN_SPEND_USD = 50.0
-
-# Convention enforced by write_negative_constraint below: rule always contains
-# the hook ID. We parse it back out to detect "already constrained" hooks
-# without a schema change.
 _HOOK_ID_IN_RULE_RX = re.compile(r"\b(WH-\d+)\b")
 
 
@@ -52,13 +58,19 @@ class HookEvaluation:
     metrics: dict
     proposed_rule: Optional[str] = None
     proposed_reason: Optional[str] = None
+    already_constrained: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Pure functions (used internally by analyze_campaign_performance)
+# --------------------------------------------------------------------------- #
 
 
 def aggregate_by_hook(insights: list[dict]) -> dict[str, HookPerformance]:
     """Group ad-level insights by hook_id; spend-weighted ROAS + summed CTR.
 
-    Rows without a parseable hook_id are skipped (e.g. brand-awareness boosts
-    where the media buyer didn't follow the WH-/RM- convention).
+    Rows without a parseable hook_id are skipped (e.g. brand-awareness
+    boosts where the media buyer did not follow the WH-/RM- convention).
     """
     bucket: dict[str, list[dict]] = {}
     for row in insights:
@@ -73,7 +85,6 @@ def aggregate_by_hook(insights: list[dict]) -> dict[str, HookPerformance]:
         total_impressions = sum(int(r.get("impressions") or 0) for r in rows)
         total_clicks = sum(int(r.get("inline_link_clicks") or 0) for r in rows)
 
-        # Spend-weighted ROAS - only ads with a reported ROAS contribute.
         roas_rows = [r for r in rows if r.get("purchase_roas") is not None]
         roas_spend = sum(float(r["spend"]) for r in roas_rows)
         weighted_roas: Optional[float] = None
@@ -103,7 +114,7 @@ def evaluate_hooks(
     min_spend_usd: float = DEFAULT_MIN_SPEND_USD,
     skip_hook_ids: Optional[set[str]] = None,
 ) -> list[HookEvaluation]:
-    """Apply the failure rule to each hook. Returns one HookEvaluation per hook."""
+    """Apply the failure rule per hook. Returns one HookEvaluation per hook."""
     skip_hook_ids = skip_hook_ids or set()
     results: list[HookEvaluation] = []
 
@@ -117,12 +128,12 @@ def evaluate_hooks(
             "clicks": perf.clicks,
         }
 
-        # Insufficient signal: skip pass/fail call.
         if perf.total_spend < min_spend_usd:
             results.append(HookEvaluation(
                 hook_id=hook_id, failed=False,
                 reasons=[f"insufficient spend ${perf.total_spend:.2f} < ${min_spend_usd:.2f}"],
                 metrics=metrics,
+                already_constrained=hook_id in skip_hook_ids,
             ))
             continue
 
@@ -158,6 +169,7 @@ def evaluate_hooks(
             metrics=metrics,
             proposed_rule=proposed_rule,
             proposed_reason=proposed_reason,
+            already_constrained=hook_id in skip_hook_ids,
         ))
     return results
 
@@ -173,34 +185,150 @@ def _existing_constrained_hook_ids(ctx: ClientContext) -> set[str]:
     return out
 
 
+def _format_evaluation_summary(
+    evaluations: list[HookEvaluation],
+    time_preset: str,
+    roas_target: Optional[float],
+    ctr_target: Optional[float],
+    min_spend_usd: float,
+) -> str:
+    """Render the evaluation results as a compact text block for the LLM.
+
+    10-100x smaller than the raw insights JSON. The LLM gets verdicts +
+    rules ready to copy into write_negative_constraint - nothing else.
+    """
+    failed = [e for e in evaluations if e.failed]
+    passing = [e for e in evaluations if not e.failed and not e.reasons]
+    insufficient = [e for e in evaluations if not e.failed and e.reasons]
+
+    targets_line = (
+        f"targets: ROAS>={roas_target if roas_target is not None else 'n/a'}, "
+        f"CTR>={ctr_target if ctr_target is not None else 'n/a'}, "
+        f"min_spend=${min_spend_usd:.2f}"
+    )
+
+    lines = [
+        f"Campaign analysis (window: {time_preset}, {targets_line})",
+        "",
+    ]
+
+    if not evaluations:
+        lines.append(
+            "No hooks with parseable ad_name found in the window. Either no "
+            "ads ran, or the media buyer did not follow the "
+            "[Audience]_[WH-xxx]_[RM-yyy] convention."
+        )
+        return "\n".join(lines)
+
+    if failed:
+        lines.append("FAILED (need negative constraint unless already_constrained):")
+        for e in failed:
+            roas_str = (
+                f"{e.metrics['weighted_roas']:.2f}"
+                if e.metrics.get("weighted_roas") is not None
+                else "n/a"
+            )
+            ctr_str = f"{e.metrics['weighted_ctr']:.4f}"
+            spend_str = f"${e.metrics['total_spend']:.2f}"
+            constrained = "YES (skip)" if e.already_constrained else "NO"
+            lines.append(
+                f"- {e.hook_id}: {spend_str} spend, ROAS {roas_str}, "
+                f"CTR {ctr_str}, {e.metrics['ad_count']} ad(s) | "
+                f"already_constrained={constrained}"
+            )
+            if not e.already_constrained and e.proposed_rule:
+                lines.append(f'    rule:   "{e.proposed_rule}"')
+                lines.append(f'    reason: "{e.proposed_reason}"')
+        lines.append("")
+
+    if passing:
+        lines.append("PASSING (no action needed):")
+        for e in passing:
+            roas_str = (
+                f"{e.metrics['weighted_roas']:.2f}"
+                if e.metrics.get("weighted_roas") is not None
+                else "n/a"
+            )
+            ctr_str = f"{e.metrics['weighted_ctr']:.4f}"
+            spend_str = f"${e.metrics['total_spend']:.2f}"
+            lines.append(
+                f"- {e.hook_id}: {spend_str} spend, ROAS {roas_str}, CTR {ctr_str}"
+            )
+        lines.append("")
+
+    if insufficient:
+        lines.append(f"INSUFFICIENT SPEND (need >=${min_spend_usd:.2f} to evaluate):")
+        for e in insufficient:
+            lines.append(f"- {e.hook_id}: ${e.metrics['total_spend']:.2f} spend")
+        lines.append("")
+
+    actionable = [e for e in failed if not e.already_constrained]
+    if actionable:
+        lines.append(
+            f"NEXT: call write_negative_constraint for each of the "
+            f"{len(actionable)} FAILED hook(s) NOT already constrained, "
+            f"using the rule + reason verbatim from above."
+        )
+    else:
+        lines.append(
+            "NEXT: no constraints to add this run. Call append_analyst_summary and stop."
+        )
+
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
-# Tool factories (closure-based, same pattern as Strategist/Producer)
+# Tool factories
 # --------------------------------------------------------------------------- #
 
 
-def make_evaluation_tool(ctx: ClientContext):
-    """LangChain tool: aggregate Meta insights by hook + apply pass/fail rules."""
+def make_analyze_campaign_performance_tool(ctx: ClientContext):
+    """LangChain tool: fetch Meta insights, aggregate, evaluate, return summary.
 
-    @tool("evaluate_performance")
-    def evaluate_performance(
-        insights: list[dict],
+    Replaces the old two-tool flow (pull_meta_insights -> evaluate_performance)
+    with a single tool whose return value is a compressed text summary. The
+    LLM never sees the raw insights JSON - it only reads the verdict and
+    acts on failed hooks via write_negative_constraint.
+    """
+
+    @tool("analyze_campaign_performance")
+    def analyze_campaign_performance(
+        time_preset: str = "last_14d",
         min_spend_usd: float = DEFAULT_MIN_SPEND_USD,
-    ) -> dict:
-        """Aggregate per-hook spend/ROAS/CTR from a list of Meta insight rows
-        (output of `pull_meta_insights`), then compare against MASTER_CONTEXT.md's
-        roas_target and ctr_target. Returns:
-          {
-            "benchmarks_used": {roas_target, ctr_target, min_spend_usd},
-            "evaluations": [{hook_id, failed, reasons, metrics,
-                            proposed_rule, proposed_reason, already_constrained}],
-            "warning": "..."  # only if benchmarks aren't configured
-          }
-        Failed hooks come with a proposed_rule + proposed_reason ready to feed
-        into write_negative_constraint."""
+    ) -> str:
+        """Fetch the client's Meta ad performance for `time_preset`, aggregate
+        by hook_id, and score each hook against MASTER_CONTEXT.md's
+        performance_benchmarks. Returns a compressed text summary listing
+        FAILED / PASSING / INSUFFICIENT SPEND hooks with the metrics that
+        justify each verdict.
+
+        Failed hooks include a proposed_rule + proposed_reason that you can
+        pass verbatim into write_negative_constraint.
+
+        time_preset:   Meta time window (e.g. 'last_14d', 'last_28d').
+                       Aliases like 'last_14_days' are accepted.
+        min_spend_usd: spend floor below which a hook is considered
+                       insufficient signal. Default $50 (industry standard).
+        """
         fm, _ = ctx.read()
         benchmarks = fm.performance_benchmarks
-        skip = _existing_constrained_hook_ids(ctx)
+
+        if benchmarks.roas_target is None and benchmarks.ctr_target is None:
+            return (
+                "ERROR: No performance benchmarks set in MASTER_CONTEXT.md. "
+                "Configure performance_benchmarks.roas_target and/or "
+                "performance_benchmarks.ctr_target before running the Analyst."
+            )
+
+        insights = fetch_meta_insights_data(time_preset=time_preset)
+        if not insights:
+            return (
+                f"No ads found in the Meta account for window={time_preset}. "
+                f"Either no ads ran, or META_AD_ACCOUNT_ID is misconfigured."
+            )
+
         performance = aggregate_by_hook(insights)
+        skip = _existing_constrained_hook_ids(ctx)
         evaluations = evaluate_hooks(
             performance,
             roas_target=benchmarks.roas_target,
@@ -209,34 +337,15 @@ def make_evaluation_tool(ctx: ClientContext):
             skip_hook_ids=skip,
         )
 
-        result: dict = {
-            "benchmarks_used": {
-                "roas_target": benchmarks.roas_target,
-                "ctr_target": benchmarks.ctr_target,
-                "min_spend_usd": min_spend_usd,
-            },
-            "evaluations": [
-                {
-                    "hook_id": ev.hook_id,
-                    "failed": ev.failed,
-                    "reasons": ev.reasons,
-                    "metrics": ev.metrics,
-                    "proposed_rule": ev.proposed_rule,
-                    "proposed_reason": ev.proposed_reason,
-                    "already_constrained": ev.hook_id in skip,
-                }
-                for ev in evaluations
-            ],
-        }
-        if benchmarks.roas_target is None and benchmarks.ctr_target is None:
-            result["warning"] = (
-                "No performance benchmarks set in MASTER_CONTEXT.md. "
-                "Cannot evaluate performance until roas_target and/or "
-                "ctr_target are configured in performance_benchmarks."
-            )
-        return result
+        return _format_evaluation_summary(
+            evaluations,
+            time_preset=time_preset,
+            roas_target=benchmarks.roas_target,
+            ctr_target=benchmarks.ctr_target,
+            min_spend_usd=min_spend_usd,
+        )
 
-    return evaluate_performance
+    return analyze_campaign_performance
 
 
 def make_constraint_writer(ctx: ClientContext):
@@ -258,13 +367,11 @@ def make_constraint_writer(ctx: ClientContext):
         rule:    short rule text; must contain the hook_id substring so the
                  'already constrained' guard can detect duplicates.
         reason:  justification with metrics, typically the proposed_reason
-                 returned by evaluate_performance.
+                 returned by analyze_campaign_performance.
         """
         existing = _existing_constrained_hook_ids(ctx)
         if hook_id in existing:
             return f"SKIPPED: {hook_id} already has a negative constraint."
-        # Guard the convention - the duplicate-detection regex relies on the
-        # hook ID appearing in the rule text.
         if hook_id not in rule:
             rule = f"{rule} ({hook_id})"
         constraint = NegativeConstraint(
