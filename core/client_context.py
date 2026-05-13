@@ -4,9 +4,10 @@
   - performance_log.json   append-only generation log
   - references/            asset directories
 
-All cross-agent communication routes through this module - agents never touch
-the files directly, so the schema is enforced in one place and writes are
-atomic (file ops) / transactional (SQL).
+V1.3: SQLite connections enable WAL journaling so reads and writes from
+different processes (Streamlit + MCP server + agents) don't block each
+other. A new update_performance_entry_by_task_id() supports the
+Producer's async submit/poll pattern.
 """
 from __future__ import annotations
 
@@ -90,11 +91,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _next_id_sql(conn: sqlite3.Connection, table: str, prefix: str) -> str:
-    """e.g. _next_id_sql(conn, 'winning_hooks', 'WH') -> 'WH-004'.
-
-    Relies on zero-padded IDs (WH-001, WH-002, ...) so lex-order matches
-    numeric order. Sufficient for up to 999 entries per table per client.
-    """
+    """e.g. _next_id_sql(conn, 'winning_hooks', 'WH') -> 'WH-004'."""
     cursor = conn.execute(
         f"SELECT id FROM {table} WHERE id LIKE ? ORDER BY id DESC LIMIT 1",
         (f"{prefix}-%",),
@@ -110,12 +107,24 @@ def _next_id_sql(conn: sqlite3.Connection, table: str, prefix: str) -> str:
 
 
 def _coerce_enum_value(value: Union[str, Confidence, Severity, None]) -> Optional[str]:
-    """Accept enum or string; return the string value SQLite expects."""
     if value is None:
         return None
     if hasattr(value, "value"):
         return value.value
     return str(value).lower()
+
+
+def _set_wal_mode(conn: sqlite3.Connection) -> None:
+    """Enable Write-Ahead Logging. With WAL, readers do not block writers
+    and writers do not block readers - critical now that Streamlit + MCP +
+    a running agent may concurrently touch the same client_data.db.
+
+    WAL mode is sticky (persisted in the DB header), so once set on a file
+    it survives across connections. Setting it on every connect costs a
+    single pragma round-trip but guarantees the mode even if a third-party
+    tool flipped it back to DELETE.
+    """
+    conn.execute("PRAGMA journal_mode=WAL")
 
 
 # --------------------------------------------------------------------------- #
@@ -145,7 +154,7 @@ class ClientContext:
                 f"No MASTER_CONTEXT.md for client {client_id!r} at {ctx.context_path}. "
                 f"Call ClientContext.onboard(...) to create it from the template."
             )
-        ctx.read()  # fail fast on schema errors
+        ctx.read()
         ctx._init_db()
         ctx._migrate_yaml_to_sql_if_needed()
         return ctx
@@ -182,18 +191,29 @@ class ClientContext:
     # ---------- SQLite plumbing ----------
 
     def _init_db(self) -> None:
-        """Create tables + indexes if missing. Idempotent (CREATE IF NOT EXISTS)."""
+        """Create tables + indexes if missing. Enables WAL on the file.
+
+        Idempotent: CREATE IF NOT EXISTS for tables/indexes; PRAGMA WAL is
+        a no-op when the DB is already in WAL mode.
+        """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(str(self.db_path)) as conn:
+            _set_wal_mode(conn)
             for ddl in ALL_DDL:
                 conn.execute(ddl)
             conn.commit()
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
-        """Open a SQLite connection. Commits on success, rolls back on
-        exception, always closes."""
+        """Open a SQLite connection in WAL journal mode. Commits on success,
+        rolls back on exception, always closes.
+
+        WAL is set on every connection so a concurrent process that may
+        have flipped the file out of WAL mode still gets the non-blocking
+        read/write semantics for this session.
+        """
         conn = sqlite3.connect(str(self.db_path))
+        _set_wal_mode(conn)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -205,28 +225,25 @@ class ClientContext:
             conn.close()
 
     def _read_raw_frontmatter(self) -> dict:
-        """Parse YAML frontmatter as raw dict (no Pydantic). Used during
-        migration to access pre-V1.2 list keys that MasterContext now drops."""
         text = self.context_path.read_text(encoding="utf-8")
         yaml_block, _body = _split_frontmatter(text)
         return yaml.safe_load(yaml_block) or {}
 
     def _migrate_yaml_to_sql_if_needed(self) -> int:
         """One-shot: if SQL tables are empty AND legacy YAML lists exist,
-        move them into SQLite and strip the dropped keys from MASTER_CONTEXT.md.
-        Returns the number of rows migrated. Idempotent."""
+        move them into SQLite and strip the dropped keys from MASTER_CONTEXT.md."""
         with self._db() as conn:
             total = sum(
                 conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                 for t in ("winning_hooks", "referral_motions", "negative_constraints")
             )
         if total > 0:
-            return 0  # already populated; assume migrated.
+            return 0
 
         raw = self._read_raw_frontmatter()
         legacy_keys = ("winning_hooks", "referral_motions", "negative_constraints")
         if not any(raw.get(k) for k in legacy_keys):
-            return 0  # nothing to migrate.
+            return 0
 
         migrated = 0
         for entry in raw.get("winning_hooks") or []:
@@ -249,8 +266,8 @@ class ClientContext:
                 continue
 
         if migrated > 0:
-            fm, body = self.read()  # MasterContext now drops the legacy keys
-            self.write(fm, body)    # rewrite YAML without them
+            fm, body = self.read()
+            self.write(fm, body)
 
         return migrated
 
@@ -267,7 +284,6 @@ class ClientContext:
         _atomic_write(self.context_path, _join_frontmatter(frontmatter, body))
 
     def append_narrative(self, section_heading: str, paragraph: str) -> None:
-        """Append a paragraph under '## <heading>' in the markdown body."""
         fm, body = self.read()
         marker = f"## {section_heading}"
         if marker in body:
@@ -276,7 +292,7 @@ class ClientContext:
             body = f"{body.rstrip()}\n\n{marker}\n\n{paragraph}\n"
         self.write(fm, body)
 
-    # ---------- SQL-backed mutators (V1.2+) ----------
+    # ---------- SQL-backed mutators ----------
 
     def add_winning_hook(self, hook: WinningHook) -> str:
         with self._db() as conn:
@@ -346,7 +362,7 @@ class ClientContext:
             )
         return constraint.id
 
-    # ---------- SQL-backed fetchers (V1.2+) ----------
+    # ---------- SQL-backed fetchers ----------
 
     def get_winning_hooks(
         self,
@@ -355,8 +371,6 @@ class ClientContext:
         since: Optional[datetime] = None,
         limit: Optional[int] = None,
     ) -> list[WinningHook]:
-        """Read winning_hooks from SQL. Filters compose; all optional.
-        Returns newest-first."""
         sql = "SELECT * FROM winning_hooks"
         params: list[Any] = []
         clauses: list[str] = []
@@ -378,7 +392,6 @@ class ClientContext:
         return [WinningHook.model_validate(dict(r)) for r in rows]
 
     def get_winning_hook(self, hook_id: str) -> Optional[WinningHook]:
-        """Single-row lookup. Returns None when the hook_id is not found."""
         with self._db() as conn:
             row = conn.execute(
                 "SELECT * FROM winning_hooks WHERE id = ?", (hook_id,)
@@ -418,8 +431,6 @@ class ClientContext:
         severity: Union[Severity, str, None] = None,
         limit: Optional[int] = None,
     ) -> list[NegativeConstraint]:
-        """Read negative_constraints from SQL. The Producer typically calls
-        this with severity=Severity.HARD to filter for enforced constraints."""
         sql = "SELECT * FROM negative_constraints"
         params: list[Any] = []
         if severity is not None:
@@ -436,12 +447,11 @@ class ClientContext:
         out: list[NegativeConstraint] = []
         for r in rows:
             d = dict(r)
-            # source_log_entries is JSON-encoded TEXT in SQLite.
             d["source_log_entries"] = json.loads(d.get("source_log_entries") or "[]")
             out.append(NegativeConstraint.model_validate(d))
         return out
 
-    # ---------- assets (unchanged) ----------
+    # ---------- assets ----------
 
     def asset_paths(self) -> dict[str, Path]:
         fm, _ = self.read()
@@ -458,7 +468,7 @@ class ClientContext:
             return []
         return sorted(p for p in base.glob("*") if p.is_file())
 
-    # ---------- performance log (unchanged) ----------
+    # ---------- performance log ----------
 
     def read_performance_log(self) -> list[dict]:
         if not self.performance_log_path.exists():
@@ -473,6 +483,34 @@ class ClientContext:
             self.performance_log_path,
             json.dumps(entries, indent=2, default=str, ensure_ascii=False),
         )
+
+    def update_performance_entry_by_task_id(
+        self,
+        task_id: str,
+        updates: dict,
+    ) -> bool:
+        """In-place merge `updates` into the entry whose kling_task_id matches.
+
+        Powers the Producer's async submit/poll lifecycle - the submit step
+        writes a 'pending' entry; check_video_status mutates that same entry
+        to 'completed' or 'failed' once Kling reports a terminal state.
+
+        Returns True if a matching entry was found and updated, False otherwise.
+        Atomic via _atomic_write (temp file -> os.replace).
+        """
+        entries = self.read_performance_log()
+        matched = False
+        for entry in entries:
+            if entry.get("kling_task_id") == task_id:
+                entry.update(updates)
+                matched = True
+                break
+        if matched:
+            _atomic_write(
+                self.performance_log_path,
+                json.dumps(entries, indent=2, default=str, ensure_ascii=False),
+            )
+        return matched
 
 
 def list_clients(clients_root: Optional[Path] = None) -> list[str]:
