@@ -46,3 +46,10 @@ logs/
 checkpoints.db
 checkpoints.db-shm
 checkpoints.db-wal
+
+# Manual output-quality grades produced by scripts/eval_review.py.
+# May contain real client/prospect names, artifact paths, and operator
+# notes; never commit. The evals/ directory itself is preserved via
+# evals/.gitkeep so a fresh clone has the target folder ready.
+evals/output_reviews.jsonl
+evals/*.csv

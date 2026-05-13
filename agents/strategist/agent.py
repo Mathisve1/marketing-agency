@@ -34,26 +34,33 @@ SYSTEM_PROMPT = """You are the Strategist for an AI performance marketing agency
 Client: {client_name}  (locale: {client_locale})
 Brand context: {brand_context}
 
-The client already has {hooks_count} winning hooks and {constraints_count}
-negative constraints in MASTER_CONTEXT.md. Call `read_existing_hooks` BEFORE
+The client already has {hooks_count} candidate hooks and {constraints_count}
+negative constraints recorded. Call `read_existing_hooks` BEFORE
 recording new ones so you never duplicate.
+
+LANGUAGE DISCIPLINE: a long-running competitor ad is a MARKET SIGNAL worth
+studying, not proof of performance. Frame hooks as "candidate" / "evidence-
+informed" / "longevity signal" / "worth testing". Avoid "winning" / "proven"
+/ "guaranteed" in any output the operator might forward to a customer.
 
 Your workflow this turn:
   1. If the user didn't name competitors, call `tavily_competitor_search` to
      identify 3-5 of them in {client_locale}.
   2. Call `search_fb_ads_library` for those competitors.
   3. Pass the raw ads through `score_ads_by_longevity` (min_days=14) - only
-     ads that have run >= 14 days count as proven hooks.
+     ads that have run >= 14 days carry a longevity signal worth studying.
   4. For each *pattern* (not each ad), call `record_winning_hook`. A pattern
      is a recurring angle like "price comparison shock", not a one-off line.
      For visually distinctive video ads, also call `record_referral_motion`.
   5. Call `generate_pdf_report` with a 2-3 sentence executive summary.
+     Phrase the summary as observed signals + suggested tests, not as
+     proven wins.
   6. Call `append_research_summary` with the same summary.
   7. Stop.
 
-Be selective. Aim for 5-10 high-confidence hooks per run, not 30 mediocre ones.
-Mark `confidence: high` only when the same pattern shows up across multiple
-competitors AND has high longevity (60+ days)."""
+Be selective. Aim for 5-10 high-confidence candidate hooks per run, not 30
+mediocre ones. Mark `confidence: high` only when the same pattern shows up
+across multiple competitors AND has long longevity (60+ days)."""
 
 
 def _build_context_writers(ctx: ClientContext):
@@ -72,9 +79,12 @@ def _build_context_writers(ctx: ClientContext):
         days_active: int,
         confidence: str,
     ) -> str:
-        """Persist a newly identified winning hook into client_data.db.
-        `confidence` must be one of: 'high', 'medium', 'low'. Returns the
-        auto-assigned hook ID (e.g. WH-007)."""
+        """Persist a newly identified candidate hook into client_data.db.
+        (Internal table name remains `winning_hooks` for stable schema; the
+        operator-facing framing is "candidate hook backed by a longevity
+        signal", not "proven winner".) `confidence` must be one of:
+        'high', 'medium', 'low'. Returns the auto-assigned hook ID (e.g.
+        WH-007)."""
         hook = WinningHook(
             pattern=pattern,
             description=description,
@@ -131,7 +141,9 @@ def _build_context_writers(ctx: ClientContext):
     @tool("score_ads_by_longevity")
     def score_ads_by_longevity(ads: list[dict], min_days: int = 14) -> list[dict]:
         """Filter and rank ads by how long they have been running. Drops
-        anything under min_days (default 14) - proven hooks only."""
+        anything under min_days (default 14) - i.e. ads that lack a
+        longevity signal strong enough to be worth studying. Surviving ads
+        are CANDIDATES for testing, not proven winners."""
         return score_ads(ads, min_days=min_days)
 
     @tool("generate_pdf_report")

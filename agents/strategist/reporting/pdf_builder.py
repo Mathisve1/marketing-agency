@@ -85,10 +85,13 @@ def build_market_analysis_pdf(
     pdf.set_text_color(40, 40, 40)
     pdf.multi_cell(0, 6, _sanitize(executive_summary))
 
-    # ---- Winning hooks ----
+    # ---- Candidate hooks (longevity signal) ----
+    # V1.6 language audit: section title softened from "Winning Hooks" to
+    # avoid overclaiming. The data-model name `winning_hooks` is kept for
+    # schema stability; only the customer-facing PDF copy changes.
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, f"Winning Hooks ({len(winning_hooks)})")
+    pdf.cell(0, 10, f"Candidate Hooks - Longevity Signal ({len(winning_hooks)})")
     pdf.ln(12)
     if not winning_hooks:
         pdf.set_font("Helvetica", "I", 10)

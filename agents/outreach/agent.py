@@ -5,11 +5,17 @@ by days_active desc) before its payload reaches the LLM, preventing
 context bloat from 100-ad scrapes. The SYSTEM_PROMPT pivots from
 fabricated visual critiques to text/metadata-derivable strategic gaps.
 
+V1.6 language audit: "winning_hooks (longevity-proven)" framing softened
+throughout. Long-running ads are a market signal worth studying, not
+proof of performance. The internal field name `winning_hooks` is kept
+for stable schema; only customer-facing language changes.
+
 Workflow:
   1. Tavily competitor search to discover brand names in a target niche/country.
   2. Capped Apify FB Ads scrape for each brand's current Meta ad library.
   3. Analyze each library STRICTLY on text + metadata: identify strategic
-     marketing gaps, extract winning hooks (longevity-proven), referral motions.
+     marketing gaps with cited evidence, extract candidate hooks
+     (longevity signal, not proof), referral motions.
   4. Save audit JSON + render Brand Audit & Pitch PDF per prospect.
 
 Silo-less worker: state['client_id'] is None, no ClientContext loaded.
@@ -78,28 +84,52 @@ Your workflow this turn:
         framing, color grading, "polished look", studio aesthetic, etc.).
 
         Identify 2-4 STRATEGIC MARKETING GAPS from the data you DO have.
-        Examples of legitimate gaps (use these as templates, derived from
-        the metadata in each ad row):
-          - Copy diversity: "Brand relies on a single copy angle across
-            all 10 long-running ads"   (count distinct body_text patterns)
-          - Creative freshness: "No fresh creative launched in 67+ days
-            (oldest start_date: 2026-02-15)"   (check newest start_date)
-          - Format mix: "Image-only ad library; no video presence on Meta"
-            (check media_type distribution)
-          - CTA repetition: "All 10 ads use the same CTA"
-            (count distinct cta_text)
+        EVERY gap MUST cite at least one piece of evidence the operator
+        can verify against the scraped ads. Use the structured form for
+        each weakness:
+          {
+            "description": "<one-sentence claim>",
+            "evidence":    ["<ad_archive_id or source_ad_id>",
+                            "<short body_text excerpt <=120 chars>",
+                            "<observed count e.g. '8 of 10 ads use same CTA'>"],
+            "confidence":  "high" | "medium" | "low"
+          }
+        Confidence guide:
+          - "high"   = three or more evidence items, or a clean count
+                       across the full sample (e.g. 10 of 10 ads).
+          - "medium" = one or two evidence items, plausible pattern.
+          - "low"    = thin signal; surface the observation but flag as
+                       worth verifying. Prefer "low" over fabricating.
+
+        Legitimate gap templates (each shows description + the kind of
+        evidence the gap requires):
+          - Copy diversity: "Brand relies on a single copy angle"
+            evidence: ["8 of 10 ads share the body_text opener 'Save 30%...'"]
+          - Creative freshness: "No fresh creative launched recently"
+            evidence: ["newest start_date is 2026-02-15 (67 days ago)"]
+          - Format mix: "Image-only ad library; no video presence"
+            evidence: ["10 of 10 ads have media_type=IMAGE"]
+          - CTA repetition: "All ads use the same CTA"
+            evidence: ["10 of 10 ads use cta_text='Shop Now'"]
           - Framework: "Captions read as product-feature lists; no
-            Hook-Story-Offer narrative"   (inspect body_text structure)
-          - Audience signal: "Body text is generic - no persona-specific
-            language"   (qualitative read of body_text)
+            Hook-Story-Offer narrative"
+            evidence: ["body_text starts with feature bullets in ads
+                       <ad_archive_id_1>, <ad_archive_id_2>, <ad_archive_id_3>"]
+          - Audience signal: "Body text is generic, not persona-specific"
+            evidence: ["no demographic / use-case language in any of the
+                       10 sampled body_text fields"]
 
-        DO NOT fabricate gaps. If the data shows a healthy ad library
-        (diverse copy, fresh creative, varied CTAs), say so honestly and
-        cap the gaps list at fewer than 4.
+        DO NOT fabricate evidence. If you cannot back a claim with at
+        least one verifiable item from the scraped ads, EITHER mark
+        confidence="low" with a clear note OR drop the claim. If the data
+        shows a healthy ad library (diverse copy, fresh creative, varied
+        CTAs), say so honestly and cap the gaps list at fewer than 4.
 
-     d. Extract 2-3 winning_hooks from the body_text of the longest-running
-        ads. Each hook: {pattern, description, source_ad_id, days_active,
-        confidence: 'high'|'medium'|'low'}.
+     d. Extract 2-3 candidate hooks from the body_text of the
+        longest-running ads. Long-running ads are a market signal worth
+        studying, NOT proof of performance - phrase recommendations
+        accordingly. Each hook: {pattern, description, source_ad_id,
+        days_active, confidence: 'high'|'medium'|'low'}.
 
      e. Extract 0-2 referral_motions ONLY for ads where media_type is VIDEO.
         Each motion: {description, reference_path:
@@ -224,8 +254,10 @@ def _make_save_audit_tool():
 
         Call this once per prospect, AFTER scraping their ads via
         search_fb_ads_library and analyzing the results. The audit captures
-        identified strategic gaps, extracted winning hooks (longevity-proven),
-        referral motions, and a snapshot of the competitor's ad library
+        identified strategic gaps (each with evidence + confidence),
+        extracted candidate hooks (longevity signal, not proof of
+        performance), referral motions, and a snapshot of the
+        competitor's ad library
         (capped at top 5 by days_active). Returns the absolute path of the
         saved audit.json.
 

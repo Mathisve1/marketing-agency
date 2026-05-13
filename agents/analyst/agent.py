@@ -28,8 +28,10 @@ Performance benchmarks:
   ROAS target: {roas_target}
   CTR target:  {ctr_target}
 
-The client has {hooks_count} winning hooks in client_data.db and
-{constraints_count} negative constraints already in force.
+The client has {hooks_count} candidate hooks tracked in client_data.db
+(internal table is `winning_hooks`; treat them as longevity-signal
+candidates worth measuring, not proven winners) and {constraints_count}
+negative constraints already in force.
 
 Your workflow this turn:
   1. Call `analyze_campaign_performance` (default time_preset='last_14d';

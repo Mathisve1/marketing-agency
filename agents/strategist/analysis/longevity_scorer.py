@@ -1,7 +1,9 @@
 """Longevity scorer: filter and rank ads by how long they've been running.
 
-Business rule from the Strategist brief: ads under 14 days are dropped as
-unproven. Surviving ads get a `days_active` field and are sorted descending.
+Business rule from the Strategist brief: ads under 14 days are filtered
+out as below the longevity-signal threshold. Long-running ads are a market
+SIGNAL worth studying - not proof of performance. Surviving ads get a
+`days_active` field and are sorted descending.
 """
 from __future__ import annotations
 

@@ -60,7 +60,21 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 @dataclass
 class ProspectAudit:
-    """The shape the Outreach agent's audit tool writes; the Promote button reads."""
+    """The shape the Outreach agent's audit tool writes; the Promote button reads.
+
+    V1.6: weaknesses entries may now be EITHER a bare string (back-compat
+    with audit JSONs written before evidence-discipline landed) OR a dict
+    of shape:
+        {
+          "description": str,
+          "evidence":    list[str],
+          "confidence":  "high" | "medium" | "low",
+        }
+    The pitch_builder renders dicts richly (description bold, evidence as
+    italic sub-bullet, confidence label) and strings as plain bullets.
+    Promote-to-client reads neither — only winning_hooks/referral_motions
+    are seeded into the new client silo.
+    """
     prospect_id: str
     prospect_name: str
     niche: Optional[str] = None
@@ -68,7 +82,7 @@ class ProspectAudit:
     locale: Optional[str] = None       # e.g. 'en-GB' for a UK prospect
     audited_at: str = ""
     competitor_ads: list[dict] = field(default_factory=list)   # raw FB ads
-    weaknesses: list[str] = field(default_factory=list)        # short bullets
+    weaknesses: list = field(default_factory=list)             # list[str | dict] - see docstring
     winning_hooks: list[dict] = field(default_factory=list)    # WinningHook-shaped
     referral_motions: list[dict] = field(default_factory=list) # ReferralMotion-shaped
 

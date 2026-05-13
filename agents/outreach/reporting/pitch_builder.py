@@ -48,17 +48,90 @@ def _sanitize(text: str) -> str:
 
 
 DEFAULT_FRAMEWORK_STRENGTHS = (
-    "Hooks proven by competitor-ad longevity (we only ship patterns that "
-    "have sustained >=14 days of paid spend in your market).",
+    # V1.6: softened from "Hooks proven by competitor-ad longevity..."
+    # Long-running ads are a strong market signal worth testing, not a
+    # guarantee of performance; the previous wording overclaimed.
+    "Hooks informed by competitor-ad longevity signals (>=14 days of "
+    "sustained paid spend in your market is a strong candidate worth "
+    "testing - we treat it as evidence to study, not proof of victory).",
     "Kling 3.0 V2V production using your brand-safe character + product "
-    "references - inherits the motion of winning competitor ads while "
-    "guaranteeing copyright originality.",
+    "references - inherits the motion of long-running competitor ads "
+    "while guaranteeing copyright originality.",
     "Built-in performance feedback loop: every Meta campaign's ROAS/CTR "
-    "auto-feeds back into our hook library, blocking losers and "
-    "compounding winners over time.",
+    "auto-feeds back into our hook library, retiring underperformers and "
+    "compounding the angles your real audience actually responds to.",
     "Per-client isolation: your brand voice, forbidden terms, and audience "
     "data never bleed into another client's creative.",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Weakness rendering - accepts both shapes per V1.6 evidence-discipline pass
+# --------------------------------------------------------------------------- #
+
+
+_VALID_CONFIDENCES = {"high", "medium", "low"}
+
+
+def _render_weakness(pdf: FPDF, weakness) -> None:
+    """Render one weakness bullet on the open PDF page.
+
+    Accepts either a bare string (back-compat) or a dict of shape
+    {description, evidence: list[str], confidence: high|medium|low}.
+    Unknown dict shapes degrade gracefully to repr() rather than crash.
+
+    Implementation note: every text emission goes through multi_cell to
+    keep the cursor in a known state. Mixing cell()+ln()+multi_cell()
+    interacts badly with fpdf2's auto page-break logic and was the
+    source of "Not enough horizontal space" crashes during V1.6 dev.
+    """
+    # fpdf2 2.8 defaults multi_cell's post-render cursor to (RIGHT, TOP),
+    # leaving x at the right margin. A subsequent multi_cell(w=0, ...)
+    # then has zero remaining width and crashes "Not enough horizontal
+    # space". We follow every multi_cell with pdf.ln(...) to reset x to
+    # the left margin (matches the pattern used elsewhere in this file).
+
+    if isinstance(weakness, str):
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(0, 6, _sanitize(f"- {weakness}"))
+        pdf.ln(2)
+        return
+
+    if isinstance(weakness, dict):
+        description = weakness.get("description") or weakness.get("desc") or ""
+        evidence = weakness.get("evidence") or []
+        confidence = (weakness.get("confidence") or "").strip().lower()
+
+        # Description line (bold)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(0, 6, _sanitize(f"- {description or '(no description)'}"))
+        pdf.ln(0)  # reset x to left margin without advancing y
+
+        # Confidence label, if recognised
+        if confidence in _VALID_CONFIDENCES:
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(120, 120, 120)
+            pdf.multi_cell(0, 5, _sanitize(f"    Confidence: {confidence}"))
+            pdf.ln(0)
+
+        # Evidence sub-bullets
+        if evidence:
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_text_color(80, 80, 80)
+            for item in evidence:
+                pdf.multi_cell(0, 5, _sanitize(f"    - {item}"))
+                pdf.ln(0)
+        pdf.ln(3)
+        return
+
+    # Unknown type: render its repr so the operator sees what came through
+    # rather than crashing the whole PDF render.
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(40, 40, 40)
+    pdf.multi_cell(0, 6, _sanitize(f"- {weakness!r}"))
+    pdf.ln(2)
 
 
 def build_pitch_pdf(
@@ -113,8 +186,7 @@ def build_pitch_pdf(
         pdf.cell(0, 6, "No specific weaknesses recorded - audit may need a re-run.")
     else:
         for w in weaknesses:
-            pdf.multi_cell(0, 6, _sanitize(f"- {w}"))
-            pdf.ln(2)
+            _render_weakness(pdf, w)
 
     # ---- Current ad library snapshot ----
     pdf.add_page()
