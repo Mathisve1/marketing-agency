@@ -11,9 +11,31 @@ dist/
 build/
 .streamlit/secrets.toml
 
-# Per-client secrets
-clients/*/.env
+# === Runtime data: never commit ====================================
+# These paths are written by the running agents. They contain customer
+# assets, scraped competitor intelligence, model API audit trails, and
+# per-client commercial context. See SECURITY.md before adding rules.
 
-# Generated media (large)
-clients/*/outputs/videos/
-clients/*/outputs/reports/*.pdf
+# Per-client SQLite database + WAL/SHM journal files
+clients/*/client_data.db
+clients/*/client_data.db-shm
+clients/*/client_data.db-wal
+
+# Per-client runtime state
+clients/*/.env
+clients/*/performance_log.json
+
+# Per-client customer-supplied assets and generated media
+clients/*/references/
+clients/*/outputs/
+
+# Re-include the seed template (cloned by ClientContext.onboard for new
+# clients). Nothing sensitive should ever be placed inside _template/.
+!clients/_template/
+!clients/_template/**
+
+# Prospect data: scraped Meta ad libraries, audit JSON, pitch PDFs
+prospects/
+
+# API audit logs (Kling request/response bodies, includes prompts)
+logs/

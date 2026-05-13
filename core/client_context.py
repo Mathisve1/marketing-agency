@@ -41,6 +41,18 @@ CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 DEFAULT_CLIENTS_ROOT = Path("clients")
 TEMPLATE_DIR_NAME = "_template"
 
+# Subdirectories every client silo MUST have. Created defensively in
+# onboard() so a fresh checkout (where git dropped the empty template
+# subdirs) never produces a half-broken silo. Keep in lockstep with
+# scripts/bootstrap_env.py and the Producer's asset_paths() reads.
+_REQUIRED_CLIENT_SUBDIRS = (
+    "references/characters",
+    "references/products",
+    "references/referral_videos",
+    "outputs/videos",
+    "outputs/reports",
+)
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -167,7 +179,14 @@ class ClientContext:
         locale: str = "nl-BE",
         clients_root: Optional[Path] = None,
     ) -> "ClientContext":
-        """Clone _template/ into clients/<client_id>/ and stamp identity."""
+        """Clone _template/ into clients/<client_id>/ and stamp identity.
+
+        Defensively creates every required subdirectory after the copy so
+        a fresh checkout (where git dropped the empty template dirs) still
+        produces a fully working silo. The Producer reads from references/
+        and writes to outputs/; if either is missing it crashes with
+        FileNotFoundError before the LLM ever runs.
+        """
         _validate_client_id(client_id)
         if client_id == TEMPLATE_DIR_NAME:
             raise ValueError(f"{TEMPLATE_DIR_NAME!r} is reserved.")
@@ -178,6 +197,8 @@ class ClientContext:
         if not template.exists():
             raise FileNotFoundError(f"Template missing at {template}.")
         shutil.copytree(template, ctx.root)
+        for subdir in _REQUIRED_CLIENT_SUBDIRS:
+            (ctx.root / subdir).mkdir(parents=True, exist_ok=True)
         fm, body = ctx.read()
         fm.client = ClientIdentity(
             id=client_id, name=name, locale=locale,
