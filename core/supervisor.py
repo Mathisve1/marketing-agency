@@ -37,7 +37,6 @@ from core.client_context import ClientContext
 from core.router import route_task
 from core.state import AgentState
 
-
 _CLIENT_SCOPED = {"research", "produce", "analyze"}
 
 
