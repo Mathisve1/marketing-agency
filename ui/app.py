@@ -1,11 +1,14 @@
 """Streamlit Command Center.
 
-V1.2: hooks / motions / constraints are fetched via ctx.get_*() SQL queries
-once per page load (right after ctx.read()) and then used to render the
-sidebar caption and the three corresponding tabs.
+V1.3 (2/N): graph dispatch moves from the synchronous graph.invoke() to
+asyncio.run(run_supervisor_async(...)). The page still blocks until the
+graph completes (Streamlit's button handler is sync), but the asyncio
+plumbing forward-aligns us with future graph.astream() streaming via
+st.write_stream() - which is the actual responsiveness fix.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -14,7 +17,7 @@ import streamlit as st
 from agents.outreach.prospect_store import promote_to_client
 from core.client_context import ClientContext, list_clients
 from core.models import SUPPORTED_MODELS
-from core.supervisor import build_supervisor_graph, initial_state
+from core.supervisor import build_supervisor_graph, initial_state, run_supervisor_async
 
 
 st.set_page_config(page_title="Agency Command Center", layout="wide")
@@ -77,7 +80,12 @@ if mode == "Lead generation":
             with st.spinner(
                 f"Running Outreach with {model_id} (Apify ad scraping is slow)..."
             ):
-                result = graph.invoke(
+                # V1.3: async dispatch via asyncio.run(). Worker nodes are
+                # still sync, but LangGraph runs them on the asyncio loop
+                # via a thread pool, freeing the caller for future
+                # streaming/concurrent work.
+                result = asyncio.run(run_supervisor_async(
+                    graph,
                     initial_state(
                         client_id=None,
                         user_message=prompt,
@@ -87,7 +95,7 @@ if mode == "Lead generation":
                         "thread_id": "outreach-ui",
                         "model": model_id,
                     }},
-                )
+                ))
 
             if result.get("error"):
                 st.error(result["error"])
@@ -290,15 +298,17 @@ with tab_run:
         agent_label = task_label.split("  -  ")[0]
         with st.spinner(
             f"Running {agent_label} with {model_id} "
-            f"(Producer runs may take 1-5 minutes per video)..."
+            f"(Producer submits are fast; Strategist/Analyst can take ~30s)..."
         ):
-            result = graph.invoke(
+            # V1.3: async dispatch. See module docstring.
+            result = asyncio.run(run_supervisor_async(
+                graph,
                 initial_state(selection, prompt, task_type=task_type),
                 config={"configurable": {
                     "thread_id": f"{selection}-ui",
                     "model": model_id,
                 }},
-            )
+            ))
 
         if result.get("error"):
             st.error(result["error"])
