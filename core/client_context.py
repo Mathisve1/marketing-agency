@@ -1,13 +1,18 @@
 """Read/write the client silo:
   - MASTER_CONTEXT.md      static metadata (brand, locale, benchmarks)
-  - client_data.db         SQLite for the three dynamic lists (V1.2+)
-  - performance_log.json   append-only generation log
+  - client_data.db         SQLite: hooks/motions/constraints (V1.2+),
+                           video_plans + video_jobs (V1.4+)
   - references/            asset directories
 
 V1.3: SQLite connections enable WAL journaling so reads and writes from
 different processes (Streamlit + MCP server + agents) don't block each
-other. A new update_performance_entry_by_task_id() supports the
-Producer's async submit/poll pattern.
+other.
+
+V1.4: performance_log.json is dropped. Producer plan + job state lives
+in client_data.db (video_plans + video_jobs tables) so concurrent polls
+from the LLM and the UI no longer race on a JSON file. The empty
+template performance_log.json file is kept on disk only because the
+template copytree includes it; nothing in core code reads or writes it.
 """
 from __future__ import annotations
 
@@ -29,10 +34,14 @@ from core.context_schema import (
     ALL_DDL,
     ClientIdentity,
     Confidence,
+    JobStatus,
     MasterContext,
     NegativeConstraint,
+    PlanStatus,
     ReferralMotion,
     Severity,
+    VideoJob,
+    VideoPlan,
     WinningHook,
 )
 
@@ -489,49 +498,301 @@ class ClientContext:
             return []
         return sorted(p for p in base.glob("*") if p.is_file())
 
-    # ---------- performance log ----------
+    # ---------- video plans (V1.4 - replaces performance_log.json planning side) ----------
 
-    def read_performance_log(self) -> list[dict]:
-        if not self.performance_log_path.exists():
-            return []
-        raw = self.performance_log_path.read_text(encoding="utf-8").strip()
-        return json.loads(raw) if raw else []
-
-    def append_performance_entry(self, entry: dict) -> None:
-        entries = self.read_performance_log()
-        entries.append(entry)
-        _atomic_write(
-            self.performance_log_path,
-            json.dumps(entries, indent=2, default=str, ensure_ascii=False),
-        )
-
-    def update_performance_entry_by_task_id(
-        self,
-        task_id: str,
-        updates: dict,
-    ) -> bool:
-        """In-place merge `updates` into the entry whose kling_task_id matches.
-
-        Powers the Producer's async submit/poll lifecycle - the submit step
-        writes a 'pending' entry; check_video_status mutates that same entry
-        to 'completed' or 'failed' once Kling reports a terminal state.
-
-        Returns True if a matching entry was found and updated, False otherwise.
-        Atomic via _atomic_write (temp file -> os.replace).
-        """
-        entries = self.read_performance_log()
-        matched = False
-        for entry in entries:
-            if entry.get("kling_task_id") == task_id:
-                entry.update(updates)
-                matched = True
-                break
-        if matched:
-            _atomic_write(
-                self.performance_log_path,
-                json.dumps(entries, indent=2, default=str, ensure_ascii=False),
+    def create_video_plan(self, plan: VideoPlan) -> str:
+        """Persist a compiled Kling brief with status='pending_approval'.
+        Returns the auto-assigned plan_id (VP-NNN)."""
+        with self._db() as conn:
+            if not plan.id:
+                plan = plan.model_copy(
+                    update={"id": _next_id_sql(conn, "video_plans", "VP")}
+                )
+            conn.execute(
+                "INSERT INTO video_plans "
+                "(id, status, hook_id, motion_id, character_asset, product_asset, "
+                " duration, aspect_ratio, mode, cfg_scale, prompt, negative_prompt, "
+                " enforced_constraint_ids, created_at, decided_at, decided_by, "
+                " submit_attempts, submit_attempted_at, submit_error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    plan.id,
+                    plan.status.value,
+                    plan.hook_id,
+                    plan.motion_id,
+                    plan.character_asset,
+                    plan.product_asset,
+                    plan.duration,
+                    plan.aspect_ratio,
+                    plan.mode,
+                    plan.cfg_scale,
+                    plan.prompt,
+                    plan.negative_prompt,
+                    json.dumps(plan.enforced_constraint_ids),
+                    plan.created_at.isoformat(),
+                    plan.decided_at.isoformat() if plan.decided_at else None,
+                    plan.decided_by,
+                    plan.submit_attempts,
+                    plan.submit_attempted_at.isoformat() if plan.submit_attempted_at else None,
+                    plan.submit_error,
+                ),
             )
-        return matched
+        return plan.id
+
+    def get_video_plan(self, plan_id: str) -> Optional[VideoPlan]:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["enforced_constraint_ids"] = json.loads(d.get("enforced_constraint_ids") or "[]")
+        return VideoPlan.model_validate(d)
+
+    def list_video_plans(
+        self,
+        *,
+        status: Union[PlanStatus, str, None] = None,
+        limit: Optional[int] = None,
+    ) -> list[VideoPlan]:
+        sql = "SELECT * FROM video_plans"
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(_coerce_enum_value(status))
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        out: list[VideoPlan] = []
+        for r in rows:
+            d = dict(r)
+            d["enforced_constraint_ids"] = json.loads(d.get("enforced_constraint_ids") or "[]")
+            out.append(VideoPlan.model_validate(d))
+        return out
+
+    def reject_video_plan(self, plan_id: str, *, decided_by: str = "human") -> bool:
+        """Atomically transition pending_approval OR submitting -> rejected.
+
+        V1.4.1: now also accepts 'submitting' as a valid source so the
+        operator can clear a stuck plan (e.g. an MCP died mid-submit).
+        Caller must understand the timeout caveat: if the plan was
+        'submitting', the provider may have still accepted the request -
+        check Kling dashboard before assuming nothing happened.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as conn:
+            cur = conn.execute(
+                "UPDATE video_plans "
+                "SET status = ?, decided_at = ?, decided_by = ? "
+                "WHERE id = ? AND status IN (?, ?)",
+                (
+                    PlanStatus.REJECTED.value, now, decided_by,
+                    plan_id,
+                    PlanStatus.PENDING_APPROVAL.value,
+                    PlanStatus.SUBMITTING.value,
+                ),
+            )
+        return cur.rowcount > 0
+
+    def claim_plan_for_submission(
+        self, plan_id: str, *, claimed_by: str = "human"
+    ) -> bool:
+        """Atomic compare-and-set: pending_approval -> submitting.
+
+        ONLY the caller that gets True back may call Kling for this plan.
+        If two processes (e.g. Streamlit double-click, MCP retry, parallel
+        workers) try to claim simultaneously, exactly ONE wins because
+        SQLite serializes the UPDATE statement and the WHERE clause filters
+        on the source status.
+
+        Side effects on success:
+          - status: pending_approval -> submitting
+          - submit_attempts: incremented
+          - submit_attempted_at: set to now (UTC)
+          - submit_error: NOT cleared - preserves the prior failure reason
+            so the operator's audit trail keeps it visible until success.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as conn:
+            cur = conn.execute(
+                "UPDATE video_plans "
+                "SET status = ?, "
+                "    submit_attempts = submit_attempts + 1, "
+                "    submit_attempted_at = ? "
+                "WHERE id = ? AND status = ?",
+                (
+                    PlanStatus.SUBMITTING.value,
+                    now,
+                    plan_id,
+                    PlanStatus.PENDING_APPROVAL.value,
+                ),
+            )
+        return cur.rowcount > 0
+
+    def release_plan_after_submit_failure(
+        self, plan_id: str, error: str
+    ) -> bool:
+        """Atomic compare-and-set: submitting -> pending_approval, with the
+        error string preserved on the row.
+
+        Called by producer_submit_node when the Kling submit_omni_video
+        call raises. Records the error so the operator can see WHY the
+        last attempt failed when re-reviewing the plan.
+
+        IMPORTANT TIMEOUT CAVEAT (already noted in the error string for
+        timeout-shaped failures): if the underlying error was a timeout
+        or other ambiguous network failure, Kling MAY have accepted the
+        submission. Re-approving the plan would then submit a duplicate.
+        The operator should check the Kling dashboard before re-approving
+        a plan whose submit_error mentions a timeout.
+        """
+        with self._db() as conn:
+            cur = conn.execute(
+                "UPDATE video_plans "
+                "SET status = ?, submit_error = ? "
+                "WHERE id = ? AND status = ?",
+                (
+                    PlanStatus.PENDING_APPROVAL.value,
+                    error,
+                    plan_id,
+                    PlanStatus.SUBMITTING.value,
+                ),
+            )
+        return cur.rowcount > 0
+
+    def mark_plan_submitted(self, plan_id: str, *, decided_by: str = "human") -> bool:
+        """Atomically transition submitting -> submitted (V1.4.1).
+
+        Precondition: the caller must have already won the claim via
+        claim_plan_for_submission. Clearing submit_error here records that
+        the latest attempt succeeded (the row otherwise still carries the
+        last failure reason from a prior reverted attempt).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as conn:
+            cur = conn.execute(
+                "UPDATE video_plans "
+                "SET status = ?, decided_at = ?, decided_by = ?, submit_error = NULL "
+                "WHERE id = ? AND status = ?",
+                (
+                    PlanStatus.SUBMITTED.value, now, decided_by,
+                    plan_id, PlanStatus.SUBMITTING.value,
+                ),
+            )
+        return cur.rowcount > 0
+
+    def list_unresolved_video_plans(self) -> list[VideoPlan]:
+        """Plans the operator may still need to act on: pending_approval
+        (awaiting first decision OR reverted from a failed submit) and
+        submitting (in flight, possibly stuck if MCP/UI crashed). Used by
+        the Streamlit log tab's stale-plan section."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM video_plans WHERE status IN (?, ?) "
+                "ORDER BY created_at DESC",
+                (
+                    PlanStatus.PENDING_APPROVAL.value,
+                    PlanStatus.SUBMITTING.value,
+                ),
+            ).fetchall()
+        out: list[VideoPlan] = []
+        for r in rows:
+            d = dict(r)
+            d["enforced_constraint_ids"] = json.loads(d.get("enforced_constraint_ids") or "[]")
+            out.append(VideoPlan.model_validate(d))
+        return out
+
+    # ---------- video jobs (V1.4 - replaces performance_log.json runtime side) ----------
+
+    def create_video_job(self, job: VideoJob) -> str:
+        """Insert a new Kling submission record. Status starts 'pending'."""
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO video_jobs "
+                "(kling_task_id, plan_id, status, video_path, error, "
+                " submitted_at, completed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job.kling_task_id,
+                    job.plan_id,
+                    job.status.value,
+                    job.video_path,
+                    job.error,
+                    job.submitted_at.isoformat(),
+                    job.completed_at.isoformat() if job.completed_at else None,
+                ),
+            )
+        return job.kling_task_id
+
+    def get_video_job(self, kling_task_id: str) -> Optional[VideoJob]:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM video_jobs WHERE kling_task_id = ?", (kling_task_id,)
+            ).fetchone()
+        return VideoJob.model_validate(dict(row)) if row else None
+
+    def list_video_jobs(
+        self,
+        *,
+        status: Union[JobStatus, str, None] = None,
+        limit: Optional[int] = None,
+    ) -> list[VideoJob]:
+        sql = "SELECT * FROM video_jobs"
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(_coerce_enum_value(status))
+        sql += " ORDER BY submitted_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [VideoJob.model_validate(dict(r)) for r in rows]
+
+    def update_video_job_by_task_id(
+        self,
+        kling_task_id: str,
+        *,
+        status: Optional[Union[JobStatus, str]] = None,
+        video_path: Optional[str] = None,
+        error: Optional[str] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> bool:
+        """Atomic SQL UPDATE - replaces the lost-update-prone JSON path.
+
+        Sets only the fields the caller passes. Returns True if a row was
+        affected. Concurrent calls from the Producer LLM and the UI's
+        Check Status button are now safe: each goes through SQLite's
+        per-statement lock instead of clobbering a shared JSON file.
+        """
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(_coerce_enum_value(status))
+        if video_path is not None:
+            sets.append("video_path = ?")
+            params.append(video_path)
+        if error is not None:
+            sets.append("error = ?")
+            params.append(error)
+        if completed_at is not None:
+            sets.append("completed_at = ?")
+            params.append(completed_at.isoformat())
+        if not sets:
+            return False
+        params.append(kling_task_id)
+        with self._db() as conn:
+            cur = conn.execute(
+                f"UPDATE video_jobs SET {', '.join(sets)} WHERE kling_task_id = ?",
+                params,
+            )
+        return cur.rowcount > 0
 
 
 def list_clients(clients_root: Optional[Path] = None) -> list[str]:

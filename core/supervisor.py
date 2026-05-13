@@ -23,7 +23,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agents.analyst.agent import analyst_node
 from agents.outreach.agent import outreach_node
-from agents.producer.agent import producer_node
+from agents.producer.agent import producer_plan_node, producer_submit_node
 from agents.strategist.agent import strategist_node
 from core.client_context import ClientContext
 from core.router import route_task
@@ -58,10 +58,20 @@ def _select_worker(state: AgentState):
         return END
     return {
         "research": "strategist",
-        "produce": "producer",
+        "produce": "producer_plan",
         "analyze": "analyst",
         "outreach": "outreach",
     }.get(state.get("current_agent"), END)
+
+
+def _after_plan(state: AgentState):
+    """Conditional edge from producer_plan: pause for approval only when a
+    plan was actually compiled. If the LLM only checked task status (no
+    compile_video_plan call), state['plan_id'] is None and we end the run
+    without triggering the HITL gate."""
+    if state.get("plan_id"):
+        return "producer_submit"
+    return END
 
 
 def build_supervisor_graph(
@@ -72,8 +82,14 @@ def build_supervisor_graph(
 
     interrupt_before: optional list of node names to pause BEFORE executing.
                      Default None = no interrupts (sync behavior, MCP/CLI).
-                     The Streamlit UI passes ['producer'] to gate paid
-                     Kling renders behind a human approval.
+
+                     V1.4: the Producer is split into producer_plan (LLM
+                     compiles a deterministic Kling brief into the
+                     video_plans SQL table; never calls Kling) and
+                     producer_submit (pure Python; reads the plan and
+                     submits to Kling). Pass ['producer_submit'] to gate
+                     paid Kling submissions behind a human approval that
+                     reviews the EXACT compiled brief.
 
     The returned compiled graph supports both invoke() (sync) and ainvoke()
     (async). Use run_supervisor_async / resume_supervisor_async helpers.
@@ -81,14 +97,16 @@ def build_supervisor_graph(
     g = StateGraph(AgentState)
     g.add_node("supervisor", supervisor_node)
     g.add_node("strategist", strategist_node)
-    g.add_node("producer", producer_node)
+    g.add_node("producer_plan", producer_plan_node)
+    g.add_node("producer_submit", producer_submit_node)
     g.add_node("analyst", analyst_node)
     g.add_node("outreach", outreach_node)
 
     g.add_edge(START, "supervisor")
     g.add_conditional_edges("supervisor", _select_worker)
     g.add_edge("strategist", END)
-    g.add_edge("producer", END)
+    g.add_conditional_edges("producer_plan", _after_plan)
+    g.add_edge("producer_submit", END)
     g.add_edge("analyst", END)
     g.add_edge("outreach", END)
 
@@ -110,6 +128,7 @@ def initial_state(
         "current_agent": None,
         "artifacts": {},
         "error": None,
+        "plan_id": None,
     }
 
 

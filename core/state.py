@@ -25,3 +25,7 @@ class AgentState(TypedDict):
     current_agent: Optional[str]   # set by Supervisor per turn
     artifacts: dict[str, str]      # name -> absolute path of produced files
     error: Optional[str]
+    # V1.4: set by producer_plan when compile_video_plan succeeds; consumed
+    # by producer_submit. None means the planner did not produce a plan
+    # (e.g. the LLM only checked status), so no submission should occur.
+    plan_id: Optional[str]

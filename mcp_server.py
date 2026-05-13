@@ -39,6 +39,8 @@ except ImportError:
 
 from mcp.server.fastmcp import FastMCP
 
+from agents.producer.agent import format_plan_summary
+from core.client_context import ClientContext
 from core.models import SUPPORTED_MODEL_IDS
 from core.supervisor import (
     build_supervisor_graph,
@@ -71,7 +73,11 @@ mcp = FastMCP("marketing-agency")
 # --------------------------------------------------------------------------- #
 
 
-_GRAPH = build_supervisor_graph(interrupt_before=["producer"])
+# V1.4: pause point moved from 'producer' (a black-box approval) to
+# 'producer_submit' (which has a fully compiled plan in SQL ready for
+# review). The pause message includes the plan's exact prompt + assets so
+# Claude Desktop can show the operator what is about to be spent on.
+_GRAPH = build_supervisor_graph(interrupt_before=["producer_submit"])
 _PENDING_RUNS: dict[str, dict[str, Any]] = {}
 
 
@@ -163,36 +169,42 @@ def run_agency_agent(
         # the error back to Claude Desktop as text.
         return f"ERROR running agency graph: {type(e).__name__}: {e}"
 
-    # interrupt_before=['producer'] paused us before Kling spend?
+    # V1.4: paused before producer_submit? Pull the compiled plan from SQL
+    # so the operator reviews the EXACT prompt about to be sent to Kling.
     pending_node = get_pending_node(_GRAPH, config=config)
-    if pending_node == "producer":
+    if pending_node == "producer_submit":
+        plan_id = result.get("plan_id")
+        plan_summary = "(no plan compiled - submit will refuse)"
+        if plan_id and client_id:
+            try:
+                ctx = ClientContext.load(client_id)
+                plan = ctx.get_video_plan(plan_id)
+                if plan is not None:
+                    plan_summary = format_plan_summary(plan)
+            except Exception as e:
+                plan_summary = f"(could not load plan {plan_id}: {e})"
+
         _PENDING_RUNS[thread_id] = {
             "config": config,
             "client_id": client_id,
             "model": chosen_model,
             "prompt": prompt,
             "task_type": result.get("task_type"),
-            "supervisor_messages": [
-                f"[{m.__class__.__name__}] "
-                f"{m.content if isinstance(m.content, str) else str(m.content)}"
-                for m in result.get("messages", [])
-            ],
+            "plan_id": plan_id,
         }
-        supervisor_excerpt = "\n".join(_PENDING_RUNS[thread_id]["supervisor_messages"]) or "(none)"
         return (
-            "Workflow paused for financial safety. Review the proposed action "
-            "and use the resume_agency_workflow tool to approve or reject.\n"
+            "Workflow paused for financial safety. Review the COMPILED plan "
+            "below and use the resume_agency_workflow tool to approve or reject.\n"
             f"\nthread_id: {thread_id}"
             f"\nclient_id: {client_id}"
             f"\nmodel:     {chosen_model}"
-            f"\ntask_type: {result.get('task_type')}"
-            f"\nrouted_to: producer"
+            f"\nrouted_to: producer_submit"
             f"\n---\nOperator instruction:\n{prompt}"
-            f"\n---\nSupervisor messages so far:\n{supervisor_excerpt}"
+            f"\n---\nCompiled plan:\n{plan_summary}"
             f"\n---\nNext step: call resume_agency_workflow("
-            f"thread_id='{thread_id}', approve=True) to run the Producer "
-            f"(this WILL spend Kling credits), "
-            f"or approve=False to cancel."
+            f"thread_id='{thread_id}', approve=True) to submit this plan "
+            f"to Kling (this WILL spend credits), or approve=False to "
+            f"cancel (plan will be marked rejected)."
         )
 
     return _format_run_result(result, chosen_model)
@@ -227,12 +239,23 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
         )
 
     if not approve:
-        # Graceful cancel: drop the registry entry. The orphan checkpoint
-        # stays in MemorySaver until the MCP process restarts; harmless and
-        # mirrors the Streamlit UI's behavior on Reject.
+        # V1.4: mark the plan rejected in SQL for the audit trail
+        # (lifecycle: pending_approval -> rejected; no auto-supersede).
+        plan_id = pending.get("plan_id")
+        client_id = pending.get("client_id")
+        if plan_id and client_id:
+            try:
+                ClientContext.load(client_id).reject_video_plan(
+                    plan_id, decided_by="human"
+                )
+            except Exception:
+                pass  # best-effort audit; don't fail the cancellation
+        # The orphan LangGraph checkpoint stays in MemorySaver until the MCP
+        # process restarts; harmless and mirrors the Streamlit UI's Reject.
         return (
             f"Producer workflow cancelled for thread_id={thread_id}. "
             f"No Kling credits were spent."
+            + (f" Plan {plan_id} marked rejected." if plan_id else "")
         )
 
     chosen_model = pending["model"]

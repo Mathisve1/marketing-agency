@@ -85,6 +85,74 @@ class NegativeConstraint(BaseModel):
     source_log_entries: list[str] = Field(default_factory=list)
 
 
+# --------------------------------------------------------------------------- #
+# Producer plan + job records (V1.4 - replaces performance_log.json)
+# --------------------------------------------------------------------------- #
+
+
+class PlanStatus(str, Enum):
+    PENDING_APPROVAL = "pending_approval"
+    SUBMITTING = "submitting"          # V1.4.1: atomic claim has been made;
+                                        # only the claiming process may call Kling.
+    REJECTED = "rejected"
+    SUBMITTED = "submitted"
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class VideoPlan(BaseModel):
+    """A compiled, deterministic Kling brief awaiting human approval.
+
+    Created by the Producer planning node's compile_video_plan tool. Holds
+    the full Kling submission envelope so the operator can review the EXACT
+    prompt, negative_prompt, asset paths, duration, and aspect_ratio before
+    any paid call. Once approved, the producer_submit node reads this row,
+    submits to Kling, and writes a corresponding video_jobs row.
+    """
+    id: str = ""                          # blank on creation -> auto-assigned (VP-NNN)
+    status: PlanStatus = PlanStatus.PENDING_APPROVAL
+    hook_id: str
+    motion_id: Optional[str] = None
+    character_asset: str                  # relative to client root
+    product_asset: str
+    duration: int
+    aspect_ratio: str
+    mode: str
+    cfg_scale: float
+    prompt: str                           # full Kling prompt as compiled
+    negative_prompt: str
+    enforced_constraint_ids: list[str] = Field(default_factory=list)
+    created_at: datetime
+    decided_at: Optional[datetime] = None
+    decided_by: Optional[str] = None      # 'human' | 'auto' | None
+    # V1.4.1 audit fields for the atomic claim flow.
+    # submit_attempts increments every time claim_plan_for_submission succeeds.
+    # submit_attempted_at is the timestamp of the LAST claim.
+    # submit_error is set by release_plan_after_submit_failure; cleared on
+    # successful mark_plan_submitted. If non-None on a pending_approval plan,
+    # the plan was reverted from a failed submission attempt and the operator
+    # should review the error before re-approving.
+    submit_attempts: int = 0
+    submit_attempted_at: Optional[datetime] = None
+    submit_error: Optional[str] = None
+
+
+class VideoJob(BaseModel):
+    """A submitted Kling task. Mutable state only; everything else lives on
+    the parent video_plans row reachable via plan_id."""
+    kling_task_id: str
+    plan_id: str
+    status: JobStatus = JobStatus.PENDING
+    video_path: Optional[str] = None      # relative to client root; set on completion
+    error: Optional[str] = None
+    submitted_at: datetime
+    completed_at: Optional[datetime] = None
+
+
 class PerformanceBenchmarks(BaseModel):
     roas_target: Optional[float] = None
     ctr_target: Optional[float] = None
@@ -170,10 +238,64 @@ CREATE INDEX IF NOT EXISTS idx_negative_constraints_severity
     ON negative_constraints (severity)
 """
 
+# --------------------------------------------------------------------------- #
+# V1.4 DDL: video plans and jobs
+# --------------------------------------------------------------------------- #
+
+SQL_DDL_VIDEO_PLANS = """
+CREATE TABLE IF NOT EXISTS video_plans (
+    id                       TEXT PRIMARY KEY,
+    status                   TEXT NOT NULL CHECK(status IN ('pending_approval', 'submitting', 'rejected', 'submitted')),
+    hook_id                  TEXT NOT NULL,
+    motion_id                TEXT,
+    character_asset          TEXT NOT NULL,
+    product_asset            TEXT NOT NULL,
+    duration                 INTEGER NOT NULL,
+    aspect_ratio             TEXT NOT NULL,
+    mode                     TEXT NOT NULL,
+    cfg_scale                REAL NOT NULL,
+    prompt                   TEXT NOT NULL,
+    negative_prompt          TEXT NOT NULL,
+    enforced_constraint_ids  TEXT NOT NULL DEFAULT '[]',
+    created_at               TEXT NOT NULL,
+    decided_at               TEXT,
+    decided_by               TEXT,
+    submit_attempts          INTEGER NOT NULL DEFAULT 0,
+    submit_attempted_at      TEXT,
+    submit_error             TEXT
+)
+"""
+
+SQL_INDEX_VIDEO_PLANS_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_video_plans_status_created
+    ON video_plans (status, created_at DESC)
+"""
+
+SQL_DDL_VIDEO_JOBS = """
+CREATE TABLE IF NOT EXISTS video_jobs (
+    kling_task_id  TEXT PRIMARY KEY,
+    plan_id        TEXT NOT NULL REFERENCES video_plans(id),
+    status         TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+    video_path     TEXT,
+    error          TEXT,
+    submitted_at   TEXT NOT NULL,
+    completed_at   TEXT
+)
+"""
+
+SQL_INDEX_VIDEO_JOBS_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_video_jobs_status
+    ON video_jobs (status, submitted_at DESC)
+"""
+
 ALL_DDL = (
     SQL_DDL_WINNING_HOOKS,
     SQL_INDEX_WINNING_HOOKS,
     SQL_DDL_REFERRAL_MOTIONS,
     SQL_DDL_NEGATIVE_CONSTRAINTS,
     SQL_INDEX_NEGATIVE_CONSTRAINTS,
+    SQL_DDL_VIDEO_PLANS,
+    SQL_INDEX_VIDEO_PLANS_STATUS,
+    SQL_DDL_VIDEO_JOBS,
+    SQL_INDEX_VIDEO_JOBS_STATUS,
 )

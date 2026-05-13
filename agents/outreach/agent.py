@@ -40,6 +40,18 @@ from core.state import AgentState
 
 OUTREACH_MAX_ADS_TO_LLM = 10
 
+# V1.4 hard cost limits enforced in Python, not in the system prompt. The
+# LLM cannot exceed these even if it hallucinates a loop. Each is per
+# OUTREACH NODE INVOCATION (one supervisor turn).
+#
+# Apify: each call is a paid scrape against a Meta ad library. Capping at
+# 5 = max 5 prospect brands audited per turn.
+# Tavily: each call is a paid web search. One discovery search is usually
+# enough to extract 5-10 brand candidates; cap at 2 to allow a fallback
+# query if the first returns weak results.
+MAX_APIFY_CALLS_PER_RUN = 5
+MAX_TAVILY_CALLS_PER_RUN = 2
+
 
 SYSTEM_PROMPT = """You are the Outreach agent for an AI performance marketing agency.
 
@@ -114,17 +126,17 @@ judgments you cannot back up with the data."""
 
 
 def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
-    """Wraps the Strategist's search_fb_ads_library tool. Sorts the scraped
-    ads by days_active desc and caps the LLM-visible payload at `max_ads`.
+    """Wraps the Strategist's search_fb_ads_library tool with a per-turn
+    Apify call counter (V1.4) and the existing top-N + try/except hardening.
 
-    Prevents two failure modes:
-      - Token bloat: a single Apify scrape can return 50-100 ads at 1-2 KB
-        each. 10 ads is enough strategic signal for a pitch.
-      - Distractor noise: short-running test ads bury the long-running
-        winners. Sorting by days_active surfaces only the proven creative
-        before the LLM sees it.
+    Prevents three failure modes:
+      - Token bloat: 50-100 ads per scrape; 10 is enough strategic signal.
+      - Distractor noise: short-running ads bury winners.
+      - Cost runaway: nonlocal counter caps Apify calls at
+        MAX_APIFY_CALLS_PER_RUN regardless of LLM intent.
     """
     underlying = make_fb_ads_search_tool()
+    _apify_calls_this_run = 0  # nonlocal counter, reset per outreach_node invocation
 
     @tool("search_fb_ads_library")
     def search_fb_ads_library(
@@ -132,20 +144,21 @@ def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
         country: str = "BE",
         active_only: bool = True,
     ):
-        """Scrape competitor Meta ads via Apify, then sort by days_active
-        descending and return only the top 10. Long-running ads carry the
-        most strategic signal; the cap keeps context tight.
+        """Scrape competitor Meta ads via Apify, sort by days_active desc,
+        return the top 10. Hard-capped at MAX_APIFY_CALLS_PER_RUN per
+        outreach run; further calls return a SAFETY LIMIT string.
 
         Returns a list[dict] of scored ads on success, or a string starting
-        with "API ERROR:" on Apify failure (see below).
+        with "API ERROR:" / "SAFETY LIMIT:" otherwise.
         """
-        # V1.3 hardening (Initiative 3): Apify actor failures and HTTP
-        # timeouts raise RuntimeError from the underlying tool. Without this
-        # guard the exception bubbles through the ReAct agent and crashes
-        # the LangGraph node mid-prospect, losing every audit completed
-        # earlier in the same run. Catching here lets the LLM see the
-        # failure as a string tool result and skip the broken brand
-        # gracefully (or report a clean failure to the operator).
+        nonlocal _apify_calls_this_run
+        if _apify_calls_this_run >= MAX_APIFY_CALLS_PER_RUN:
+            return (
+                f"SAFETY LIMIT: Maximum of {MAX_APIFY_CALLS_PER_RUN} Apify "
+                f"scrape(s) per outreach run. STOP calling search_fb_ads_library. "
+                f"Report the {_apify_calls_this_run} prospect(s) already audited "
+                f"to the user; for more, submit a fresh outreach request."
+            )
         try:
             raw = underlying.invoke({
                 "competitor_pages": competitor_pages,
@@ -153,14 +166,46 @@ def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
                 "max_ads_per_page": 50,
                 "active_only": active_only,
             })
-            # score_ads adds the `days_active` field and sorts desc.
-            # min_days=0 keeps every ad - the cap is by count, not longevity.
             scored = score_ads(raw, min_days=0)
+            _apify_calls_this_run += 1
             return scored[:max_ads]
         except Exception as e:
+            # Failures count against the cap too - prevents an LLM from
+            # retrying an Apify failure in a tight loop and burning the
+            # cap on a permanently-broken brand.
+            _apify_calls_this_run += 1
             return f"API ERROR: {str(e)}"
 
     return search_fb_ads_library
+
+
+def _make_capped_tavily_tool():
+    """V1.4: wrap the Tavily competitor-search tool with a per-turn call
+    counter. Tavily is paid; one discovery query usually surfaces 5-10
+    brand candidates so MAX_TAVILY_CALLS_PER_RUN=2 leaves room for a
+    fallback query if the first returns weak results."""
+    underlying = make_tavily_competitor_search_tool()
+    _tavily_calls_this_run = 0
+
+    @tool("tavily_competitor_search")
+    def tavily_competitor_search(brand: str, country: str = "BE", limit: int = 5):
+        """Discover competitor brand names via Tavily. Hard-capped at
+        MAX_TAVILY_CALLS_PER_RUN per outreach run."""
+        nonlocal _tavily_calls_this_run
+        if _tavily_calls_this_run >= MAX_TAVILY_CALLS_PER_RUN:
+            return (
+                f"SAFETY LIMIT: Maximum of {MAX_TAVILY_CALLS_PER_RUN} Tavily "
+                f"search(es) per outreach run. STOP calling "
+                f"tavily_competitor_search. Use the brand candidates already "
+                f"discovered, or ask the user to refine the niche/country."
+            )
+        # underlying tool already has its own try/except returning
+        # "API ERROR: Tavily search failed - ..." on Tavily failure.
+        result = underlying.invoke({"brand": brand, "country": country, "limit": limit})
+        _tavily_calls_this_run += 1
+        return result
+
+    return tavily_competitor_search
 
 
 def _make_save_audit_tool():
@@ -264,7 +309,7 @@ def outreach_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     validate_model_id(model_name)
 
     tools = [
-        make_tavily_competitor_search_tool(),
+        _make_capped_tavily_tool(),
         _make_capped_fb_ads_tool(),
         _make_save_audit_tool(),
         _make_generate_pitch_tool(),
