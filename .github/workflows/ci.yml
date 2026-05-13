@@ -1,0 +1,53 @@
+name: CI
+
+# Minimal CI for the marketing-agency repo.
+#
+#   - Lint:  ruff check .
+#   - Test:  pytest (the full suite; runs in a few seconds)
+#
+# Tests must NOT call real external APIs. The job exports stub values for
+# every required env var so any code path that reads os.environ at import
+# time keeps working; tests that hit Kling / Meta / Anthropic / Tavily /
+# Apify already mock at the boundary (see tests/test_*.py for the pattern).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ruff + pytest (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install project (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Tests (pytest)
+        # Stub env vars so import-time os.environ reads do not fail. These
+        # are NOT real credentials; every external API call in the test
+        # suite is mocked at the requests / SDK boundary.
+        env:
+          ANTHROPIC_API_KEY: stub-anthropic
+          TAVILY_API_KEY: stub-tavily
+          APIFY_API_TOKEN: stub-apify
+          KLING_API_KEY: stub-kling-key
+          KLING_API_SECRET: stub-kling-secret
+          META_ACCESS_TOKEN: stub-meta-token
+          META_AD_ACCOUNT_ID: act_stub
+        run: python -m pytest
