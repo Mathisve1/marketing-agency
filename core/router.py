@@ -1,7 +1,7 @@
 """Routing helpers for the Supervisor.
 
 Phase 1: deterministic keyword routing. Phase 2+: swap in an LLM router that
-returns the same string surface ('research' | 'produce' | 'analyze').
+returns the same string surface ('research' | 'produce' | 'analyze' | 'outreach').
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Literal
 from langchain_core.messages import BaseMessage, HumanMessage
 
 
-TaskType = Literal["research", "produce", "analyze"]
+TaskType = Literal["research", "produce", "analyze", "outreach"]
 
 
 _KEYWORDS: dict[TaskType, tuple[str, ...]] = {
@@ -25,6 +25,11 @@ _KEYWORDS: dict[TaskType, tuple[str, ...]] = {
     "analyze": (
         "analyze", "performance", "roas", "ctr", "insights",
         "feedback", "report results", "meta ads",
+    ),
+    "outreach": (
+        "outreach", "lead generation", "lead gen", "prospect", "prospects",
+        "pitch", "new client", "find brands", "client acquisition",
+        "audit prospect",
     ),
 }
 
