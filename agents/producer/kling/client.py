@@ -1,20 +1,23 @@
-"""Kling AI direct API client with JWT auth and a sync polling loop.
+"""Kling AI direct API client - Omni-Video endpoint, JWT auth, sync polling.
 
 Authentication uses Kling's documented JWT pattern: HS256-signed token with
 the access key as `iss`, 30-minute expiry, and a 5-second nbf buffer. Tokens
-are cached and re-minted ~5 minutes before expiry to amortize auth cost.
+are cached and re-minted ~5 minutes before expiry.
+
+The Omni-Video endpoint is a unified V2V/I2V surface introduced in Kling's
+enterprise API. Static assets (character + product images) live in
+`image_list`; motion references live in `video_list`; the text prompt
+references them via `<<<image_n>>>` / `<<<video_n>>>` tags so the model
+knows which asset to apply where.
 
 Every API call is appended to logs/kling-api.jsonl for audit + credit
-reconciliation.
+reconciliation. Binary fields are redacted in the log so it stays readable.
 
-Endpoint paths are env-configurable so a Kling schema change is a .env edit,
-not a code release:
-  KLING_API_BASE_URL  (default: https://api.klingai.com)
-  KLING_V2V_ENDPOINT  (default: /v1/videos/video2video)
-  KLING_I2V_ENDPOINT  (default: /v1/videos/image2video)
-  KLING_T2V_ENDPOINT  (default: /v1/videos/text2video)
+Endpoint paths are env-configurable so a Kling schema change is a .env edit:
+  KLING_API_BASE_URL  (default: https://api-singapore.klingai.com)
+  KLING_OMNI_ENDPOINT (default: /v1/videos/omni-video)
   KLING_POLL_PATH     (default: /v1/videos/{task_id})
-  KLING_MODEL         (default: kling-v3-master)
+  KLING_MODEL         (default: kling-v3-omni)
 """
 from __future__ import annotations
 
@@ -34,23 +37,20 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Config (env-overridable; defaults track current public-wrapper conventions)
+# Config (env-overridable)
 # --------------------------------------------------------------------------- #
 
-BASE_URL = os.getenv("KLING_API_BASE_URL", "https://api.klingai.com")
-V2V_ENDPOINT = os.getenv("KLING_V2V_ENDPOINT", "/v1/videos/video2video")
-I2V_ENDPOINT = os.getenv("KLING_I2V_ENDPOINT", "/v1/videos/image2video")
-T2V_ENDPOINT = os.getenv("KLING_T2V_ENDPOINT", "/v1/videos/text2video")
+BASE_URL = os.getenv("KLING_API_BASE_URL", "https://api-singapore.klingai.com")
+OMNI_ENDPOINT = os.getenv("KLING_OMNI_ENDPOINT", "/v1/videos/omni-video")
 POLL_PATH = os.getenv("KLING_POLL_PATH", "/v1/videos/{task_id}")
-DEFAULT_MODEL = os.getenv("KLING_MODEL", "kling-v3-master")
+DEFAULT_MODEL = os.getenv("KLING_MODEL", "kling-v3-omni")
 
-TOKEN_TTL_SEC = 30 * 60         # Kling JWT lifetime per docs
-TOKEN_REFRESH_BUFFER = 5 * 60   # re-mint 5 minutes before expiry
+TOKEN_TTL_SEC = 30 * 60
+TOKEN_REFRESH_BUFFER = 5 * 60
 POLL_INTERVAL_SEC = 5
 POLL_MAX_WAIT_SEC = int(os.getenv("KLING_POLL_MAX_WAIT_SEC", str(20 * 60)))
 HTTP_TIMEOUT_SEC = 60
 
-# Terminal statuses - defensive because Kling has shipped two enums across versions.
 SUCCESS_STATUSES = {"succeed", "success", "completed"}
 FAILURE_STATUSES = {"failed", "error"}
 
@@ -78,7 +78,7 @@ def encode_jwt_token(access_key: str, secret_key: str, ttl_sec: int = TOKEN_TTL_
 
 
 # --------------------------------------------------------------------------- #
-# Encoding helpers
+# Encoding helpers - accept Path/local-file (-> base64) or http(s) URL (pass through)
 # --------------------------------------------------------------------------- #
 
 
@@ -86,10 +86,7 @@ def _b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
-def _image_field(value: Union[str, Path, None]) -> Optional[str]:
-    """Accept a local Path (base64-inline) or an http(s) URL (pass through)."""
-    if value is None:
-        return None
+def _image_field(value: Union[str, Path]) -> str:
     if isinstance(value, Path) or not str(value).startswith(("http://", "https://")):
         path = Path(value)
         if not path.exists():
@@ -98,11 +95,9 @@ def _image_field(value: Union[str, Path, None]) -> Optional[str]:
     return str(value)
 
 
-def _video_field(value: Union[str, Path, None]) -> Optional[str]:
+def _video_field(value: Union[str, Path]) -> str:
     """Same accept-rule as _image_field. Hard-stops oversized inlines so we
     don't silently blow up the request body - surface this to the user instead."""
-    if value is None:
-        return None
     if isinstance(value, Path) or not str(value).startswith(("http://", "https://")):
         path = Path(value)
         if not path.exists():
@@ -110,11 +105,24 @@ def _video_field(value: Union[str, Path, None]) -> Optional[str]:
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > 25:
             raise ValueError(
-                f"Referral video {path} is {size_mb:.1f}MB; inline base64 would "
+                f"Reference video {path} is {size_mb:.1f}MB; inline base64 would "
                 f"bloat the request. Upload to a public URL (S3/CDN) and pass that."
             )
         return _b64(path)
     return str(value)
+
+
+def _redact_asset_list(asset_list: list[dict]) -> list[dict]:
+    """Replace base64 image_url / video_url payloads with '<base64>' in audit-log copies."""
+    out = []
+    for item in asset_list:
+        redacted = dict(item)
+        for key in ("image_url", "video_url"):
+            val = redacted.get(key)
+            if val and isinstance(val, str) and not val.startswith(("http://", "https://")):
+                redacted[key] = "<base64>"
+        out.append(redacted)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +131,7 @@ def _video_field(value: Union[str, Path, None]) -> Optional[str]:
 
 
 class KlingClient:
-    """Direct Kling API client. Construct once per session; token cache is internal."""
+    """Direct Kling Omni-Video API client. Construct once per session; token cache is internal."""
 
     def __init__(
         self,
@@ -177,11 +185,13 @@ class KlingClient:
             self._audit({"op": "POST", "path": path, "status": "network_error", "error": str(e)})
             raise KlingAPIError(f"Kling POST {path} failed: {e}") from e
 
-        # Redact heavy binary fields so the audit log stays readable.
-        redacted = {
-            k: ("<base64>" if k in {"image", "image_tail", "reference_video"} and v else v)
-            for k, v in body.items()
-        }
+        # Redact base64 payloads inside image_list / video_list for the audit log.
+        redacted = dict(body)
+        if "image_list" in redacted:
+            redacted["image_list"] = _redact_asset_list(redacted["image_list"])
+        if "video_list" in redacted:
+            redacted["video_list"] = _redact_asset_list(redacted["video_list"])
+
         self._audit({
             "op": "POST", "path": path, "status_code": r.status_code,
             "request": redacted, "response": _truncate(r.text, 4000),
@@ -212,25 +222,40 @@ class KlingClient:
             )
         return r.json()
 
-    # ---- submission methods ----
+    # ---- submission ----
 
-    def submit_video_to_video(
+    def submit_omni_video(
         self,
-        reference_video: Union[str, Path],
         prompt: str,
         *,
-        character_image: Union[str, Path, None] = None,
-        product_image: Union[str, Path, None] = None,
+        images: Optional[list[Union[str, Path]]] = None,
+        videos: Optional[list[Union[str, Path]]] = None,
+        image_type: str = "first_frame",
+        video_refer_type: str = "feature",
+        keep_original_sound: bool = False,
         negative_prompt: str = "",
         model: str = DEFAULT_MODEL,
         duration: int = 10,
         aspect_ratio: str = "9:16",
         mode: str = "professional",
         cfg_scale: float = 0.5,
-        camera_control: Optional[dict] = None,
         extra: Optional[dict] = None,
     ) -> str:
-        """Submit a V2V (motion control) task. Returns task_id."""
+        """Submit a Kling Omni-Video task. Returns task_id.
+
+        `images` and `videos` are positional lists - their order determines
+        the <<<image_n>>> / <<<video_n>>> tag mapping in the prompt
+        (1-indexed: images[0] -> <<<image_1>>>, videos[0] -> <<<video_1>>>).
+        Each entry can be a local Path / path-string (base64-inlined) or an
+        http(s) URL (passed through).
+
+        Permissive on count - validate the agency convention
+        ([character, product]) inside the Producer agent, not here.
+
+        image_type:          per-image type tag ('first_frame' by default per Omni docs).
+        video_refer_type:    per-video role ('feature' for motion reference).
+        keep_original_sound: whether the reference video's audio influences the output.
+        """
         body: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -239,50 +264,26 @@ class KlingClient:
             "aspect_ratio": aspect_ratio,
             "mode": mode,
             "cfg_scale": cfg_scale,
-            "reference_video": _video_field(reference_video),
         }
-        if character_image is not None:
-            body["image"] = _image_field(character_image)
-        if product_image is not None:
-            body["image_tail"] = _image_field(product_image)
-        if camera_control:
-            body["camera_control"] = camera_control
+
+        if images:
+            body["image_list"] = [
+                {"image_url": _image_field(img), "type": image_type}
+                for img in images
+            ]
+        if videos:
+            body["video_list"] = [
+                {
+                    "video_url": _video_field(vid),
+                    "refer_type": video_refer_type,
+                    "keep_original_sound": "yes" if keep_original_sound else "no",
+                }
+                for vid in videos
+            ]
         if extra:
             body.update(extra)
 
-        resp = self._post(V2V_ENDPOINT, body)
-        return _extract_task_id(resp)
-
-    def submit_image_to_video(
-        self,
-        image: Union[str, Path],
-        prompt: str,
-        *,
-        image_tail: Union[str, Path, None] = None,
-        negative_prompt: str = "",
-        model: str = DEFAULT_MODEL,
-        duration: int = 10,
-        aspect_ratio: str = "9:16",
-        mode: str = "professional",
-        cfg_scale: float = 0.5,
-        camera_control: Optional[dict] = None,
-    ) -> str:
-        """I2V fallback for runs without a referral video."""
-        body = {
-            "model": model,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-            "mode": mode,
-            "cfg_scale": cfg_scale,
-            "image": _image_field(image),
-        }
-        if image_tail is not None:
-            body["image_tail"] = _image_field(image_tail)
-        if camera_control:
-            body["camera_control"] = camera_control
-        resp = self._post(I2V_ENDPOINT, body)
+        resp = self._post(OMNI_ENDPOINT, body)
         return _extract_task_id(resp)
 
     # ---- polling ----
@@ -336,8 +337,8 @@ class KlingClient:
 
 
 # --------------------------------------------------------------------------- #
-# Defensive response shape helpers - Kling has shipped multiple shapes
-# across v1/v2 endpoints; centralise the variance here.
+# Defensive response shape helpers - Kling ships multiple shapes across
+# endpoint versions; centralise the variance here.
 # --------------------------------------------------------------------------- #
 
 

@@ -2,13 +2,19 @@
 
 Architecture: LangGraph create_react_agent with three tool categories:
   1. Inspection - list_available_assets, read_master_context
-  2. Action     - generate_ugc_video (compile brief -> Kling submit -> poll
-                  -> download -> log to performance_log)
+  2. Action     - generate_ugc_video (compile brief -> Kling Omni-Video submit
+                  -> poll -> download -> log to performance_log)
   3. Memory writes happen inside generate_ugc_video itself, via
      ctx.append_performance_entry, so the Analyst can later see what was made.
 
 Model selection is explicit per run via config['configurable']['model'],
 same contract as the Strategist.
+
+Kling Omni-Video: a single unified endpoint replaces the older V2V/I2V split.
+Assets are passed as image_list + video_list; the prompt references them
+via <<<image_n>>> / <<<video_n>>> tags. The Producer enforces the agency
+convention here (NOT in the API client): images = [character, product]
+in that exact order to match the tags baked into the brief's prompt.
 """
 from __future__ import annotations
 
@@ -45,8 +51,9 @@ Your workflow this turn:
        hook_id          - e.g. 'WH-003'
        character_asset  - relative path from list_available_assets('characters')
        product_asset    - relative path from list_available_assets('products')
-       motion_id        - optional 'RM-002' for V2V; omit for I2V fallback
-       duration         - 5 to 15 seconds (Kling 3.0 default 10)
+       motion_id        - optional 'RM-002' to inherit pacing + camera from a
+                          referral video; omit to generate from images alone
+       duration         - 5 to 15 seconds (default 10)
   4. Each `generate_ugc_video` call blocks 1-5 minutes while Kling renders.
      Report each output path back to the user when done.
 
@@ -87,13 +94,13 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
         motion_id: Optional[str] = None,
         duration: int = 10,
     ) -> str:
-        """Generate one UGC video: compile a Kling brief from hook + motion +
-        assets, submit, poll, save MP4 to outputs/videos/. Returns absolute
-        path to the saved video.
+        """Generate one UGC video: compile a Kling Omni-Video brief from
+        hook + motion + assets, submit, poll, save MP4 to outputs/videos/.
+        Returns absolute path to the saved video.
 
-        Use motion_id for V2V (recommended when a strong referral motion
-        exists); omit for I2V fallback (character image as start frame,
-        product as end frame).
+        Use motion_id when a strong referral motion exists (the Omni model
+        will inherit pacing + camera from the referral video). Omit motion_id
+        to generate from character + product images alone.
         """
         fm, _ = ctx.read()
 
@@ -124,40 +131,37 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
             duration=duration,
         )
 
+        # Agency convention enforced HERE (not in the API client):
+        # images[0] -> <<<image_1>>> = character
+        # images[1] -> <<<image_2>>> = product
+        # The brief's prompt already references these tags inline.
+        images: list = [brief.character_image_path, brief.product_image_path]
+        videos: Optional[list] = None
+
         if brief.reference_video_path is not None:
             ref_video = (ctx.root / brief.reference_video_path).resolve()
             if not ref_video.exists():
                 raise FileNotFoundError(
                     f"Motion's reference video not found: {ref_video}"
                 )
-            task_id = kling_client.submit_video_to_video(
-                reference_video=ref_video,
-                prompt=brief.prompt,
-                character_image=brief.character_image_path,
-                product_image=brief.product_image_path,
-                negative_prompt=brief.negative_prompt,
-                duration=brief.duration,
-                aspect_ratio=brief.aspect_ratio,
-                mode=brief.mode,
-                cfg_scale=brief.cfg_scale,
-            )
-        else:
-            task_id = kling_client.submit_image_to_video(
-                image=brief.character_image_path,
-                image_tail=brief.product_image_path,
-                prompt=brief.prompt,
-                negative_prompt=brief.negative_prompt,
-                duration=brief.duration,
-                aspect_ratio=brief.aspect_ratio,
-                mode=brief.mode,
-                cfg_scale=brief.cfg_scale,
-            )
+            videos = [ref_video]
+
+        task_id = kling_client.submit_omni_video(
+            prompt=brief.prompt,
+            images=images,
+            videos=videos,
+            negative_prompt=brief.negative_prompt,
+            duration=brief.duration,
+            aspect_ratio=brief.aspect_ratio,
+            mode=brief.mode,
+            cfg_scale=brief.cfg_scale,
+        )
 
         task = kling_client.wait_for_completion(task_id)
 
-        # Save to outputs/videos/<hook>-<motion-or-i2v>-<timestamp>.mp4
+        # Save to outputs/videos/<hook>-<motion-or-images>-<timestamp>.mp4
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        name = f"{hook_id}-{motion_id or 'i2v'}-{timestamp}.mp4"
+        name = f"{hook_id}-{motion_id or 'images'}-{timestamp}.mp4"
         dest = ctx.root / "outputs" / "videos" / name
         kling_client.download_video(task, dest)
 
