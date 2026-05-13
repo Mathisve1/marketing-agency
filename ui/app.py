@@ -2,67 +2,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
 
+from agents.outreach.prospect_store import promote_to_client
 from core.client_context import ClientContext, list_clients
-from core.context_schema import AddedBy, Confidence, ReferralMotion, WinningHook
 from core.models import SUPPORTED_MODELS
 from core.supervisor import build_supervisor_graph, initial_state
 
 
 st.set_page_config(page_title="Agency Command Center", layout="wide")
 st.title("Agency Command Center")
-
-
-# --------------------------------------------------------------------------- #
-# Auto-promote helper - reads a prospect's audit.json and seeds the new
-# client's MASTER_CONTEXT.md with the identified hooks + motions.
-# Will migrate to agents/outreach/prospect_store.py in Phase 5 (2/3).
-# --------------------------------------------------------------------------- #
-
-
-def _seed_from_audit_data(ctx: ClientContext, audit_data: dict) -> tuple[int, int]:
-    """Returns (hooks_seeded, motions_seeded)."""
-    now = datetime.now(timezone.utc)
-    hooks_seeded = 0
-    motions_seeded = 0
-
-    for raw in audit_data.get("winning_hooks", []):
-        try:
-            hook = WinningHook(
-                pattern=raw["pattern"],
-                description=raw["description"],
-                source_ad_id=raw.get("source_ad_id"),
-                days_active=raw.get("days_active"),
-                confidence=Confidence(str(raw.get("confidence", "medium")).lower()),
-                added_by=AddedBy.STRATEGIST,
-                added_at=now,
-            )
-            ctx.add_winning_hook(hook)
-            hooks_seeded += 1
-        except (KeyError, ValueError):
-            continue  # Skip malformed entries; surface the count to the user.
-
-    for raw in audit_data.get("referral_motions", []):
-        try:
-            motion = ReferralMotion(
-                description=raw["description"],
-                reference_path=raw["reference_path"],
-                pacing=raw.get("pacing"),
-                camera_style=raw.get("camera_style"),
-                duration_seconds=raw.get("duration_seconds"),
-                added_by=AddedBy.STRATEGIST,
-                added_at=now,
-            )
-            ctx.add_referral_motion(motion)
-            motions_seeded += 1
-        except (KeyError, ValueError):
-            continue
-
-    return hooks_seeded, motions_seeded
 
 
 # --------------------------------------------------------------------------- #
@@ -227,10 +178,12 @@ if mode == "Lead generation":
 
                         if submitted:
                             try:
-                                new_ctx = ClientContext.onboard(
-                                    new_id, new_name, locale=new_locale,
+                                new_ctx, h, m = promote_to_client(
+                                    prospect_id=folder.name,
+                                    new_client_id=new_id,
+                                    new_client_name=new_name,
+                                    new_client_locale=new_locale,
                                 )
-                                h, m = _seed_from_audit_data(new_ctx, audit_data)
                                 st.success(
                                     f"Promoted `{folder.name}` -> client `{new_id}`. "
                                     f"Seeded {h} hook(s) and {m} motion(s) into "
@@ -241,8 +194,10 @@ if mode == "Lead generation":
                                 st.error(
                                     f"Client `{new_id}` already exists. Pick a different ID."
                                 )
-                            except (ValueError, FileNotFoundError) as e:
+                            except FileNotFoundError as e:
                                 st.error(f"Promotion failed: {e}")
+                            except ValueError as e:
+                                st.error(f"Invalid input: {e}")
 
     st.stop()
 
