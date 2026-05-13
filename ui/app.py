@@ -395,9 +395,15 @@ def _render_hitl_approval(graph) -> bool:
             st.rerun()
     with col_r:
         if st.button("Reject - cancel", key="hitl_reject"):
-            # Service owns the SQL audit-trail bookkeeping consistently
-            # across UI + MCP callers.
-            reject_pending_plan(plan_ctx, plan_id, decided_by="human")
+            # Service owns the SQL audit-trail bookkeeping AND (V1.5) the
+            # LangGraph checkpoint drain consistently across UI + MCP
+            # callers. Passing graph+config triggers _drain_rejected_checkpoint
+            # so snapshot.next empties and the persistent SqliteSaver
+            # doesn't accumulate orphaned paused threads on disk.
+            reject_pending_plan(
+                plan_ctx, plan_id, decided_by="human",
+                graph=graph, config=pending["config"],
+            )
             st.session_state["hitl_pending"] = None
             st.session_state["hitl_last_status"] = "rejected"
             st.session_state["hitl_last_result"] = None

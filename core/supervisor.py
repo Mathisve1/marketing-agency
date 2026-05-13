@@ -12,13 +12,21 @@ V1.3 (3/N): adds optional interrupt_before plumbing + resume_supervisor_async()
             + get_pending_node() so the UI can gate Producer behind a Human-
             in-the-Loop approval. Worker nodes still sync; MCP/CLI keep
             no-interrupt behavior by passing interrupt_before=None.
+V1.5:       default checkpointer is now SqliteSaver (./checkpoints.db),
+            so pending HITL approvals survive Streamlit and MCP-server
+            restarts. The DB is intentionally isolated from per-client
+            client_data.db files - different lifecycle, different concerns.
 """
 from __future__ import annotations
 
+import os
+import sqlite3
+from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from agents.analyst.agent import analyst_node
@@ -29,7 +37,15 @@ from core.client_context import ClientContext
 from core.router import route_task
 from core.state import AgentState
 
+
 _CLIENT_SCOPED = {"research", "produce", "analyze"}
+
+
+# V1.5: default location for the SqliteSaver. Isolated from any
+# clients/<id>/client_data.db; the checkpoint DB tracks ephemeral graph
+# state (paused HITLs, in-flight turns) and is regenerated on demand.
+# Override via CHECKPOINT_DB_PATH env var (e.g. tests pin to tmp_path).
+DEFAULT_CHECKPOINT_DB_PATH = Path(os.getenv("CHECKPOINT_DB_PATH", "checkpoints.db"))
 
 
 def supervisor_node(state: AgentState) -> dict[str, Any]:
@@ -73,26 +89,52 @@ def _after_plan(state: AgentState):
     return END
 
 
+def _build_default_checkpointer(db_path: Path) -> SqliteSaver:
+    """Open a SqliteSaver-backed connection at db_path.
+
+    - check_same_thread=False: LangGraph dispatches saver methods from a
+      thread pool under ainvoke; SQLite would otherwise refuse cross-thread
+      use of the connection.
+    - PRAGMA journal_mode=WAL: readers do not block writers and vice versa,
+      so the UI inspecting graph state cannot deadlock with a graph turn
+      mid-write. Same justification as client_data.db.
+    - The connection is owned by the returned SqliteSaver and lives as long
+      as the compiled graph. Streamlit caches the graph in session_state;
+      MCP server caches it at module scope. Process exit closes the conn.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return SqliteSaver(conn)
+
+
 def build_supervisor_graph(
-    checkpointer: Optional[MemorySaver] = None,
+    checkpointer: Optional[BaseCheckpointSaver] = None,
     interrupt_before: Optional[list[str]] = None,
+    checkpoint_db_path: Optional[Path] = None,
 ):
     """Compile the supervisor graph.
 
+    checkpointer: explicit BaseCheckpointSaver instance. Tests typically
+                  pass MemorySaver() here for isolation. When None, builds
+                  a SqliteSaver at checkpoint_db_path (default
+                  ./checkpoints.db, overridable via CHECKPOINT_DB_PATH env).
     interrupt_before: optional list of node names to pause BEFORE executing.
-                     Default None = no interrupts (sync behavior, MCP/CLI).
-
-                     V1.4: the Producer is split into producer_plan (LLM
-                     compiles a deterministic Kling brief into the
-                     video_plans SQL table; never calls Kling) and
-                     producer_submit (pure Python; reads the plan and
-                     submits to Kling). Pass ['producer_submit'] to gate
-                     paid Kling submissions behind a human approval that
-                     reviews the EXACT compiled brief.
+                  Default None = no interrupts (sync behavior, CLI).
+                  V1.4: pass ['producer_submit'] to gate paid Kling
+                  submissions behind a HITL approval that reviews the
+                  EXACT compiled brief in SQL.
+    checkpoint_db_path: where the default SqliteSaver writes. Ignored when
+                  `checkpointer` is provided explicitly.
 
     The returned compiled graph supports both invoke() (sync) and ainvoke()
     (async). Use run_supervisor_async / resume_supervisor_async helpers.
     """
+    if checkpointer is None:
+        checkpointer = _build_default_checkpointer(
+            checkpoint_db_path or DEFAULT_CHECKPOINT_DB_PATH
+        )
+
     g = StateGraph(AgentState)
     g.add_node("supervisor", supervisor_node)
     g.add_node("strategist", strategist_node)
@@ -110,7 +152,7 @@ def build_supervisor_graph(
     g.add_edge("outreach", END)
 
     return g.compile(
-        checkpointer=checkpointer or MemorySaver(),
+        checkpointer=checkpointer,
         interrupt_before=interrupt_before or [],
     )
 
@@ -165,13 +207,7 @@ def get_pending_node(graph, *, config: dict) -> Optional[str]:
     the graph has completed (snapshot.next is empty).
 
     The UI calls this immediately after run_supervisor_async to detect
-    an interrupt_before pause. Example:
-
-        result = asyncio.run(run_supervisor_async(graph, state, config=config))
-        if get_pending_node(graph, config=config) == "producer":
-            # Show HITL approval UI
-        else:
-            # Graph ran to completion - display result.
+    an interrupt_before pause.
     """
     snapshot = graph.get_state(config=config)
     if snapshot.next:

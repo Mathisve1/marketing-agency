@@ -39,3 +39,10 @@ prospects/
 
 # API audit logs (Kling request/response bodies, includes prompts)
 logs/
+
+# LangGraph SqliteSaver checkpoint DB (HITL/in-flight graph state).
+# Persistent so pending approvals survive process restart; regenerated
+# on demand so safe to delete. WAL/SHM sidecars excluded too.
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal

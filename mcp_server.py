@@ -242,19 +242,22 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
 
     if not approve:
         # Service owns the SQL audit-trail bookkeeping (lifecycle:
-        # pending_approval | submitting -> rejected). Best-effort; an audit
-        # failure must not prevent the cancellation acknowledgement.
+        # pending_approval | submitting -> rejected) AND (V1.5) the
+        # LangGraph checkpoint drain. Best-effort; an audit failure must
+        # not prevent the cancellation acknowledgement.
         rejection_note = ""
         if client_id:
             try:
                 outcome = reject_pending_plan(
-                    ClientContext.load(client_id), plan_id, decided_by="human"
+                    ClientContext.load(client_id), plan_id, decided_by="human",
+                    graph=_GRAPH, config=pending["config"],
                 )
                 rejection_note = " " + outcome.note
             except Exception:
                 pass
-        # The orphan LangGraph checkpoint stays in MemorySaver until the MCP
-        # process restarts; harmless and mirrors the Streamlit UI's Reject.
+        # V1.5: reject_pending_plan now drains the SqliteSaver checkpoint
+        # via graph.update_state + ainvoke(None) so snapshot.next is empty
+        # by the time we return - matches the Streamlit UI's Reject.
         return (
             f"Producer workflow cancelled for thread_id={thread_id}. "
             f"No Kling credits were spent.{rejection_note}"
