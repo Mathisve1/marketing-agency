@@ -33,6 +33,12 @@ from core.state import AgentState
 # treated as "still pending" rather than crashing.
 _NON_TERMINAL_STATUSES = {"pending", "processing", "queued", "running", "created", "submitted"}
 
+# V1.3 polish (Initiative 3): hard cap on paid Kling submissions per producer
+# turn. Even after a human approves the HITL gate, a hallucinating LLM could
+# loop generate_ugc_video and bleed credits. This is a circuit breaker, not a
+# soft prompt - 3 paid renders is the absolute ceiling per supervisor turn.
+MAX_VIDEOS_PER_TURN = 3
+
 
 SYSTEM_PROMPT = """You are the Producer for an AI performance marketing agency.
 
@@ -69,6 +75,12 @@ they should follow up by asking for the status of the returned task_id."""
 
 def _build_tools(ctx: ClientContext, kling_client: KlingClient):
     """Closure-based tools so the LLM never threads client_id through args."""
+
+    # V1.3 polish (Initiative 3): per-turn paid-render counter. Lives in the
+    # _build_tools closure so it resets every supervisor turn (every fresh
+    # call to producer_node creates a new closure). Tracked on successful
+    # Kling submissions only - validation errors do not count against the cap.
+    _videos_submitted_this_turn = 0
 
     @tool("list_available_assets")
     def list_available_assets(kind: str) -> list[str]:
@@ -119,6 +131,19 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
         will inherit pacing + camera from the referral video). Omit
         motion_id to generate from character + product images alone.
         """
+        nonlocal _videos_submitted_this_turn
+        # V1.3 polish (Initiative 3): hard circuit breaker. Checked BEFORE
+        # the paid Kling submission so a hallucinating LLM cannot bleed
+        # credits in a loop. This is a wall, not advice - the LLM should
+        # read the message and stop calling, then explain to the user.
+        if _videos_submitted_this_turn >= MAX_VIDEOS_PER_TURN:
+            return (
+                f"SAFETY LIMIT: Maximum of {MAX_VIDEOS_PER_TURN} videos can be "
+                f"generated per run. Please submit a new request. STOP calling "
+                f"generate_ugc_video and report the {_videos_submitted_this_turn} "
+                f"task_id(s) already submitted to the user."
+            )
+
         # V1.2 single-row SQL lookups
         hook = ctx.get_winning_hook(hook_id)
         if hook is None:
@@ -191,11 +216,18 @@ def _build_tools(ctx: ClientContext, kling_client: KlingClient):
             "submitted_at": datetime.now(timezone.utc).isoformat(),
         })
 
+        # Increment AFTER successful Kling submission so validation errors
+        # (missing hook, missing asset) do not burn the per-turn budget.
+        _videos_submitted_this_turn += 1
+        remaining = MAX_VIDEOS_PER_TURN - _videos_submitted_this_turn
+
         return (
             f"Task submitted successfully. ID: {task_id}. "
             f"Kling rendering typically takes 1-5 minutes. Call "
             f"check_video_status('{task_id}') in a minute or two to poll "
-            f"completion and trigger the MP4 download."
+            f"completion and trigger the MP4 download. "
+            f"({_videos_submitted_this_turn}/{MAX_VIDEOS_PER_TURN} videos "
+            f"submitted this run; {remaining} remaining before safety limit.)"
         )
 
     @tool("check_video_status")

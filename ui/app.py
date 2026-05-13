@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -233,6 +234,13 @@ if mode == "Lead generation":
                                     f"client_data.db. Switch to Client work mode "
                                     f"and select `{new_id}` to continue."
                                 )
+                                # V1.3 polish (Initiative 1): sleep so the
+                                # success banner is readable (it lists hook +
+                                # motion counts), then rerun so the prospect
+                                # row reflects its new promoted status and
+                                # list_clients() picks up the new silo.
+                                time.sleep(2)
+                                st.rerun()
                             except FileExistsError:
                                 st.error(
                                     f"Client `{new_id}` already exists. Pick a different ID."
@@ -265,7 +273,13 @@ with st.sidebar:
         if st.button("Create silo"):
             try:
                 ClientContext.onboard(new_id, new_name, locale=new_locale)
-                st.success(f"Onboarded {new_id!r}. Refresh the page to select it.")
+                st.success(f"Onboarded {new_id!r}. Refreshing...")
+                # V1.3 polish (Initiative 1): sleep briefly so the success
+                # banner is visible, then rerun so list_clients() picks up
+                # the new silo and the sidebar dropdown updates. Without
+                # this the operator clicks Create again and hits FileExistsError.
+                time.sleep(1)
+                st.rerun()
             except Exception as e:
                 st.error(str(e))
 
