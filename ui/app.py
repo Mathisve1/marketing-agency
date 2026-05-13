@@ -14,6 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+# V1.7 imports for the operator status strip + tab_eval. Importing the
+# eval_review module from scripts/ requires adding scripts/ to sys.path
+# (this app already runs with the repo root as cwd via Streamlit, so
+# scripts/ is a sibling and not on sys.path by default).
+import sys as _sys  # noqa: E402
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,7 +30,7 @@ import streamlit as st
 from agents.outreach.prospect_store import promote_to_client
 from agents.producer.kling.client import KlingAPIError, KlingClient
 from core.client_context import ClientContext, list_clients
-from core.context_schema import JobStatus
+from core.context_schema import JobStatus, PlanStatus
 from core.models import SUPPORTED_MODELS
 from core.supervisor import (
     build_supervisor_graph,
@@ -37,6 +43,11 @@ from services.hitl_service import (
     load_plan_for_review,
     reject_pending_plan,
 )
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "scripts")
+if _SCRIPTS_DIR not in _sys.path:
+    _sys.path.insert(0, _SCRIPTS_DIR)
+import eval_review  # noqa: E402
 
 st.set_page_config(page_title="Agency Command Center", layout="wide")
 st.title("Agency Command Center")
@@ -119,8 +130,17 @@ if mode == "Lead generation":
         model_id = SUPPORTED_MODELS[model_label]
 
         if st.button("Dispatch outreach", type="primary", disabled=not prompt.strip()):
+            # V1.7 long-run UX: Apify ad-library scrapes are 30-60s each
+            # and the agent does one per prospect. Without an explicit
+            # warning, operators reflexively refresh.
+            st.info(
+                ":hourglass: **Outreach run in progress.** One Apify ad-library "
+                "scrape per prospect (~30-60s each), capped at 5. Total "
+                "wall time can exceed 5 minutes for a full batch. "
+                "**Do not refresh** while the spinner is visible."
+            )
             with st.spinner(
-                f"Running Outreach with {model_id} (Apify ad scraping is slow)..."
+                f"Running Outreach with {model_id}..."
             ):
                 result = asyncio.run(run_supervisor_async(
                     graph,
@@ -433,9 +453,42 @@ st.caption(
     f"{len(constraints)} constraints"
 )
 
-tab_run, tab_ctx, tab_hooks, tab_motions, tab_constraints, tab_videos, tab_log = st.tabs([
+# --------------------------------------------------------------------------- #
+# V1.7 operator status strip - rendered above the tabs so the operator
+# sees the system state at a glance without clicking into multiple tabs.
+# Counts only; the per-row triage UI lives in tab_videos and tab_log.
+# --------------------------------------------------------------------------- #
+
+
+def _render_operator_status(ctx: ClientContext) -> None:
+    pending_plans = ctx.list_video_plans(status=PlanStatus.PENDING_APPROVAL)
+    submitting_plans = ctx.list_video_plans(status=PlanStatus.SUBMITTING)
+    rejected_plans = ctx.list_video_plans(status=PlanStatus.REJECTED, limit=20)
+    pending_jobs = ctx.list_video_jobs(status=JobStatus.PENDING)
+    completed_jobs = ctx.list_video_jobs(status=JobStatus.COMPLETED, limit=50)
+    failed_jobs = ctx.list_video_jobs(status=JobStatus.FAILED, limit=20)
+
+    st.markdown("### Operator status")
+    cols = st.columns(6)
+    cols[0].metric("Plans pending", len(pending_plans))
+    cols[1].metric("Plans submitting", len(submitting_plans))
+    cols[2].metric("Plans rejected", len(rejected_plans))
+    cols[3].metric("Jobs pending", len(pending_jobs))
+    cols[4].metric("Jobs failed", len(failed_jobs))
+    cols[5].metric("Jobs completed", len(completed_jobs))
+    st.caption(
+        "Triage pending plans + jobs in the *Generated videos* and "
+        "*Performance log* tabs."
+    )
+
+
+_render_operator_status(ctx)
+st.divider()
+
+
+tab_run, tab_ctx, tab_hooks, tab_motions, tab_constraints, tab_videos, tab_log, tab_eval = st.tabs([
     "Run agent", "Context", "Winning hooks", "Referral motions",
-    "Negative constraints", "Generated videos", "Performance log",
+    "Negative constraints", "Generated videos", "Performance log", "Grade output",
 ])
 
 TASK_TYPE_OPTIONS: dict[str, str | None] = {
@@ -518,9 +571,17 @@ with tab_run:
         thread_id = f"{selection}-{uuid.uuid4().hex[:8]}"
         config = {"configurable": {"thread_id": thread_id, "model": model_id}}
 
+        # V1.7 long-run UX: keep the operator informed during a 30-90s
+        # graph step so they don't refresh and corrupt the dispatch.
+        st.info(
+            ":hourglass: **Dispatch in progress.** Strategist and Analyst "
+            "runs typically take 30-90 seconds. Outreach can take longer "
+            "(one Apify scrape per prospect). **Do not refresh** while the "
+            "spinner is visible. Producer submissions are still gated by "
+            "your approval on the next screen."
+        )
         with st.spinner(
-            f"Running {agent_label} with {model_id} "
-            f"(Producer submits are fast; Strategist/Analyst can take ~30s)..."
+            f"Running {agent_label} with {model_id}..."
         ):
             result = asyncio.run(run_supervisor_async(
                 graph,
@@ -635,6 +696,29 @@ def _poll_pending_kling_job(ctx: ClientContext, kling_task_id: str) -> tuple[str
 
 
 with tab_videos:
+    # ----- V1.7: Failed jobs section (rendered first so failures are
+    #             impossible to miss) -----
+    failed_jobs = ctx.list_video_jobs(status=JobStatus.FAILED, limit=20)
+    if failed_jobs:
+        st.markdown(f"### :red[Failed Kling jobs ({len(failed_jobs)})]")
+        st.caption(
+            "Jobs Kling reported as failed. The error string is stored "
+            "verbatim from the provider. To retry, dispatch a fresh "
+            "Producer request - the existing failed row stays for audit."
+        )
+        for job in failed_jobs:
+            plan = ctx.get_video_plan(job.plan_id)
+            with st.container(border=True):
+                st.markdown(f"**Task** `{job.kling_task_id}`")
+                if plan:
+                    st.caption(
+                        f"plan={plan.id} - hook={plan.hook_id} - "
+                        f"motion={plan.motion_id or '-'} - "
+                        f"submitted {job.submitted_at.isoformat()}"
+                    )
+                st.error(job.error or "(no error text recorded)")
+        st.divider()
+
     # ----- Pending Kling tasks: SQL-backed list + polling UI -----
     pending_jobs = ctx.list_video_jobs(status=JobStatus.PENDING)
 
@@ -757,3 +841,81 @@ with tab_log:
         st.json([p.model_dump(mode="json") for p in plans])
         st.markdown(f"### Video jobs ({len(jobs)})")
         st.json([j.model_dump(mode="json") for j in jobs])
+
+
+# --------------------------------------------------------------------------- #
+# V1.7 Manual evaluation tab.
+# Single-form grading writes to evals/output_reviews.jsonl via the same
+# helper the CLI uses (scripts/eval_review.py). Below the form we show
+# the most recent rows so the operator has context.
+# --------------------------------------------------------------------------- #
+
+
+with tab_eval:
+    st.markdown("### Grade an output")
+    st.caption(
+        "Manual quality grade for an artifact this client just produced. "
+        "Writes one JSONL row to `evals/output_reviews.jsonl` (gitignored). "
+        "Same data layout as `python scripts/eval_review.py`; either path "
+        "works and they share storage."
+    )
+
+    with st.form("eval_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            agent_choice = st.selectbox("Agent", options=list(eval_review.VALID_AGENTS))
+            output_type = st.text_input(
+                "Output type",
+                placeholder="pdf_report | pitch_pdf | kling_video | constraint | audit_json",
+            )
+            source = st.text_input(
+                "Source path (optional)",
+                placeholder=f"clients/{selection}/outputs/...",
+            )
+        with c2:
+            specificity = st.slider("Specificity", 1, 5, 3)
+            accuracy = st.slider("Accuracy", 1, 5, 3)
+            usefulness = st.slider("Usefulness", 1, 5, 3)
+            sendable = st.toggle("Sendable / usable to a real customer?", value=False)
+
+        notes = st.text_area("Notes (free text)", height=80)
+        submitted = st.form_submit_button("Save review", type="primary")
+
+        if submitted:
+            if not output_type.strip():
+                st.error("output_type is required (e.g. `pdf_report`, `kling_video`).")
+            else:
+                review = eval_review.build_review(
+                    agent=agent_choice,
+                    output_type=output_type.strip(),
+                    client_id=selection,
+                    source=source.strip() or None,
+                    specificity=specificity,
+                    accuracy=accuracy,
+                    usefulness=usefulness,
+                    sendable=sendable,
+                    notes=notes,
+                )
+                eval_review.append_review(review)
+                st.success(
+                    f"Review appended for agent={review.agent} "
+                    f"output={review.output_type}."
+                )
+
+    st.divider()
+    st.markdown("### Recent reviews (last 10)")
+    eval_path = eval_review.DEFAULT_EVAL_PATH
+    if not eval_path.exists():
+        st.caption("No reviews yet. Use the form above after a real workflow run.")
+    else:
+        try:
+            lines = eval_path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            st.error(f"Could not read {eval_path}: {e}")
+            lines = []
+        recent = [json.loads(line) for line in lines[-10:] if line.strip()]
+        if not recent:
+            st.caption("Eval file exists but is empty.")
+        else:
+            # Newest first.
+            st.json(list(reversed(recent)))

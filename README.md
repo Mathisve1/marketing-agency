@@ -83,6 +83,20 @@ analyze / outreach), and the HITL approve / reject screen for paused
 Producer runs. The compiled supervisor graph is cached in
 `st.session_state` per browser session.
 
+V1.7 operator surfaces:
+- **Operator status strip** above the tabs: at-a-glance counts of
+  pending / submitting / rejected plans and pending / failed /
+  completed jobs.
+- **Long-run warnings** during dispatch: explicit
+  "do not refresh while spinner is visible" callouts so a 60-second
+  Strategist run isn't mistaken for a hang.
+- **Failed Kling jobs** subsection at the top of the *Generated videos*
+  tab — surfaces the provider's error string verbatim instead of
+  burying it inside the all-jobs JSON dump.
+- **Grade output** tab — write a manual quality score for the artifact
+  the agent just produced; same JSONL backing file as
+  `python scripts/eval_review.py`.
+
 ### MCP server (Claude Desktop integration)
 
 ```bash
@@ -181,6 +195,30 @@ onboarding probe in a tmpdir, and the LangGraph checkpoint config. Never
 makes a real network call. Exit code is non-zero iff at least one hard
 check fails.
 
+### External API error format
+
+Every wrapper around an external integration returns a structured
+error string instead of bubbling raw exceptions. The format is:
+
+```
+API ERROR [<provider> / <CLASS>]: <ExceptionType>: <message>
+```
+
+Where `<CLASS>` is one of `MISSING_KEY`, `RATE_LIMIT`, `TIMEOUT`,
+`PROVIDER_ERROR`, `MALFORMED_RESPONSE`, `NO_DATA`, or `UNKNOWN` and
+`<provider>` is `tavily`, `apify`, `meta`, etc. The class token is
+greppable in the audit log and tells the operator immediately whether
+to fix `.env` (MISSING_KEY), back off (RATE_LIMIT), or verify with the
+provider before retrying (TIMEOUT — the call may have reached the
+provider despite the local error).
+
+The Producer's Kling failure path has its own classifier with extra
+duplicate-submission warnings on timeout — see V1.4.1 in
+`agents/producer/agent.py`.
+
+Implementation: `services/api_errors.py`. Pure stdlib, never calls a
+provider.
+
 ### Manual output evaluation
 
 Structured outputs (PDFs, videos, audits, hook tables) prove the agents
@@ -234,9 +272,30 @@ before adding or modifying ignore rules.
 | `prospects/`                         | Scraped Meta ad-library data, pitch PDFs|
 | `logs/`                              | Kling request/response audit logs       |
 | `checkpoints.db`                     | LangGraph SqliteSaver (HITL/in-flight)  |
+| `mcp_pending_runs.db`                | MCP pending-runs registry (V1.7) — operator context for paused Producer approvals |
+| `evals/output_reviews.jsonl`         | Manual output-quality grades (operator-written) |
 
 The `clients/_template/` directory IS committed (the template skeleton)
 and should never contain anything sensitive.
+
+### Repo hygiene scanner
+
+A standalone scanner (`scripts/check_repo_hygiene.py`) flags any path
+matching the sensitive patterns above. Run modes:
+
+```bash
+# Pre-commit hook: scan only what's about to be committed.
+python scripts/check_repo_hygiene.py --staged
+
+# CI / continuous guard: scan everything currently tracked in git.
+python scripts/check_repo_hygiene.py --tracked
+```
+
+CI runs the `--tracked` form on every push and PR. The scanner never
+reads file contents and never prints potential secret values; it only
+flags PATHS the operator must double-check. Allow-listed exceptions
+(`.env.example`, `clients/_template/...`, `evals/.gitkeep`, etc.) are
+documented inline in the script.
 
 ---
 
@@ -333,14 +392,6 @@ become bottlenecks.
 ## Known limitations
 
 These are documented gaps in the current build, NOT bugs to file:
-
-- **MCP pending-runs registry is in-memory** (`_PENDING_RUNS` in
-  `mcp_server.py`). If the MCP server process restarts while a Producer
-  approval is paused, the registry entry is lost. The underlying LangGraph
-  checkpoint survives (it lives in `checkpoints.db` via the SqliteSaver,
-  V1.5), but the operator-facing context — prompt, client_id, chosen
-  model — would have to be reconstructed manually. A future pass should
-  persist `_PENDING_RUNS` alongside the checkpoint.
 
 - **Streamlit dispatch is async-plumbed but not streamed**: the UI calls
   `asyncio.run(run_supervisor_async(...))` and renders the final result

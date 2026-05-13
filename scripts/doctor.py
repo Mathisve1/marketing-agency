@@ -79,6 +79,19 @@ REQUIRED_ENV_VAR_NAMES = (
     "META_AD_ACCOUNT_ID",
 )
 
+# V1.7: name -> short provider/usage label. Doctor prints this map so a
+# new operator can see WHICH integration each missing key blocks. Names
+# only - never values, never any external API call.
+ENV_VAR_PROVIDER_HINTS = {
+    "ANTHROPIC_API_KEY":  "anthropic   (every agent's LLM calls)",
+    "TAVILY_API_KEY":     "tavily      (Strategist + Outreach competitor search)",
+    "APIFY_API_TOKEN":    "apify       (Strategist + Outreach FB ad-library scrape)",
+    "KLING_API_KEY":      "kling       (Producer paid video submission)",
+    "KLING_API_SECRET":   "kling       (Producer paid video submission)",
+    "META_ACCESS_TOKEN":  "meta-ads    (Analyst Insights pull)",
+    "META_AD_ACCOUNT_ID": "meta-ads    (Analyst Insights account scoping)",
+}
+
 # Subfolders referenced from clients/_template/MASTER_CONTEXT.md's
 # asset_inventory block. Kept in lockstep with the template frontmatter.
 TEMPLATE_REFERENCE_SUBDIRS = (
@@ -199,11 +212,17 @@ def check_env_vars(runner: CheckRunner) -> None:
         )
         return
 
-    runner.warned(
-        "Some required env vars are not set in this shell: "
-        + ", ".join(missing)
-        + " (this is fine if Streamlit/MCP load them from .env at startup)"
-    )
+    # V1.7: also show which provider each missing var blocks, so a new
+    # operator doesn't have to grep the codebase to figure out "what
+    # breaks if I leave TAVILY_API_KEY unset for now".
+    lines = [
+        "Some required env vars are not set in this shell"
+        " (this is fine if Streamlit/MCP load them from .env at startup):",
+    ]
+    for name in missing:
+        hint = ENV_VAR_PROVIDER_HINTS.get(name, "(no hint registered)")
+        lines.append(f"        {name:<22}-> {hint}")
+    runner.warned("\n".join(lines))
 
 
 def check_master_context_template(runner: CheckRunner, root: Path) -> None:
@@ -402,6 +421,49 @@ def check_checkpoint_db_config(runner: CheckRunner) -> None:
     )
 
 
+def check_mcp_pending_registry(runner: CheckRunner) -> None:
+    """V1.7: confirm services.mcp_pending_store imports cleanly and its
+    DEFAULT_DB_PATH is in a writable location. Also probes the schema by
+    calling list_pending() against a tmp DB - if the DDL is broken the
+    error surfaces here, not the first time MCP tries to record a
+    pending run.
+
+    Never touches the production mcp_pending_runs.db at repo root, never
+    calls a network. Pure schema-init smoke test in tmp.
+    """
+    try:
+        from services import mcp_pending_store  # noqa: PLC0415
+    except ImportError as e:
+        runner.failed(f"services.mcp_pending_store not importable: {e}")
+        return
+
+    prod_path = Path(mcp_pending_store.DEFAULT_DB_PATH)
+    parent = prod_path.parent if str(prod_path.parent) not in ("", ".") else Path.cwd()
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            runner.failed(f"MCP pending registry parent dir not creatable at {parent}: {e}")
+            return
+
+    # Schema smoke test against a tmp DB - never touches the real one.
+    # ignore_cleanup_errors=True because Windows can hold the SQLite
+    # WAL/SHM sidecars briefly after the connection closes; the OS will
+    # garbage-collect the tmp dir later.
+    import tempfile  # noqa: PLC0415
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        tmp_db = Path(tmp) / "mcp_pending_runs.db"
+        try:
+            assert mcp_pending_store.list_pending(db_path=tmp_db) == []
+        except Exception as e:
+            runner.failed(f"MCP pending registry schema init failed: {e}")
+            return
+
+    runner.passed(
+        f"MCP pending registry OK (path={prod_path}, parent writable, schema initialises)"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
@@ -424,6 +486,7 @@ def main() -> int:
     check_master_context_template(runner, root)
     check_client_onboarding(runner, root)
     check_checkpoint_db_config(runner)
+    check_mcp_pending_registry(runner)
 
     print("=" * 60)
     print(

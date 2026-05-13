@@ -42,6 +42,7 @@ from agents.strategist.tools.apify_fb_ads import make_fb_ads_search_tool
 from agents.strategist.tools.tavily_search import make_tavily_competitor_search_tool
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
+from services.api_errors import format_api_error
 
 OUTREACH_MAX_ADS_TO_LLM = 10
 
@@ -203,7 +204,10 @@ def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
             # retrying an Apify failure in a tight loop and burning the
             # cap on a permanently-broken brand.
             _apify_calls_this_run += 1
-            return f"API ERROR: {str(e)}"
+            # V1.7: classified error string so the operator can immediately
+            # see whether this was MISSING_KEY (fix .env) vs RATE_LIMIT
+            # (back off) vs PROVIDER_ERROR (Apify down).
+            return format_api_error("apify", e)
 
     return search_fb_ads_library
 

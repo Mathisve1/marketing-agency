@@ -57,7 +57,8 @@ def test_apify_failures_count_against_cap():
     ):
         tool = _make_capped_fb_ads_tool()
         for _ in range(MAX_APIFY_CALLS_PER_RUN):
-            assert tool.invoke({"competitor_pages": ["x"]}).startswith("API ERROR:")
+            # V1.7: classified format "API ERROR [apify / <CLASS>]: ..."
+            assert tool.invoke({"competitor_pages": ["x"]}).startswith("API ERROR [apify /")
         # Cap reached; next call hits the SAFETY LIMIT, not the underlying.
         assert tool.invoke({"competitor_pages": ["x"]}).startswith("SAFETY LIMIT:")
 

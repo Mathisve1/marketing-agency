@@ -2,13 +2,19 @@ name: CI
 
 # Minimal CI for the marketing-agency repo.
 #
-#   - Lint:  ruff check .
-#   - Test:  pytest (the full suite; runs in a few seconds)
+#   - Lint:    ruff check .
+#   - Hygiene: scripts/check_repo_hygiene.py --tracked
+#   - Test:    pytest (the full suite; runs in a few seconds)
 #
 # Tests must NOT call real external APIs. The job exports stub values for
 # every required env var so any code path that reads os.environ at import
 # time keeps working; tests that hit Kling / Meta / Anthropic / Tavily /
 # Apify already mock at the boundary (see tests/test_*.py for the pattern).
+#
+# The hygiene step (V1.7) scans `git ls-files` for sensitive paths
+# (prospects/, logs/, clients/<id>/client_data.db, .env, pitch.pdf, ...)
+# and fails the build if anything forbidden ever made it into git
+# history. Never reads file contents.
 
 on:
   push:
@@ -60,6 +66,11 @@ jobs:
 
       - name: Lint (ruff)
         run: python -m ruff check .
+
+      - name: Repo hygiene (forbidden paths in tracked files)
+        # Pure stdlib; never reads file contents, never prints potential
+        # secret values. Fails CI if a sensitive path was ever committed.
+        run: python scripts/check_repo_hygiene.py --tracked
 
       - name: Tests (pytest)
         # Stub env vars so import-time os.environ reads do not fail. These

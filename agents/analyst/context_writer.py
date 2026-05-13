@@ -34,6 +34,7 @@ from core.context_schema import (
     NegativeConstraint,
     Severity,
 )
+from services.api_errors import format_api_error
 
 DEFAULT_MIN_SPEND_USD = 50.0
 _HOOK_ID_IN_RULE_RX = re.compile(r"\b(WH-\d+)\b")
@@ -336,7 +337,10 @@ def make_analyze_campaign_performance_tool(ctx: ClientContext):
                 min_spend_usd=min_spend_usd,
             )
         except Exception as e:
-            return f"API ERROR: {str(e)}"
+            # V1.7: classified error - operator can immediately tell whether
+            # the Meta call failed because of an unset token (MISSING_KEY)
+            # vs a 5xx (PROVIDER_ERROR) vs a window with no ads (NO_DATA).
+            return format_api_error("meta", e)
 
     return analyze_campaign_performance
 

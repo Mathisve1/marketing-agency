@@ -13,6 +13,8 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from services.api_errors import format_api_error
+
 
 class TavilySearchInput(BaseModel):
     brand: str = Field(..., description="Client brand name to find competitors of.")
@@ -63,6 +65,9 @@ def make_tavily_competitor_search_tool():
                 for r in (response.get("results") or [])[:limit]
             ]
         except Exception as e:
-            return f"API ERROR: Tavily search failed - {str(e)}"
+            # V1.7: classified error format - operator can grep on the
+            # bracketed token (RATE_LIMIT, MISSING_KEY, TIMEOUT, ...)
+            # without reading English.
+            return format_api_error("tavily", e)
 
     return tavily_competitor_search

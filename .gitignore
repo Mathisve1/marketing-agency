@@ -47,6 +47,14 @@ checkpoints.db
 checkpoints.db-shm
 checkpoints.db-wal
 
+# V1.7: MCP pending-runs registry (operator-facing context for paused
+# Producer approvals). Contains thread_id, prompt, client_id, model,
+# task_type, plan_id and the LangGraph runtime config. Regenerated on
+# demand by mcp_server.py / services/mcp_pending_store.py.
+mcp_pending_runs.db
+mcp_pending_runs.db-shm
+mcp_pending_runs.db-wal
+
 # Manual output-quality grades produced by scripts/eval_review.py.
 # May contain real client/prospect names, artifact paths, and operator
 # notes; never commit. The evals/ directory itself is preserved via

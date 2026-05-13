@@ -20,7 +20,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 # Ensure we run from the repo root so relative paths (clients/, prospects/,
 # logs/) resolve correctly regardless of how Claude Desktop spawns us.
@@ -48,6 +48,7 @@ from core.supervisor import (
     initial_state,
     run_supervisor_async,
 )
+from services import mcp_pending_store
 from services.hitl_service import approve_and_resume, reject_pending_plan
 
 # Hidden default - Sonnet 4.6 is the cheaper/faster tier. Override per call
@@ -61,14 +62,15 @@ mcp = FastMCP("marketing-agency")
 # --------------------------------------------------------------------------- #
 # Module-level graph singleton + pending-runs registry.
 #
-# The compiled graph owns its MemorySaver checkpointer. Because resume happens
-# in a SEPARATE tool call (different LangGraph invocation) we cannot rebuild
-# the graph between submit and resume - the in-memory checkpoint would be
-# discarded. Hence: build once at import.
+# Graph: V1.5 SqliteSaver checkpointer persists graph state across MCP
+# restarts; the graph is built once at import to keep the compiled
+# nodes + checkpointer alive for the life of the process.
 #
-# _PENDING_RUNS maps thread_id -> the original config + minimal context the
-# operator needs to make an informed approve/reject decision. Entries are
-# popped on resume (approve OR reject) so the registry stays bounded.
+# Pending runs registry: V1.7 moved this off a process-local dict and
+# into SQLite (`mcp_pending_runs.db`) via services/mcp_pending_store.py.
+# An MCP restart no longer loses the operator-facing context
+# (thread_id, prompt, client_id, model, task_type, plan_id, config) that
+# resume_agency_workflow needs.
 # --------------------------------------------------------------------------- #
 
 
@@ -77,7 +79,12 @@ mcp = FastMCP("marketing-agency")
 # review). The pause message includes the plan's exact prompt + assets so
 # Claude Desktop can show the operator what is about to be spent on.
 _GRAPH = build_supervisor_graph(interrupt_before=["producer_submit"])
-_PENDING_RUNS: dict[str, dict[str, Any]] = {}
+
+# V1.7: the operator-facing pending-runs registry now lives in SQLite
+# (mcp_pending_runs.db) so an MCP restart no longer strands the
+# checkpoint-without-context. The dict-shaped helpers in
+# services/mcp_pending_store.py preserve the call-site semantics that
+# used to be a process-local dict here.
 
 
 def _format_run_result(result: dict, chosen_model: str) -> str:
@@ -183,14 +190,16 @@ def run_agency_agent(
             except Exception as e:
                 plan_summary = f"(could not load plan {plan_id}: {e})"
 
-        _PENDING_RUNS[thread_id] = {
-            "config": config,
-            "client_id": client_id,
-            "model": chosen_model,
-            "prompt": prompt,
-            "task_type": result.get("task_type"),
-            "plan_id": plan_id,
-        }
+        # V1.7: durable replacement for the in-memory _PENDING_RUNS dict.
+        mcp_pending_store.record_pending(
+            thread_id,
+            client_id=client_id,
+            model=chosen_model,
+            prompt=prompt,
+            task_type=result.get("task_type"),
+            plan_id=plan_id,
+            config=config,
+        )
         return (
             "Workflow paused for financial safety. Review the COMPILED plan "
             "below and use the resume_agency_workflow tool to approve or reject.\n"
@@ -228,13 +237,15 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
         On reject:  a confirmation that the run was cancelled with no Kling
                     spend.
     """
-    pending = _PENDING_RUNS.pop(thread_id, None)
+    # V1.7: pop_pending mirrors the old dict.pop(k, None) semantics but
+    # against SQLite, so an MCP restart no longer loses the registry.
+    pending = mcp_pending_store.pop_pending(thread_id)
     if pending is None:
         return (
             f"ERROR: no paused workflow with thread_id={thread_id!r}. "
-            f"Either it was already approved/rejected, the MCP server "
-            f"restarted (in-memory checkpoint lost), or the thread_id is "
-            f"a typo."
+            f"Either it was already approved/rejected, or the thread_id "
+            f"is a typo. (The MCP pending-runs registry is durable as of "
+            f"V1.7, so MCP restart no longer drops in-flight thread IDs.)"
         )
 
     plan_id = pending.get("plan_id")
@@ -258,6 +269,10 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
         # V1.5: reject_pending_plan now drains the SqliteSaver checkpoint
         # via graph.update_state + ainvoke(None) so snapshot.next is empty
         # by the time we return - matches the Streamlit UI's Reject.
+        # V1.7: re-record + mark_decided so the rejection shows up in the
+        # MCP audit panel (pop_pending DELETEd the row above).
+        mcp_pending_store.restore_pending(pending)
+        mcp_pending_store.mark_decided(thread_id, "rejected")
         return (
             f"Producer workflow cancelled for thread_id={thread_id}. "
             f"No Kling credits were spent.{rejection_note}"
@@ -268,7 +283,7 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
     if not outcome.ok:
         # Restore the pending entry so the operator can retry approve/reject
         # rather than losing the checkpoint reference entirely.
-        _PENDING_RUNS[thread_id] = pending
+        mcp_pending_store.restore_pending(pending)
         return (
             f"ERROR resuming Producer for thread_id={thread_id}: "
             f"{outcome.error}. The pause is still active - retry "
@@ -276,6 +291,11 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
         )
     result = outcome.result
 
+    # V1.7: keep the audit row (pop_pending DELETEd it; mark_decided is a
+    # no-op now because the row is gone, but we re-record + mark so the
+    # decision shows up in list_decided for the Streamlit status panel).
+    mcp_pending_store.restore_pending(pending)
+    mcp_pending_store.mark_decided(thread_id, "approved")
     return f"Producer approved.\n{_format_run_result(result, chosen_model)}"
 
 
