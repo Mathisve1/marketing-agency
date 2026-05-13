@@ -35,7 +35,6 @@ from core.context_schema import (
     Severity,
 )
 
-
 DEFAULT_MIN_SPEND_USD = 50.0
 _HOOK_ID_IN_RULE_RX = re.compile(r"\b(WH-\d+)\b")
 

@@ -32,7 +32,6 @@ from core.context_schema import (
     WinningHook,
 )
 
-
 # --------------------------------------------------------------------------- #
 # UGC authenticity library (ported from krusemediallc/arcads-claude-code)
 # --------------------------------------------------------------------------- #

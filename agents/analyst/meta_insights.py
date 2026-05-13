@@ -23,7 +23,6 @@ from typing import Optional
 
 import requests
 
-
 META_GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v19.0")
 META_API_BASE = os.getenv(
     "META_API_BASE_URL",

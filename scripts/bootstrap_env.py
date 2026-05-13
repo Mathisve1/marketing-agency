@@ -17,7 +17,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_REFERENCES = REPO_ROOT / "clients" / "_template" / "references"
 REQUIRED_SUBDIRS = ("characters", "products", "referral_videos")

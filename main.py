@@ -7,7 +7,6 @@ import sys
 from core.models import SUPPORTED_MODEL_IDS
 from core.supervisor import build_supervisor_graph, initial_state
 
-
 TASK_TYPE_CHOICES = ["research", "produce", "analyze"]
 
 

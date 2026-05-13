@@ -28,7 +28,6 @@ from core.context_schema import (
     WinningHook,
 )
 
-
 NOW = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
 
 
@@ -137,7 +136,12 @@ def test_multiple_hard_constraints_all_enforced_and_tracked():
 def test_motion_injected_when_provided():
     motion = _motion(description="quick zoom on product")
     brief = compile_brief(**{**_empty_brief_inputs(), "motion": motion})
-    assert "Motion reference: quick zoom on product" in brief.prompt
+    # Post-V1.2 phrasing: the motion line references the <<<video_1>>>
+    # asset tag so the Kling Omni model can ground the input.
+    assert (
+        "Motion: follow the pacing and camera of <<<video_1>>> "
+        "(quick zoom on product)" in brief.prompt
+    )
     assert "pacing=medium-fast" in brief.prompt
     assert "camera=handheld_POV" in brief.prompt
     assert brief.source_motion_id == "RM-001"
@@ -146,7 +150,9 @@ def test_motion_injected_when_provided():
 
 def test_no_motion_means_no_motion_line_and_no_reference_path():
     brief = compile_brief(**_empty_brief_inputs())
-    assert "Motion reference:" not in brief.prompt
+    # No motion -> no Motion: line, no <<<video_1>>> tag in the assets header.
+    assert "\nMotion:" not in brief.prompt
+    assert "<<<video_1>>>" not in brief.prompt
     assert brief.reference_video_path is None
     assert brief.source_motion_id is None
 

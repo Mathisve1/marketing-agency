@@ -3,34 +3,72 @@ name = "marketing-agency"
 version = "0.1.0"
 description = "Multi-tenant AI performance marketing agency with LangGraph supervisor/worker agents"
 requires-python = ">=3.11"
+
+# Dependency policy (V1.5 maintainability pass):
+#   - Pin a known-good lower floor (we have run against this floor).
+#   - Pin an upper bound on the next likely-breaking major (or minor for
+#     pre-1.0 SDKs whose minor bumps routinely break).
+#   - Reproducibility lockfile (requirements-lock.txt or uv.lock) is
+#     deferred to a dedicated dependency-management pass; see README.md
+#     "Dependency management" section for the recommended next step.
 dependencies = [
-    "langgraph>=0.2.50",
-    "langchain-anthropic>=0.3.0",
-    "langchain-core>=0.3.0",
-    "pydantic>=2.9",
-    "pyyaml>=6.0.2",
-    "python-dotenv>=1.0",
-    "streamlit>=1.40",
-    "fpdf2>=2.8",
-    "requests>=2.32",
-    "anthropic>=0.40",
-    "tavily-python>=0.5",
-    "apify-client>=1.8",
-    "PyJWT>=2.9",
-    "mcp>=1.2",
+    "langgraph>=0.2.50,<0.3",
+    "langchain-anthropic>=0.3.0,<0.4",
+    "langchain-core>=0.3.0,<0.4",
+    "pydantic>=2.9,<3",
+    "pyyaml>=6.0.2,<7",
+    "python-dotenv>=1.0,<2",
+    "streamlit>=1.40,<2",
+    "fpdf2>=2.8,<3",
+    "requests>=2.32,<3",
+    "anthropic>=0.40,<1",
+    "tavily-python>=0.5,<1",
+    "apify-client>=1.8,<2",
+    "PyJWT>=2.9,<3",
+    "mcp>=1.2,<2",
 ]
 
 [project.optional-dependencies]
 producer = []
-dev = ["pytest>=8.3", "ruff>=0.7"]
+# Dev includes lint, test, and pip-tools for the future
+# `pip-compile pyproject.toml -o requirements-lock.txt` step.
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.7,<1",
+    "pip-tools>=7.4,<8",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["core*", "agents*", "ui*"]
+include = ["core*", "agents*", "ui*", "services*"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# Conservative starting set: pycodestyle errors, pyflakes, isort, bugbear.
+# Tighten in a follow-up; we want CI green on first run.
+select = ["E", "F", "I", "B"]
+ignore = [
+    "E501",  # line length is enforced separately by formatter; long
+             # docstrings + URLs are common in this repo
+    "B008",  # function calls in argument defaults - widely used in the
+             # codebase for FastMCP / LangChain tool decorators
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally use unused-imports-like patterns and may shadow
+# fixtures; ruff's defaults flag these unhelpfully.
+"tests/*" = ["B"]
+# The MCP server intentionally imports agent modules AFTER os.chdir() and
+# load_dotenv() so .env is loaded before any agent module reads env vars
+# at import time. The late imports are load-bearing, not bad style.
+"mcp_server.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -8,15 +8,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from agents.outreach.agent import (
     MAX_APIFY_CALLS_PER_RUN,
     MAX_TAVILY_CALLS_PER_RUN,
     _make_capped_fb_ads_tool,
     _make_capped_tavily_tool,
 )
-
 
 # --------------------------------------------------------------------------- #
 # Apify cap
@@ -68,7 +65,8 @@ def test_apify_failures_count_against_cap():
 def test_apify_counter_is_per_factory_call():
     """Each fresh outreach_node invocation builds a new tool with a fresh
     counter. Two factory builds must be independent."""
-    fake_underlying = MagicMock(); fake_underlying.invoke.return_value = []
+    fake_underlying = MagicMock()
+    fake_underlying.invoke.return_value = []
     with patch("agents.outreach.agent.make_fb_ads_search_tool", return_value=fake_underlying):
         tool_a = _make_capped_fb_ads_tool()
         for _ in range(MAX_APIFY_CALLS_PER_RUN):

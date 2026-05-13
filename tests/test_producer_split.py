@@ -37,7 +37,6 @@ from core.context_schema import (
     WinningHook,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -288,7 +287,10 @@ def test_atomic_claim_prevents_double_submission(ctx_with_assets: ClientContext)
          patch("agents.producer.agent.ClientContext.load", return_value=ctx_with_assets):
         t1 = threading.Thread(target=run_submit)
         t2 = threading.Thread(target=run_submit)
-        t1.start(); t2.start(); t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
     assert submit_count["n"] == 1, (
         f"Kling was called {submit_count['n']} times for the same plan; "

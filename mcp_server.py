@@ -46,10 +46,9 @@ from core.supervisor import (
     build_supervisor_graph,
     get_pending_node,
     initial_state,
-    resume_supervisor_async,
     run_supervisor_async,
 )
-
+from services.hitl_service import approve_and_resume, reject_pending_plan
 
 # Hidden default - Sonnet 4.6 is the cheaper/faster tier. Override per call
 # via the `model` arg if a heavier reasoning pass is worth the cost.
@@ -238,40 +237,41 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
             f"a typo."
         )
 
+    plan_id = pending.get("plan_id")
+    client_id = pending.get("client_id")
+
     if not approve:
-        # V1.4: mark the plan rejected in SQL for the audit trail
-        # (lifecycle: pending_approval -> rejected; no auto-supersede).
-        plan_id = pending.get("plan_id")
-        client_id = pending.get("client_id")
-        if plan_id and client_id:
+        # Service owns the SQL audit-trail bookkeeping (lifecycle:
+        # pending_approval | submitting -> rejected). Best-effort; an audit
+        # failure must not prevent the cancellation acknowledgement.
+        rejection_note = ""
+        if client_id:
             try:
-                ClientContext.load(client_id).reject_video_plan(
-                    plan_id, decided_by="human"
+                outcome = reject_pending_plan(
+                    ClientContext.load(client_id), plan_id, decided_by="human"
                 )
+                rejection_note = " " + outcome.note
             except Exception:
-                pass  # best-effort audit; don't fail the cancellation
+                pass
         # The orphan LangGraph checkpoint stays in MemorySaver until the MCP
         # process restarts; harmless and mirrors the Streamlit UI's Reject.
         return (
             f"Producer workflow cancelled for thread_id={thread_id}. "
-            f"No Kling credits were spent."
-            + (f" Plan {plan_id} marked rejected." if plan_id else "")
+            f"No Kling credits were spent.{rejection_note}"
         )
 
     chosen_model = pending["model"]
-    try:
-        result = asyncio.run(resume_supervisor_async(
-            _GRAPH, config=pending["config"]
-        ))
-    except Exception as e:
+    outcome = approve_and_resume(_GRAPH, pending["config"])
+    if not outcome.ok:
         # Restore the pending entry so the operator can retry approve/reject
         # rather than losing the checkpoint reference entirely.
         _PENDING_RUNS[thread_id] = pending
         return (
             f"ERROR resuming Producer for thread_id={thread_id}: "
-            f"{type(e).__name__}: {e}. The pause is still active - retry "
+            f"{outcome.error}. The pause is still active - retry "
             f"resume_agency_workflow when the underlying issue is resolved."
         )
+    result = outcome.result
 
     return f"Producer approved.\n{_format_run_result(result, chosen_model)}"
 

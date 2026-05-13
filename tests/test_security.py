@@ -19,7 +19,6 @@ import pytest
 from agents.outreach.prospect_store import ProspectStore
 from core.client_context import ClientContext
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

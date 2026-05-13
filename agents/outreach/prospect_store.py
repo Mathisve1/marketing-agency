@@ -27,7 +27,6 @@ from core.context_schema import (
     WinningHook,
 )
 
-
 PROSPECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 DEFAULT_PROSPECTS_ROOT = Path("prospects")
 

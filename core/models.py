@@ -5,7 +5,6 @@ means one edit here, not three.
 """
 from __future__ import annotations
 
-
 # Friendly label -> model_id, in display order. The label appears in the
 # Streamlit selectbox; the id is passed to ChatAnthropic.
 SUPPORTED_MODELS: dict[str, str] = {

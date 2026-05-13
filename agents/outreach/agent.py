@@ -37,7 +37,6 @@ from agents.strategist.tools.tavily_search import make_tavily_competitor_search_
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
 
-
 OUTREACH_MAX_ADS_TO_LLM = 10
 
 # V1.4 hard cost limits enforced in Python, not in the system prompt. The

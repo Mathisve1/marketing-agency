@@ -15,8 +15,7 @@ from pathlib import Path
 import pytest
 
 from core.client_context import ClientContext
-from core.context_schema import JobStatus, PlanStatus, VideoJob, VideoPlan
-
+from core.context_schema import JobStatus, VideoJob, VideoPlan
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -132,7 +131,10 @@ def test_concurrent_updates_atomic(ctx: ClientContext):
 
     t1 = threading.Thread(target=hammer, args=(JobStatus.COMPLETED,))
     t2 = threading.Thread(target=hammer, args=(JobStatus.FAILED,))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     for tid in task_ids:
         job = ctx.get_video_job(tid)

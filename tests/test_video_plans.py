@@ -17,7 +17,6 @@ import pytest
 from core.client_context import ClientContext
 from core.context_schema import PlanStatus, VideoPlan
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -163,8 +162,10 @@ def test_claim_atomic_under_concurrent_threads(ctx: ClientContext):
             wins.append(won)
 
     threads = [threading.Thread(target=attempt) for _ in range(50)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     assert wins.count(True) == 1, (
         f"exactly one thread must win the claim; got {wins.count(True)} winners"

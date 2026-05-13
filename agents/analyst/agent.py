@@ -21,7 +21,6 @@ from core.client_context import ClientContext
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
 
-
 SYSTEM_PROMPT = """You are the Analyst for an AI performance marketing agency.
 
 Client: {client_name}  (locale: {client_locale})

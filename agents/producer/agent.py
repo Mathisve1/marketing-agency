@@ -45,7 +45,6 @@ from core.context_schema import JobStatus, VideoJob, VideoPlan
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
 
-
 # Kling task statuses still considered "in flight" (mirrors kling/client.py).
 _NON_TERMINAL_STATUSES = {"pending", "processing", "queued", "running", "created", "submitted"}
 

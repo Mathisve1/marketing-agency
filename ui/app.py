@@ -22,7 +22,6 @@ from pathlib import Path
 import streamlit as st
 
 from agents.outreach.prospect_store import promote_to_client
-from agents.producer.agent import format_plan_summary
 from agents.producer.kling.client import KlingAPIError, KlingClient
 from core.client_context import ClientContext, list_clients
 from core.context_schema import JobStatus
@@ -31,10 +30,13 @@ from core.supervisor import (
     build_supervisor_graph,
     get_pending_node,
     initial_state,
-    resume_supervisor_async,
     run_supervisor_async,
 )
-
+from services.hitl_service import (
+    approve_and_resume,
+    load_plan_for_review,
+    reject_pending_plan,
+)
 
 st.set_page_config(page_title="Agency Command Center", layout="wide")
 st.title("Agency Command Center")
@@ -317,7 +319,7 @@ def _render_hitl_approval(graph) -> bool:
 
     plan_id = pending.get("plan_id")
     plan_ctx = ClientContext.load(pending["client_id"])
-    plan = plan_ctx.get_video_plan(plan_id) if plan_id else None
+    plan = load_plan_for_review(plan_ctx, plan_id)
 
     st.warning("Plan review required - paid Kling submission about to occur")
 
@@ -382,25 +384,20 @@ def _render_hitl_approval(graph) -> bool:
             disabled=approve_disabled,
         ):
             with st.spinner("Submitting to Kling (render happens async)..."):
-                try:
-                    result = asyncio.run(resume_supervisor_async(
-                        graph, config=pending["config"]
-                    ))
-                    st.session_state["hitl_last_result"] = result
-                    st.session_state["hitl_last_status"] = "approved"
-                except Exception as e:
-                    st.session_state["hitl_last_result"] = None
-                    st.session_state["hitl_last_status"] = (
-                        f"error:{type(e).__name__}: {e}"
-                    )
+                outcome = approve_and_resume(graph, pending["config"])
+            if outcome.ok:
+                st.session_state["hitl_last_result"] = outcome.result
+                st.session_state["hitl_last_status"] = "approved"
+            else:
+                st.session_state["hitl_last_result"] = None
+                st.session_state["hitl_last_status"] = f"error:{outcome.error}"
             st.session_state["hitl_pending"] = None
             st.rerun()
     with col_r:
         if st.button("Reject - cancel", key="hitl_reject"):
-            # V1.4: mark the plan rejected in SQL for the audit trail
-            # (lifecycle: pending_approval -> rejected, no auto-supersede).
-            if plan_id and plan is not None:
-                plan_ctx.reject_video_plan(plan_id, decided_by="human")
+            # Service owns the SQL audit-trail bookkeeping consistently
+            # across UI + MCP callers.
+            reject_pending_plan(plan_ctx, plan_id, decided_by="human")
             st.session_state["hitl_pending"] = None
             st.session_state["hitl_last_status"] = "rejected"
             st.session_state["hitl_last_result"] = None

@@ -11,7 +11,6 @@ from typing import Optional
 
 from agents.strategist.analysis.longevity_scorer import score_ads
 
-
 NOW = datetime(2026, 5, 12, 12, 0, tzinfo=timezone.utc)
 
 

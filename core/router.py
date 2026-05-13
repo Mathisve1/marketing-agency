@@ -9,7 +9,6 @@ from typing import Literal
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
-
 TaskType = Literal["research", "produce", "analyze", "outreach"]
 
 

@@ -15,7 +15,6 @@ from apify_client import ApifyClient
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-
 # Default to the most-used community FB Ads Library actor. Override via
 # APIFY_FB_ADS_ACTOR_ID if you've licensed a different one.
 DEFAULT_ACTOR_ID = os.getenv(

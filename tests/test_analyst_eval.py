@@ -141,7 +141,10 @@ def test_evaluate_fails_hook_below_roas_target():
     assert results[0].failed is True
     assert "ROAS 1.00 < target 2.00" in results[0].reasons
     assert results[0].proposed_rule == "Do not use Hook WH-001 for this client"
-    assert "WH-001" in results[0].proposed_reason
+    # The hook_id is enforced in proposed_rule (asserted above); the
+    # proposed_reason carries the failure metrics so the constraint row
+    # records WHY the rule was added.
+    assert "ROAS 1.00" in results[0].proposed_reason
 
 
 def test_evaluate_fails_hook_below_ctr_target():
