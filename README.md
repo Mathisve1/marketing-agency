@@ -180,23 +180,82 @@ and should never contain anything sensitive.
 
 ## Dependency management
 
-Dependencies in `pyproject.toml` are pinned with a known-good lower floor
-and an upper bound on the next likely-breaking major (or minor for pre-1.0
-SDKs whose minor bumps routinely break — `langchain-*`, `langgraph`).
+Two layers:
 
-This repo does **not** yet ship a reproducibility lockfile. That's a
-deliberate scope choice for the maintainability pass; the recommended
-follow-up is a dedicated dependency-pinning sprint:
+1. **`pyproject.toml`** declares acceptable version *ranges* — known-good
+   lower floor + upper bound on the next likely-breaking major (or minor
+   for pre-1.0 SDKs whose minor bumps routinely break — `langchain-*`,
+   `langgraph`).
+2. **`requirements-lock.txt`** pins the *exact* resolved versions used in
+   CI and recommended for local development. Regenerated whenever
+   `pyproject.toml` deps change.
+
+CI installs from the lockfile, then installs the local project with
+`--no-deps` so `pyproject` ranges cannot silently upgrade anything the
+lock pinned.
+
+### Local install (recommended: from the lock)
 
 ```bash
-# pip-tools is already in [project.optional-dependencies].dev
-python -m piptools compile pyproject.toml -o requirements-lock.txt
-# (or use `uv pip compile pyproject.toml -o uv.lock` if you prefer uv.)
+python -m pip install -r requirements-lock.txt
+python -m pip install -e . --no-deps
+python -m pip check          # must report "No broken requirements found."
 ```
 
-Once a lockfile exists the CI install step should switch to
-`pip install -r requirements-lock.txt` so PRs cannot pick up a silent
-upgrade of `langgraph` / `langchain-*` mid-week.
+`pip install -e ".[dev]"` (resolving from `pyproject` ranges) still
+works for fast experimentation, but you may pick up versions CI hasn't
+seen.
+
+### Refreshing the lockfile
+
+The lockfile **must** be generated under Python 3.11 — same version CI
+runs. Resolving under 3.13 / 3.14 produces wheels and environment-marker
+choices that 3.11 cannot necessarily install.
+
+```bash
+# Use the Windows py launcher to pick 3.11 explicitly:
+py -3.11 -m pip install --upgrade pip pip-tools
+py -3.11 -m piptools compile pyproject.toml --extra dev -o requirements-lock.txt
+```
+
+On macOS / Linux the equivalent is `python3.11 -m piptools compile …`.
+
+After regenerating, re-run the verification gate before committing the
+new lock:
+
+```bash
+py -3.11 -m pip install -r requirements-lock.txt
+py -3.11 -m pip install -e . --no-deps
+py -3.11 -m pip check
+py -3.11 -m ruff check .
+py -3.11 -m pytest
+py -3.11 scripts/doctor.py
+```
+
+### When to refresh
+
+- Any time `pyproject.toml` `dependencies` or `[dev]` extras change.
+- When a security advisory hits one of the locked packages
+  (`pip-audit -r requirements-lock.txt` is a good periodic check).
+- When CI starts failing on an upgraded transitive (rare with the lock
+  in place — almost always means a maintainer changed `pyproject` and
+  forgot to refresh the lock).
+
+### Why no `--generate-hashes`?
+
+Adds 800-1000 lines to the lockfile, slows CI installs noticeably, and
+complicates the manual refresh workflow above. Worth adding in a
+follow-up if/when supply-chain pinning becomes a hard requirement.
+
+### Why not `uv`?
+
+`uv` is faster and has a `--python` flag that targets a Python version
+without needing it locally. We standardised on `pip-tools` because it
+is already in `[dev]`, every contributor already has `pip` installed,
+and the resolver bug fixed by the lockfile (a leftover
+`langgraph-prebuilt 1.x` clashing with `langchain-core 0.3.x`) needs
+nothing more sophisticated. Revisit if/when supply-chain or speed
+become bottlenecks.
 
 ---
 

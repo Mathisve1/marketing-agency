@@ -29,11 +29,34 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          # Cache key changes whenever the lockfile changes, so contributors
+          # can refresh dependencies without manually busting the cache.
+          cache-dependency-path: "requirements-lock.txt"
 
-      - name: Install project (with dev extras)
+      - name: Install pinned dependencies (from lockfile)
+        # Lockfile generated under Python 3.11 via:
+        #   py -3.11 -m piptools compile pyproject.toml --extra dev \
+        #       -o requirements-lock.txt
+        # Installing from the lock guarantees CI sees the exact versions
+        # the maintainer last verified, and prunes stray packages (e.g.
+        # the leftover langgraph-prebuilt 1.x that conflicted with our
+        # langchain-core 0.3 pin) that pyproject's range would otherwise
+        # quietly accept.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install -r requirements-lock.txt
+
+      - name: Install local project (no dependency re-resolution)
+        # --no-deps prevents pip from re-evaluating any pyproject ranges
+        # and silently upgrading something the lockfile pinned. The
+        # editable install is purely for our source tree (core, agents,
+        # services, ui).
+        run: python -m pip install -e . --no-deps
+
+      - name: Verify dependency tree is consistent
+        # Cheap belt-and-suspenders: fails the build if anyone slips a
+        # conflicting version into the lockfile.
+        run: python -m pip check
 
       - name: Lint (ruff)
         run: python -m ruff check .
