@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
 
 from agents.outreach.prospect_store import promote_to_client
+from agents.producer.kling.client import KlingAPIError, KlingClient
 from core.client_context import ClientContext, list_clients
 from core.models import SUPPORTED_MODELS
 from core.supervisor import (
@@ -500,14 +502,113 @@ with tab_constraints:
             st.markdown(f"**{c.id}** ({c.severity.value}) - {c.rule}")
             st.caption(f"Reason: {c.reason}")
 
+def _poll_pending_kling_task(ctx: ClientContext, entry: dict) -> tuple[str, str]:
+    """Poll a single pending Kling task and reconcile its performance_log entry.
+
+    V1.3 hardening (Initiative 4): solves the orphaned-task UX dead end.
+    Mirrors agents/producer/agent.py::check_video_status so the UI button
+    and the LLM tool produce identical on-disk state (same filename
+    convention, same status fields).
+
+    Returns a (status, message) tuple where status is one of
+    'rendering' | 'failed' | 'completed' | 'error'. Errors are caught so a
+    transient Kling failure never crashes the Streamlit script.
+    """
+    task_id = entry["kling_task_id"]
+    try:
+        kling_client = KlingClient()
+        task = kling_client.poll_task(task_id)
+    except (KlingAPIError, Exception) as e:
+        return "error", f"Poll failed: {type(e).__name__}: {e}"
+
+    data = task.get("data") or task
+    status = str(data.get("task_status") or data.get("status") or "pending").lower()
+
+    if status in {"submitted", "processing", "pending", "queued", "running"}:
+        return "rendering", f"Still rendering (Kling status: {status})."
+
+    if status in {"failed", "error"}:
+        err = data.get("error") or data.get("message") or "unknown failure"
+        ctx.update_performance_entry_by_task_id(task_id, {
+            "status": "failed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(err),
+        })
+        return "failed", f"Kling reported failure: {err}"
+
+    # Terminal success -> mirror Producer's filename convention.
+    hook_id = entry.get("hook_id", "unknown")
+    motion_id = entry.get("motion_id")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    name = f"{hook_id}-{motion_id or 'images'}-{timestamp}.mp4"
+    dest = ctx.root / "outputs" / "videos" / name
+
+    try:
+        kling_client.download_video(task, dest)
+    except Exception as e:
+        return "error", f"Download failed: {type(e).__name__}: {e}"
+
+    rel_path = str(dest.relative_to(ctx.root))
+    ctx.update_performance_entry_by_task_id(task_id, {
+        "status": "completed",
+        "video_path": rel_path,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return "completed", f"Video downloaded to {rel_path}."
+
+
 with tab_videos:
+    # ----- Pending Kling tasks: polling UI so async submissions never orphan. -----
+    log_entries = ctx.read_performance_log()
+    pending_entries = [
+        e for e in log_entries
+        if e.get("status") == "pending" and e.get("kling_task_id")
+    ]
+
+    if pending_entries:
+        st.markdown("### Pending Kling tasks")
+        st.caption(
+            f"{len(pending_entries)} task(s) submitted to Kling but not yet "
+            f"reconciled. Click *Check Status* to poll. Completed renders "
+            f"download to `outputs/videos/` and disappear from this list."
+        )
+        for entry in pending_entries:
+            task_id = entry["kling_task_id"]
+            with st.container(border=True):
+                cols = st.columns([3, 1])
+                with cols[0]:
+                    st.markdown(f"**Task** `{task_id}`")
+                    st.caption(
+                        f"hook={entry.get('hook_id', '-')} - "
+                        f"motion={entry.get('motion_id') or '-'} - "
+                        f"submitted {entry.get('submitted_at', '?')}"
+                    )
+                with cols[1]:
+                    if st.button("Check Status", key=f"poll_{task_id}"):
+                        with st.spinner(f"Polling Kling for {task_id}..."):
+                            outcome, message = _poll_pending_kling_task(ctx, entry)
+                        if outcome == "completed":
+                            st.success(message)
+                        elif outcome == "rendering":
+                            st.info(message)
+                        elif outcome == "failed":
+                            st.error(message)
+                        else:
+                            st.warning(message)
+                        # Rerun so the entry leaves 'pending' (or shows the
+                        # new status banner on the next render).
+                        st.rerun()
+        st.divider()
+
+    # ----- Existing on-disk MP4 listing (unchanged behavior). -----
     videos_dir = ctx.root / "outputs" / "videos"
     mp4_files = (
         sorted(videos_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         if videos_dir.exists() else []
     )
     if not mp4_files:
-        st.info("No videos generated yet.")
+        if not pending_entries:
+            st.info("No videos generated yet.")
     else:
         st.caption(f"{len(mp4_files)} video(s) saved to `{videos_dir}`")
         for mp4 in mp4_files:

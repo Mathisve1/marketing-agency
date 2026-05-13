@@ -131,20 +131,34 @@ def _make_capped_fb_ads_tool(max_ads: int = OUTREACH_MAX_ADS_TO_LLM):
         competitor_pages: list[str],
         country: str = "BE",
         active_only: bool = True,
-    ) -> list[dict]:
+    ):
         """Scrape competitor Meta ads via Apify, then sort by days_active
         descending and return only the top 10. Long-running ads carry the
-        most strategic signal; the cap keeps context tight."""
-        raw = underlying.invoke({
-            "competitor_pages": competitor_pages,
-            "country": country,
-            "max_ads_per_page": 50,
-            "active_only": active_only,
-        })
-        # score_ads adds the `days_active` field and sorts desc.
-        # min_days=0 keeps every ad - the cap is by count, not longevity.
-        scored = score_ads(raw, min_days=0)
-        return scored[:max_ads]
+        most strategic signal; the cap keeps context tight.
+
+        Returns a list[dict] of scored ads on success, or a string starting
+        with "API ERROR:" on Apify failure (see below).
+        """
+        # V1.3 hardening (Initiative 3): Apify actor failures and HTTP
+        # timeouts raise RuntimeError from the underlying tool. Without this
+        # guard the exception bubbles through the ReAct agent and crashes
+        # the LangGraph node mid-prospect, losing every audit completed
+        # earlier in the same run. Catching here lets the LLM see the
+        # failure as a string tool result and skip the broken brand
+        # gracefully (or report a clean failure to the operator).
+        try:
+            raw = underlying.invoke({
+                "competitor_pages": competitor_pages,
+                "country": country,
+                "max_ads_per_page": 50,
+                "active_only": active_only,
+            })
+            # score_ads adds the `days_active` field and sorts desc.
+            # min_days=0 keeps every ad - the cap is by count, not longevity.
+            scored = score_ads(raw, min_days=0)
+            return scored[:max_ads]
+        except Exception as e:
+            return f"API ERROR: {str(e)}"
 
     return search_fb_ads_library
 

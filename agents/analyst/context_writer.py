@@ -295,40 +295,49 @@ def make_analyze_campaign_performance_tool(ctx: ClientContext):
         Failed hooks include a proposed_rule + proposed_reason that you can
         pass verbatim into write_negative_constraint.
         """
-        fm, _ = ctx.read()
-        benchmarks = fm.performance_benchmarks
+        # V1.3 hardening (Initiative 3): Meta API timeouts/HTTP errors raise
+        # RuntimeError from fetch_meta_insights_data. Without this guard the
+        # exception bubbles through the LangChain tool runtime and crashes
+        # the whole graph step, losing the agent's in-flight state. Catching
+        # here lets the LLM read the failure as a tool result and decide
+        # whether to retry, switch time windows, or report back to the user.
+        try:
+            fm, _ = ctx.read()
+            benchmarks = fm.performance_benchmarks
 
-        if benchmarks.roas_target is None and benchmarks.ctr_target is None:
-            return (
-                "ERROR: No performance benchmarks set in MASTER_CONTEXT.md. "
-                "Configure performance_benchmarks.roas_target and/or "
-                "performance_benchmarks.ctr_target before running the Analyst."
+            if benchmarks.roas_target is None and benchmarks.ctr_target is None:
+                return (
+                    "ERROR: No performance benchmarks set in MASTER_CONTEXT.md. "
+                    "Configure performance_benchmarks.roas_target and/or "
+                    "performance_benchmarks.ctr_target before running the Analyst."
+                )
+
+            insights = fetch_meta_insights_data(time_preset=time_preset)
+            if not insights:
+                return (
+                    f"No ads found in the Meta account for window={time_preset}. "
+                    f"Either no ads ran, or META_AD_ACCOUNT_ID is misconfigured."
+                )
+
+            performance = aggregate_by_hook(insights)
+            skip = _existing_constrained_hook_ids(ctx)
+            evaluations = evaluate_hooks(
+                performance,
+                roas_target=benchmarks.roas_target,
+                ctr_target=benchmarks.ctr_target,
+                min_spend_usd=min_spend_usd,
+                skip_hook_ids=skip,
             )
 
-        insights = fetch_meta_insights_data(time_preset=time_preset)
-        if not insights:
-            return (
-                f"No ads found in the Meta account for window={time_preset}. "
-                f"Either no ads ran, or META_AD_ACCOUNT_ID is misconfigured."
+            return _format_evaluation_summary(
+                evaluations,
+                time_preset=time_preset,
+                roas_target=benchmarks.roas_target,
+                ctr_target=benchmarks.ctr_target,
+                min_spend_usd=min_spend_usd,
             )
-
-        performance = aggregate_by_hook(insights)
-        skip = _existing_constrained_hook_ids(ctx)
-        evaluations = evaluate_hooks(
-            performance,
-            roas_target=benchmarks.roas_target,
-            ctr_target=benchmarks.ctr_target,
-            min_spend_usd=min_spend_usd,
-            skip_hook_ids=skip,
-        )
-
-        return _format_evaluation_summary(
-            evaluations,
-            time_preset=time_preset,
-            roas_target=benchmarks.roas_target,
-            ctr_target=benchmarks.ctr_target,
-            min_spend_usd=min_spend_usd,
-        )
+        except Exception as e:
+            return f"API ERROR: {str(e)}"
 
     return analyze_campaign_performance
 
