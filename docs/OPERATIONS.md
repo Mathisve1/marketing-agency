@@ -11,9 +11,9 @@ This document does NOT cover:
 - output-quality validation workflow — see SECURITY.md and the eval review
   framework documented in the README
 
-Pass 2 will add: persistent operator task store, daily summary script,
-cost ledger, and Streamlit task-action overhaul. This runbook will be
-extended at that time.
+Pass 2.1 added: persistent operator task store, daily summary script,
+and Streamlit task-action buttons (Mark done / Dismiss / Snooze).
+Pass 2.2 will add: cost ledger + provider instrumentation + cost dashboard.
 
 ---
 
@@ -90,8 +90,73 @@ py -3.11 scripts/check_repo_hygiene.py --tracked   # CI does this on every push
 py -3.11 scripts/check_repo_hygiene.py --staged    # pre-commit hook style
 ```
 
-Pass 2 adds a `daily_summary` script — that section will land here when
-the script does.
+### Generate the daily summary (manual, no background process)
+
+The daily summary is a one-shot CLI that syncs the inferred inbox into
+the persistent task store and renders the open tasks as markdown grouped
+by priority + category.
+
+```bash
+# Print to stdout (default)
+py -3.11 scripts/daily_summary.py
+
+# Write to a file (path is gitignored and hygiene-protected)
+py -3.11 scripts/daily_summary.py --out reports/daily-summary-2026-05-14.md
+```
+
+There is intentionally **no background scheduler in the repo**. Wire it
+to Windows Task Scheduler or cron yourself if you want a daily reminder.
+Always `cd` into the repo first so `reports/` resolves to the right
+place:
+
+```bash
+# cron (macOS / Linux), 09:00 local daily:
+0 9 * * *  cd /path/to/Marketing_Agency && \
+           /usr/bin/env py -3.11 scripts/daily_summary.py \
+             --out reports/daily-summary-$(date +\%Y-\%m-\%d).md
+
+# Windows Task Scheduler "Program/script":
+#   py -3.11
+# "Arguments":
+#   scripts\daily_summary.py --out reports\daily-summary-%date%.md
+# "Start in":
+#   C:\Users\mathi\Desktop\Marketing_Agency
+```
+
+The script makes NO external API calls. Pass the path overrides
+(`--db-path`, `--clients-root`, `--prospects-root`, `--mcp-db-path`,
+`--eval-path`, `--today`) only for tests / debugging.
+
+### Manage open tasks (mark done / dismiss / snooze)
+
+Pass 2.1 introduced a persistent layer (`operator_tasks.db`) on top of
+the inferred inbox. The operator can now act on individual tasks without
+losing their decisions to the next inference sweep.
+
+- **Streamlit:** *Agency overview* tab. Each task card renders with
+  three buttons: **Mark done**, **Dismiss**, **Snooze 1 day**. Approval-
+  category tasks render guidance text only — approvals still flow
+  through the existing HITL surfaces (Streamlit HITL panel or MCP
+  `resume_agency_workflow`). No generic Approve button on inbox cards.
+- **Manager:** `manager_request("what do I need to approve today?")`
+  reads from the persistent store after syncing — done / dismissed /
+  snoozed tasks won't reappear.
+- **Daily summary:** same store, same semantics.
+
+Sync semantics in plain English:
+
+- An inferred task that's NEW → inserted as `open`.
+- An inferred task that already exists as `open` → content (title /
+  description / priority / location) refreshed; status preserved.
+- An inferred task already marked `done` or `dismissed` → NOT reopened.
+  `inferred_seen_at` is bumped for audit.
+- An inferred task that's `snoozed` and expired → resurfaces as `open`.
+- A row whose inferred fingerprint disappears (job polled to completion,
+  plan rejected, eval graded) → auto-closed as `done` with `resolved_at`
+  set. Operator can `reopen_task` from the Manager / a REPL if needed.
+
+The store does NOT replace the inferred inbox; the inbox is still the
+source of truth for "what should be open right now".
 
 ---
 
@@ -107,12 +172,18 @@ deleting per-client commercial data is not.
 |---|---|---|
 | `checkpoints.db`, `*.db-shm`, `*.db-wal` | LangGraph SqliteSaver — paused supervisor checkpoints | When a paused workflow is wedged and you want a clean slate |
 | `mcp_pending_runs.db`, `*.db-shm`, `*.db-wal` | Operator-facing MCP pending registry | When you've abandoned every paused MCP workflow and want to clear the table |
+| `operator_tasks.db`, `*.db-shm`, `*.db-wal` | Persistent operator task store (Pass 2.1) | When you want to drop every operator decision (done / dismissed / snoozed) and re-sync the inferred inbox from scratch |
+| `reports/daily-summary-*.md` | Daily summary exports (Pass 2.1) | Any time; regenerated on demand by re-running `scripts/daily_summary.py` |
 | `clients/<id>/client_data.db-shm`, `*.db-wal` | SQLite WAL sidecars only | Almost never needed; SQLite manages these itself |
 
 ```bash
 # Wipe ALL paused MCP workflows + checkpoints. Stop MCP first.
 rm -f checkpoints.db checkpoints.db-shm checkpoints.db-wal
 rm -f mcp_pending_runs.db mcp_pending_runs.db-shm mcp_pending_runs.db-wal
+
+# Wipe operator decisions (Pass 2.1). The inferred inbox will re-populate
+# the store on the next Streamlit / Manager / daily_summary call.
+rm -f operator_tasks.db operator_tasks.db-shm operator_tasks.db-wal
 ```
 
 ### NEVER delete without intent
@@ -258,11 +329,11 @@ MCP without the right resume context.
 
 ## 6. Known limitations
 
-- **No proactive notifications.** Pass 2 adds a daily summary script
-  you can run on cron / Windows Task Scheduler. Manager only answers
-  when asked.
-- **No persistent operator task store yet** — Pass 2.
-- **No cost ledger / dashboard yet** — Pass 2.
+- **No proactive notifications.** Pass 2.1 ships a manual daily summary
+  script (`scripts/daily_summary.py`) you can wire to cron / Windows
+  Task Scheduler. The agency itself never reaches out — Manager only
+  answers when asked.
+- **No cost ledger / dashboard yet** — Pass 2.2.
 - **Anthropic LLM call costs are not instrumented** even after Pass 2
   ships the cost ledger. Token accounting requires LangChain callbacks
   and is a separate workstream.

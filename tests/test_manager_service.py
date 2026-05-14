@@ -53,6 +53,14 @@ def mcp_db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def task_store_db(tmp_path: Path) -> Path:
+    """PR A: tmp operator_tasks.db so tests that exercise the sync-then-
+    read shim in get_agency_overview / get_client_overview never touch
+    the real operator_tasks.db at repo root."""
+    return tmp_path / "operator_tasks.db"
+
+
+@pytest.fixture
 def acme(clients_root: Path) -> ClientContext:
     return ClientContext.onboard("acme", "Acme Corp", clients_root=clients_root)
 
@@ -339,7 +347,7 @@ def test_locate_unknown_source_type_returns_helpful_hint(tmp_path):
 
 
 def test_route_manager_overview_returns_inbox_markdown(
-    acme, clients_root, mcp_db, tmp_path,
+    acme, clients_root, mcp_db, task_store_db, tmp_path,
 ):
     _seed_pending_plan(acme)
     out = manager_service.route_manager_request(
@@ -349,13 +357,14 @@ def test_route_manager_overview_returns_inbox_markdown(
         prospects_root=tmp_path / "prospects",
         mcp_db_path=mcp_db,
         eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
     )
     assert "Agency overview" in out
     assert "CRITICAL" in out
 
 
 def test_route_manager_client_overview_filters(
-    clients_root, mcp_db, tmp_path,
+    clients_root, mcp_db, task_store_db, tmp_path,
 ):
     a = ClientContext.onboard("acme", "Acme", clients_root=clients_root)
     b = ClientContext.onboard("zelda", "Zelda", clients_root=clients_root)
@@ -369,10 +378,115 @@ def test_route_manager_client_overview_filters(
         prospects_root=tmp_path / "prospects",
         mcp_db_path=mcp_db,
         eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
     )
     assert "acme overview" in out
     # zelda's plan must NOT appear in the acme overview.
     assert "zelda" not in out
+
+
+# --------------------------------------------------------------------------- #
+# PR A: get_agency_overview / get_client_overview now sync-then-read
+# --------------------------------------------------------------------------- #
+
+
+def test_get_agency_overview_syncs_store_before_listing(
+    acme, clients_root, mcp_db, task_store_db, tmp_path,
+):
+    """The first call should populate the task store with whatever the
+    inferred inbox surfaces. After the call, the store must contain a
+    row for the seeded pending plan (so subsequent reads see operator
+    decisions, not just raw inferred state)."""
+    from services import operator_task_store
+
+    pid = _seed_pending_plan(acme)
+
+    # Pre-sync: store empty.
+    assert operator_task_store.list_open_tasks(db_path=task_store_db) == []
+
+    out = manager_service.get_agency_overview(
+        clients_root=clients_root,
+        prospects_root=tmp_path / "prospects",
+        mcp_db_path=mcp_db,
+        eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
+    )
+
+    # Post-sync: store has at least the pending-plan row.
+    stored = operator_task_store.list_open_tasks(db_path=task_store_db)
+    fingerprints = {s.fingerprint for s in stored}
+    assert f"plan-pending:acme:{pid}" in fingerprints
+    # And the markdown reflects it.
+    assert pid in out
+
+
+def test_get_agency_overview_hides_done_tasks(
+    acme, clients_root, mcp_db, task_store_db, tmp_path,
+):
+    """Operator decisions persist: once a task is marked done in the
+    store, subsequent overview calls must NOT surface it - even though
+    the inferred inbox still claims it should be open."""
+    from services import operator_task_store
+
+    pid = _seed_pending_plan(acme)
+
+    # First call: populate the store.
+    manager_service.get_agency_overview(
+        clients_root=clients_root,
+        prospects_root=tmp_path / "prospects",
+        mcp_db_path=mcp_db,
+        eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
+    )
+
+    # Mark the row done in the store.
+    stored = operator_task_store.list_open_tasks(db_path=task_store_db)
+    target = next(s for s in stored if s.fingerprint == f"plan-pending:acme:{pid}")
+    assert operator_task_store.mark_task_done(target.id, db_path=task_store_db)
+
+    # Second call: pid must NOT appear, even though the inferred inbox
+    # still thinks the plan is pending_approval.
+    out = manager_service.get_agency_overview(
+        clients_root=clients_root,
+        prospects_root=tmp_path / "prospects",
+        mcp_db_path=mcp_db,
+        eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
+    )
+    assert pid not in out
+    # And the row in the store is still 'done' (didn't reopen).
+    after = operator_task_store.get_task(target.id, db_path=task_store_db)
+    assert after.status == "done"
+
+
+def test_get_client_overview_filters_to_client_id(
+    clients_root, mcp_db, task_store_db, tmp_path,
+):
+    """get_client_overview should only surface tasks for the named client
+    even though the sync sweeps across the FULL inferred set (which is
+    necessary so cross-client state in the store stays accurate).
+
+    Plan IDs are per-silo sequential (each client gets its own VP-001
+    counter), so we cannot key the filter assertion on plan_id. We
+    assert on the CLIENT NAME instead - 'zelda' must never appear in
+    acme's overview because every task title / description for zelda's
+    plan contains the word 'zelda'."""
+    a = ClientContext.onboard("acme", "Acme", clients_root=clients_root)
+    b = ClientContext.onboard("zelda", "Zelda", clients_root=clients_root)
+    _seed_pending_plan(a)
+    _seed_pending_plan(b)
+
+    out = manager_service.get_client_overview(
+        "acme",
+        clients_root=clients_root,
+        prospects_root=tmp_path / "prospects",
+        mcp_db_path=mcp_db,
+        eval_path=tmp_path / "evals" / "x.jsonl",
+        task_store_db_path=task_store_db,
+    )
+    assert "acme overview" in out
+    assert "acme" in out  # at least one acme task surfaced
+    assert "zelda" not in out  # zelda's plan must NOT cross over
 
 
 def test_route_manager_clarify_for_unknown_request(clients_root):

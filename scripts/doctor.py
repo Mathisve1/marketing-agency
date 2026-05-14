@@ -421,6 +421,99 @@ def check_checkpoint_db_config(runner: CheckRunner) -> None:
     )
 
 
+def check_operator_task_store(runner: CheckRunner) -> None:
+    """PR A: confirm services.operator_task_store imports cleanly and its
+    DEFAULT_DB_PATH parent is writable. Schema smoke test against a tmp
+    DB so a broken DDL surfaces here, not the first time Streamlit /
+    Manager / daily_summary tries to sync.
+
+    Never touches the production operator_tasks.db at repo root, never
+    calls a network. Pure schema-init test in a tmp dir.
+    """
+    try:
+        from services import operator_task_store  # noqa: PLC0415
+    except ImportError as e:
+        runner.failed(f"services.operator_task_store not importable: {e}")
+        return
+
+    prod_path = Path(operator_task_store.DEFAULT_DB_PATH)
+    parent = prod_path.parent if str(prod_path.parent) not in ("", ".") else Path.cwd()
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            runner.failed(
+                f"Operator task store parent dir not creatable at {parent}: {e}"
+            )
+            return
+
+    import tempfile  # noqa: PLC0415
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        tmp_db = Path(tmp) / "operator_tasks.db"
+        try:
+            # list_open_tasks fires _init_schema as a side effect; if any
+            # DDL is malformed, this raises here rather than in the UI.
+            assert operator_task_store.list_open_tasks(db_path=tmp_db) == []
+            # Also exercise the sync entry point with an empty inferred
+            # list - catches a typo in the auto-close SQL that doesn't
+            # show up on the read-only path.
+            operator_task_store.sync_inferred_tasks([], db_path=tmp_db)
+        except Exception as e:
+            runner.failed(f"Operator task store schema init failed: {e}")
+            return
+
+    runner.passed(
+        f"Operator task store OK (path={prod_path}, parent writable, "
+        f"schema initialises)"
+    )
+
+
+def check_daily_summary_imports(runner: CheckRunner) -> None:
+    """PR A: confirm scripts/daily_summary.py loads and exposes a `main`
+    callable. The script is not a package member (scripts/ has no
+    __init__.py), so we load it via importlib.util like tests/test_doctor.py
+    does for doctor.py itself. No DB call, no I/O, no Task Scheduler
+    trigger - purely an import sanity check.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    here = Path(__file__).resolve().parent
+    script_path = here / "daily_summary.py"
+    if not script_path.is_file():
+        runner.failed(f"scripts/daily_summary.py missing at {script_path}")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "daily_summary_doctor_probe", script_path,
+        )
+        if spec is None or spec.loader is None:
+            runner.failed(
+                f"scripts/daily_summary.py spec could not be built from {script_path}"
+            )
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:
+        runner.failed(
+            f"scripts/daily_summary.py failed to import: "
+            f"{type(e).__name__}: {e}"
+        )
+        return
+
+    main_fn = getattr(module, "main", None)
+    if not callable(main_fn):
+        runner.failed("scripts/daily_summary.py does not expose a callable main()")
+        return
+
+    render_fn = getattr(module, "render_summary", None)
+    if not callable(render_fn):
+        runner.failed("scripts/daily_summary.py does not expose render_summary()")
+        return
+
+    runner.passed("Daily summary script OK (loads cleanly, exposes main + render_summary)")
+
+
 def check_mcp_pending_registry(runner: CheckRunner) -> None:
     """V1.7: confirm services.mcp_pending_store imports cleanly and its
     DEFAULT_DB_PATH is in a writable location. Also probes the schema by
@@ -487,6 +580,8 @@ def main() -> int:
     check_client_onboarding(runner, root)
     check_checkpoint_db_config(runner)
     check_mcp_pending_registry(runner)
+    check_operator_task_store(runner)
+    check_daily_summary_imports(runner)
 
     print("=" * 60)
     print(

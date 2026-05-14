@@ -128,3 +128,31 @@ def test_required_top_level_dirs_include_clients_template(doctor_module):
     but a clearer 'Missing directory' message helps triage."""
     assert "clients/_template" in doctor_module.REQUIRED_TOP_LEVEL_DIRS
     assert "clients" in doctor_module.REQUIRED_TOP_LEVEL_DIRS
+
+
+# --------------------------------------------------------------------------- #
+# PR A: new check functions for the persistent task store + daily summary
+# --------------------------------------------------------------------------- #
+
+
+def test_check_operator_task_store_passes_on_clean_repo(doctor_module):
+    """Doctor's check_operator_task_store should produce a PASS line in
+    a clean repo. Pinned so a future refactor that breaks the schema-init
+    smoke test surfaces as a hard test failure."""
+    runner = doctor_module.CheckRunner()
+    doctor_module.check_operator_task_store(runner)
+    assert runner.failures == [], (
+        f"check_operator_task_store unexpectedly failed: {runner.failures}"
+    )
+
+
+def test_check_daily_summary_imports_passes_on_clean_repo(doctor_module):
+    """Doctor's check_daily_summary_imports loads scripts/daily_summary.py
+    via importlib.util and verifies main + render_summary are exposed.
+    A failure here usually means a top-level import in daily_summary.py
+    raised (and would also fail the daily summary at runtime)."""
+    runner = doctor_module.CheckRunner()
+    doctor_module.check_daily_summary_imports(runner)
+    assert runner.failures == [], (
+        f"check_daily_summary_imports unexpectedly failed: {runner.failures}"
+    )

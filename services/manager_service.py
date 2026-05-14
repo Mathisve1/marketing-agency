@@ -284,14 +284,32 @@ def get_agency_overview(
     prospects_root: Optional[Path] = None,
     mcp_db_path: Optional[Path] = None,
     eval_path: Optional[Path] = None,
+    task_store_db_path: Optional[Path] = None,
 ) -> str:
-    """Markdown overview across all clients + prospects. Read-only."""
-    tasks = operator_inbox.collect_operator_tasks(
+    """Markdown overview across all clients + prospects. Read-only.
+
+    Pass 2.1: sync the inferred inbox into the persistent task store, then
+    read open tasks from the store. The store layer respects operator
+    decisions (done / dismissed / snoozed) that the pure inference layer
+    cannot see; auto-closes stale rows whose inferred fingerprint
+    disappeared. See `services.operator_task_store` for the full state
+    machine.
+
+    `task_store_db_path` is test-injectable; defaults to the repo-root
+    operator_tasks.db owned by `operator_task_store.DEFAULT_DB_PATH`.
+    """
+    from services import operator_task_store
+
+    store_db = task_store_db_path or operator_task_store.DEFAULT_DB_PATH
+    operator_task_store.sync_from_inbox(
         clients_root=clients_root,
         prospects_root=prospects_root,
         mcp_db_path=mcp_db_path,
         eval_path=eval_path,
+        db_path=store_db,
     )
+    stored = operator_task_store.list_open_tasks(db_path=store_db)
+    tasks = [s.to_operator_task() for s in stored]
     return operator_inbox.summarize_operator_tasks(tasks)
 
 
@@ -299,14 +317,31 @@ def get_client_overview(
     client_id: str,
     *,
     clients_root: Optional[Path] = None,
+    prospects_root: Optional[Path] = None,
+    mcp_db_path: Optional[Path] = None,
     eval_path: Optional[Path] = None,
+    task_store_db_path: Optional[Path] = None,
 ) -> str:
-    """Markdown overview scoped to one client. Read-only."""
-    tasks = operator_inbox.collect_client_tasks(
-        client_id, clients_root=clients_root, eval_path=eval_path,
+    """Markdown overview scoped to one client. Read-only.
+
+    Pass 2.1: same sync-then-read pattern as get_agency_overview. The
+    sync runs across the FULL inferred set (so we don't lose visibility
+    of cross-client state) but the read filters to `client_id`.
+    """
+    from services import operator_task_store
+
+    store_db = task_store_db_path or operator_task_store.DEFAULT_DB_PATH
+    operator_task_store.sync_from_inbox(
+        clients_root=clients_root,
+        prospects_root=prospects_root,
+        mcp_db_path=mcp_db_path,
+        eval_path=eval_path,
+        db_path=store_db,
     )
-    if not tasks:
+    stored = operator_task_store.list_open_tasks(client_id=client_id, db_path=store_db)
+    if not stored:
         return f"## {client_id} overview\n\nNo open tasks for this client."
+    tasks = [s.to_operator_task() for s in stored]
     md = operator_inbox.summarize_operator_tasks(tasks)
     # Replace the generic header with a client-scoped one for clarity.
     return md.replace("## Agency overview", f"## {client_id} overview", 1)
@@ -619,6 +654,7 @@ def route_manager_request(
     prospects_root: Optional[Path] = None,
     mcp_db_path: Optional[Path] = None,
     eval_path: Optional[Path] = None,
+    task_store_db_path: Optional[Path] = None,
 ) -> str:
     """Top-level manager dispatch. Returns markdown.
 
@@ -648,6 +684,7 @@ def route_manager_request(
             prospects_root=prospects_root,
             mcp_db_path=mcp_db_path,
             eval_path=eval_path,
+            task_store_db_path=task_store_db_path,
         )
 
     if intent.kind == "client_overview":
@@ -659,7 +696,12 @@ def route_manager_request(
                 "`client_id=...` or include the client name in the prompt."
             )
         return get_client_overview(
-            target, clients_root=clients_root, eval_path=eval_path,
+            target,
+            clients_root=clients_root,
+            prospects_root=prospects_root,
+            mcp_db_path=mcp_db_path,
+            eval_path=eval_path,
+            task_store_db_path=task_store_db_path,
         )
 
     if intent.kind == "locate":

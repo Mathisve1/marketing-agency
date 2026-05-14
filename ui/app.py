@@ -22,7 +22,7 @@ import json
 import sys as _sys  # noqa: E402
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -540,13 +540,16 @@ def _display_result(result: dict, model_id_used: str) -> None:
 
 with tab_overview:
     from services import operator_inbox  # local import to avoid cycle at module load
+    from services import operator_task_store as _task_store
     from services.operator_inbox import VALID_PRIORITIES
 
     st.markdown("### Agency overview")
     st.caption(
-        "Read-only inbox inferred from `video_plans`, `video_jobs`, "
-        "`mcp_pending_runs`, `prospects/`, and `evals/output_reviews.jsonl`. "
-        "No agent runs from this tab. Use *Run agent* to dispatch."
+        "Persistent task store synced from the inferred inbox "
+        "(`video_plans`, `video_jobs`, `mcp_pending_runs`, `prospects/`, "
+        "`evals/output_reviews.jsonl`). Mark done / dismiss / snooze "
+        "decisions persist across reruns. No agent runs from this tab — "
+        "use *Run agent* to dispatch."
     )
 
     # Filter widgets
@@ -567,12 +570,18 @@ with tab_overview:
             index=0,
         )
     with fcols[2]:
-        if st.button("Refresh", help="Re-scan SQL + filesystem"):
+        if st.button("Refresh", help="Re-sync inferred inbox + re-scan store"):
             st.rerun()
 
-    all_tasks = operator_inbox.collect_operator_tasks()
+    # PR A: sync the inferred inbox into the persistent store, then read
+    # from the store. The store layer respects operator decisions (done /
+    # dismissed / snoozed) and auto-closes stale rows whose inferred
+    # fingerprint disappeared. See services/operator_task_store.py for
+    # the full state machine.
+    _task_store.sync_from_inbox()
+    all_tasks = _task_store.list_open_tasks()
 
-    def _matches(task: operator_inbox.OperatorTask) -> bool:
+    def _matches(task) -> bool:
         if priority_filter != "all" and task.priority != priority_filter:
             return False
         if client_filter == "(prospects + system)":
@@ -583,8 +592,10 @@ with tab_overview:
 
     filtered = [t for t in all_tasks if _matches(t)]
 
-    # Counts strip
-    by_pri = operator_inbox.group_tasks_by_priority(filtered)
+    # Counts strip — operate on the projected OperatorTask shape so the
+    # existing group_tasks_by_priority helper works unchanged.
+    _projected = [t.to_operator_task() for t in filtered]
+    by_pri = operator_inbox.group_tasks_by_priority(_projected)
     cstrip = st.columns(4)
     cstrip[0].metric("Critical", len(by_pri.get("critical") or []))
     cstrip[1].metric("High", len(by_pri.get("high") or []))
@@ -665,10 +676,74 @@ with tab_overview:
                 st.caption(_hint)
         st.divider()
 
+    # --------------------------------------------------------------- #
+    # PR A: per-task cards with safe action buttons.
+    #
+    # SAFETY: approval-category tasks render guidance text only. NO
+    # Approve button on any card. Plan approvals stay on the existing
+    # HITL surfaces — the V1.9 "Pending approvals — where to act" panel
+    # above already routes the operator to the right channel
+    # (Streamlit HITL or MCP resume).
+    # --------------------------------------------------------------- #
+
+    def _scope_chip(task) -> str:
+        if task.client_id:
+            return f"client `{task.client_id}`"
+        if task.prospect_id:
+            return f"prospect `{task.prospect_id}`"
+        return "system"
+
+    def _render_task_card(task) -> None:
+        with st.container(border=True):
+            st.markdown(
+                f"**[{task.priority.upper()}]** "
+                f"_{_scope_chip(task)}, agent `{task.agent}`, "
+                f"category `{task.category}`_"
+            )
+            st.markdown(f"#### {task.title}")
+            st.write(task.description)
+            if task.location_hint:
+                st.caption(f"Where: {task.location_hint}")
+            st.caption(f"Next: {task.recommended_next_action}")
+
+            if task.category == "approval":
+                # NO buttons on approval cards. The V1.9 panel above
+                # routes the operator to the right approval surface.
+                st.info(
+                    "Approval task. Use the **Pending approvals — where "
+                    "to act** panel above for the safe approval path "
+                    "(Streamlit HITL panel or MCP resume). This tab "
+                    "never approves plans directly."
+                )
+                with st.expander("Open details"):
+                    st.json(task.to_operator_task().to_dict())
+                return
+
+            # Non-approval categories: Mark done / Dismiss / Snooze 1d.
+            btn_cols = st.columns([1, 1, 1])
+            done_key = f"task-action-done-{task.id}"
+            dismiss_key = f"task-action-dismiss-{task.id}"
+            snooze_key = f"task-action-snooze-{task.id}"
+            if btn_cols[0].button("Mark done", key=done_key):
+                _task_store.mark_task_done(task.id)
+                st.rerun()
+            if btn_cols[1].button("Dismiss", key=dismiss_key):
+                _task_store.dismiss_task(task.id)
+                st.rerun()
+            if btn_cols[2].button("Snooze 1 day", key=snooze_key):
+                _task_store.snooze_task(
+                    task.id,
+                    datetime.now(timezone.utc) + timedelta(days=1),
+                )
+                st.rerun()
+            with st.expander("Open details"):
+                st.json(task.to_operator_task().to_dict())
+
     if not filtered:
         st.success("No open tasks for the current filter.")
     else:
-        st.markdown(operator_inbox.summarize_operator_tasks(filtered))
+        for _t in filtered:
+            _render_task_card(_t)
 
 
 with tab_run:
