@@ -20,6 +20,7 @@ records the operator-facing context to the durable MCP pending store.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -35,6 +36,15 @@ from core.supervisor import (
 from services import mcp_pending_store
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+
+def _run_async(coro):
+    """Run a coroutine from a sync context that may already be inside a
+    running event loop (e.g. an MCP tool handler).  asyncio.run() raises
+    RuntimeError in that situation; spawning a worker thread sidesteps it
+    because the new thread has no event loop of its own."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +199,7 @@ def dispatch_supervisor_run(
     config = {"configurable": {"thread_id": thread_id, "model": chosen_model}}
 
     try:
-        result = asyncio.run(run_supervisor_async(
+        result = _run_async(run_supervisor_async(
             graph,
             initial_state(
                 client_id=client_id, user_message=prompt, task_type=task_type

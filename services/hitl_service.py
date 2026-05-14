@@ -28,12 +28,21 @@ This module is a coordination shim, not the gatekeeper.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from core.client_context import ClientContext
 from core.context_schema import VideoPlan
 from core.supervisor import resume_supervisor_async
+
+
+def _run_async(coro):
+    """Run a coroutine from a sync context that may already be inside a
+    running event loop.  Worker thread has no event loop, so asyncio.run()
+    works there even when called from an MCP handler."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 # --------------------------------------------------------------------------- #
 # Result shapes
@@ -90,7 +99,7 @@ def approve_and_resume(
     dispatch, otherwise LangGraph cannot find the checkpoint.
     """
     try:
-        result = asyncio.run(resume_supervisor_async(graph, config=config))
+        result = _run_async(resume_supervisor_async(graph, config=config))
         return ApprovalResult(ok=True, result=result)
     except Exception as e:
         return ApprovalResult(
@@ -142,7 +151,7 @@ def _drain_rejected_checkpoint(graph: Any, config: dict) -> bool:
 
     # Drive any remaining graph evaluation. For producer_submit -> END
     # this returns immediately at the END barrier.
-    asyncio.run(resume_supervisor_async(graph, config=config))
+    _run_async(resume_supervisor_async(graph, config=config))
 
     final = graph.get_state(config=config)
     return not final.next

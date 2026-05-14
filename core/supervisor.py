@@ -92,7 +92,7 @@ def _build_default_checkpointer(db_path: Path) -> SqliteSaver:
     """Open a SqliteSaver-backed connection at db_path.
 
     - check_same_thread=False: LangGraph dispatches saver methods from a
-      thread pool under ainvoke; SQLite would otherwise refuse cross-thread
+      thread pool under invoke; SQLite would otherwise refuse cross-thread
       use of the connection.
     - PRAGMA journal_mode=WAL: readers do not block writers and vice versa,
       so the UI inspecting graph state cannot deadlock with a graph turn
@@ -183,7 +183,7 @@ async def run_supervisor_async(
     Pair with get_pending_node(graph, config=config) after invocation
     to detect whether interrupt_before paused the graph.
     """
-    return await graph.ainvoke(state, config=config or {})
+    return graph.invoke(state, config=config or {})
 
 
 async def resume_supervisor_async(
@@ -198,7 +198,7 @@ async def resume_supervisor_async(
     match the one used in the original run_supervisor_async call that
     caused the pause.
     """
-    return await graph.ainvoke(None, config=config)
+    return graph.invoke(None, config=config)
 
 
 def get_pending_node(graph, *, config: dict) -> Optional[str]:
