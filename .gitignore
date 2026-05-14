@@ -61,3 +61,23 @@ mcp_pending_runs.db-wal
 # evals/.gitkeep so a fresh clone has the target folder ready.
 evals/output_reviews.jsonl
 evals/*.csv
+
+# V1.9 Pass 1 placeholders for Pass 2 runtime artifacts. The services
+# don't exist yet but their on-disk paths are reserved here so the
+# moment they ship the storage is gitignored without a follow-up commit.
+
+# Operator persistent task store (Pass 2: services/operator_task_store.py).
+operator_tasks.db
+operator_tasks.db-shm
+operator_tasks.db-wal
+
+# Cost / activity ledger (Pass 2: services/cost_ledger.py).
+cost_ledger.db
+cost_ledger.db-shm
+cost_ledger.db-wal
+
+# Daily summary outputs (Pass 2: scripts/daily_summary.py --out ...).
+# May reference real client/prospect names; never commit. The reports/
+# directory is created on demand.
+reports/daily-summary-*.md
+reports/daily-summary-*.txt

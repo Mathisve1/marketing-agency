@@ -40,19 +40,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / "mcp_pending_runs.db"
 
 
+# V1.9: source_channel column added so the operator (and Manager) can see
+# which surface produced the pause - 'mcp' (paused via run_agency_agent /
+# manager_request) vs 'streamlit' (paused via the dispatch tab) vs
+# 'unknown' (legacy rows from before this column existed).
+#
+# IMPORTANT: rows written before V1.9 do not have this column. The
+# _init_schema migration step ALTER TABLE ADDs it with a default of
+# 'unknown' so reads of legacy rows don't crash.
 _DDL = """
 CREATE TABLE IF NOT EXISTS mcp_pending_runs (
-    thread_id    TEXT PRIMARY KEY,
-    client_id    TEXT,
-    model        TEXT NOT NULL,
-    prompt       TEXT NOT NULL,
-    task_type    TEXT,
-    plan_id      TEXT,
-    config_json  TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected')),
-    created_at   TEXT NOT NULL,
-    decided_at   TEXT,
-    decided_by   TEXT
+    thread_id      TEXT PRIMARY KEY,
+    client_id      TEXT,
+    model          TEXT NOT NULL,
+    prompt         TEXT NOT NULL,
+    task_type      TEXT,
+    plan_id        TEXT,
+    config_json    TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected')),
+    created_at     TEXT NOT NULL,
+    decided_at     TEXT,
+    decided_by     TEXT,
+    source_channel TEXT NOT NULL DEFAULT 'unknown'
 )
 """
 
@@ -60,6 +69,17 @@ _INDEX_STATUS = """
 CREATE INDEX IF NOT EXISTS idx_mcp_pending_runs_status_created
     ON mcp_pending_runs (status, created_at DESC)
 """
+
+# Idempotent ALTER for databases created before V1.9. SQLite raises an
+# OperationalError when the column already exists - we swallow that one
+# specifically so the migration is a no-op on fresh installs (where the
+# CREATE TABLE above already includes the column).
+_MIGRATIONS_V1_9 = (
+    "ALTER TABLE mcp_pending_runs ADD COLUMN source_channel TEXT NOT NULL DEFAULT 'unknown'",
+)
+
+
+VALID_SOURCE_CHANNELS = ("mcp", "streamlit", "unknown")
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +100,15 @@ def _init_schema(db_path: Path) -> None:
         _set_wal_mode(conn)
         conn.execute(_DDL)
         conn.execute(_INDEX_STATUS)
+        # V1.9 idempotent migrations - applied on every connect; harmless
+        # when the column already exists (we filter the duplicate-column
+        # OperationalError specifically).
+        for stmt in _MIGRATIONS_V1_9:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
         conn.commit()
 
 
@@ -110,6 +139,13 @@ def _db(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
+    # source_channel may be absent on rows written before V1.9 even after
+    # the ALTER added the column (sqlite3.Row supports keys() lookup).
+    # Default to 'unknown' so the operator-facing UI doesn't show empty.
+    try:
+        source_channel = row["source_channel"] or "unknown"
+    except (IndexError, KeyError):
+        source_channel = "unknown"
     return {
         "thread_id": row["thread_id"],
         "client_id": row["client_id"],
@@ -122,6 +158,7 @@ def _row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "decided_at": row["decided_at"],
         "decided_by": row["decided_by"],
+        "source_channel": source_channel,
     }
 
 
@@ -139,21 +176,35 @@ def record_pending(
     task_type: Optional[str],
     plan_id: Optional[str],
     config: dict,
+    source_channel: str = "mcp",
     db_path: Path = DEFAULT_DB_PATH,
 ) -> None:
     """Upsert a pending-run row. INSERT OR REPLACE so a re-pause on the
     same thread_id (rare but possible if MCP retries) doesn't deadlock
-    on the PRIMARY KEY."""
+    on the PRIMARY KEY.
+
+    V1.9: source_channel marks which surface produced the pause so the
+    Manager (and Streamlit overview) can give the operator a precise
+    "approve here" instruction. Defaults to 'mcp' because that's the
+    overwhelmingly common writer (run_agency_agent + manager_request);
+    if a future Streamlit dispatch records to this store it should pass
+    source_channel='streamlit'.
+    """
+    if source_channel not in VALID_SOURCE_CHANNELS:
+        raise ValueError(
+            f"source_channel must be one of {VALID_SOURCE_CHANNELS}, "
+            f"got {source_channel!r}"
+        )
     now = datetime.now(timezone.utc).isoformat()
     with _db(db_path) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO mcp_pending_runs "
             "(thread_id, client_id, model, prompt, task_type, plan_id, "
-            " config_json, status, created_at, decided_at, decided_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
+            " config_json, status, created_at, decided_at, decided_by, source_channel) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?)",
             (
                 thread_id, client_id, model, prompt, task_type, plan_id,
-                json.dumps(config), now,
+                json.dumps(config), now, source_channel,
             ),
         )
 
@@ -205,7 +256,11 @@ def restore_pending(payload: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
     """Re-insert a previously-popped payload as pending again. Used by
     mcp_server.py when a graph resume fails after we already popped the
     row, so the operator can retry the approve/reject decision instead
-    of the row vanishing."""
+    of the row vanishing.
+
+    V1.9: preserves the original source_channel so the Manager keeps
+    routing operators to the right approval surface even after a retry.
+    """
     record_pending(
         payload["thread_id"],
         client_id=payload.get("client_id"),
@@ -214,6 +269,7 @@ def restore_pending(payload: dict, db_path: Path = DEFAULT_DB_PATH) -> None:
         task_type=payload.get("task_type"),
         plan_id=payload.get("plan_id"),
         config=payload["config"],
+        source_channel=payload.get("source_channel") or "unknown",
         db_path=db_path,
     )
 

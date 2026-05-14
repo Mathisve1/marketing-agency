@@ -68,6 +68,15 @@ import check_repo_hygiene as hygiene  # noqa: E402
     # Pitch PDF anywhere
     ("pitch.pdf", "pitch-pdf-anywhere"),
     ("Downloads/pitch.pdf", "pitch-pdf-anywhere"),
+
+    # V1.9 Pass 1 placeholders for Pass 2 services
+    ("operator_tasks.db", "operator-tasks-db"),
+    ("operator_tasks.db-wal", "operator-tasks-db"),
+    ("operator_tasks.db-shm", "operator-tasks-db"),
+    ("cost_ledger.db", "cost-ledger-db"),
+    ("cost_ledger.db-wal", "cost-ledger-db"),
+    ("reports/daily-summary-2026-05-14.md", "daily-summary-md"),
+    ("reports/daily-summary-2026-05-14.txt", "daily-summary-md"),
 ])
 def test_bad_paths_are_flagged(path: str, expected_rule_id: str):
     hits = hygiene.find_hits([path])

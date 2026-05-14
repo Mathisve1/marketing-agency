@@ -126,6 +126,25 @@ _RULES: tuple[Rule, ...] = (
         "Eval CSV exports. May reference real client/prospect names.",
     ),
 
+    # V1.9 Pass 1 placeholders for Pass 2 services. The .db files don't
+    # exist yet but reserving the patterns now means the moment Pass 2
+    # ships nothing slips into git on the very first run.
+    Rule(
+        "operator-tasks-db",
+        re.compile(r"(^|/)operator_tasks\.db(-shm|-wal)?$", re.IGNORECASE),
+        "Operator persistent task store (Pass 2). May contain client/prospect names.",
+    ),
+    Rule(
+        "cost-ledger-db",
+        re.compile(r"(^|/)cost_ledger\.db(-shm|-wal)?$", re.IGNORECASE),
+        "Cost / activity ledger (Pass 2). May contain client/prospect-attributed events.",
+    ),
+    Rule(
+        "daily-summary-md",
+        re.compile(r"^reports/daily-summary-.+\.(md|txt)$", re.IGNORECASE),
+        "Daily summary export (Pass 2). May reference real client/prospect names.",
+    ),
+
     # Stray .env files (excluding the tracked .env.example)
     Rule(
         "env-file-anywhere",

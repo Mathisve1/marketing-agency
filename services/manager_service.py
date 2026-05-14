@@ -64,10 +64,27 @@ class ManagerIntent:
     notes: Optional[str] = None
 
 
+# V1.9: keyword tuples expanded to cover the natural-operator phrasings
+# the classifier previously dropped to 'clarify'. Empirical baseline: a
+# 17-phrase smoke test caught 8 misclassifications; this expansion makes
+# all 17 classify correctly without making any keyword match more greedy
+# than the old set. New entries are PHRASES (multi-word substrings) - not
+# bare words - to keep false-positive risk low.
+#
+# Discipline: if you add a single-word keyword, it MUST be unambiguous
+# in operator language (e.g. "prospecting" only ever means outreach).
+# When in doubt, prefer a 2-word phrase.
+
 _OVERVIEW_KEYWORDS = (
+    # original
     "overview", "approve today", "what do i need", "what's waiting",
     "whats waiting", "what is waiting", "what needs", "pending tasks",
     "open tasks", "summary", "daily", "inbox", "to do", "todo",
+    # V1.9 additions
+    "what should i do", "what's next", "whats next",
+    "show tasks", "show me tasks", "show open tasks", "show all tasks",
+    "list tasks", "list open tasks",
+    "what is open", "what's open", "anything waiting", "anything pending",
 )
 
 _LOCATE_KEYWORDS = (
@@ -89,26 +106,49 @@ _REJECT_KEYWORDS = (
 # with manager-flavoured phrasing.
 _DISPATCH_KEYWORDS: dict[str, tuple[str, ...]] = {
     "outreach": (
+        # original
         "outreach", "lead generation", "lead gen", "find leads",
         "find brands", "find prospects", "find new clients", "prospect ",
         "prospects ", "client acquisition",
+        # V1.9 additions: natural lead-gen phrasings
+        "prospecting", "start prospecting", "do prospecting",
+        "find new leads", "lead research", "leads in", "leads for",
+        "audit prospect", "audit prospects",
+        "hunt for brands", "discover brands",
     ),
     "research": (
+        # original
         "strategist", "research competitors", "market research",
         "competitor research", "competitive intelligence", "discover hooks",
         "find hooks", "scrape ad library", "audit competitors",
         "run strategist", "competitor scrape",
+        # V1.9 additions: natural research phrasings
+        "look into the market", "look into market", "look into competitors",
+        "research the market", "research market",
+        "find candidate hooks", "candidate hooks for", "discover candidate hooks",
+        "investigate competitors", "study the market",
     ),
     "produce": (
+        # original
         "video plan", "create video", "create a video", "produce a video",
         "make a video", "render video", "compile video", "kling video",
         "ad creative", "video for client", "creative production",
         "run producer",
+        # V1.9 additions: natural creative-production phrasings
+        "creative concept", "new creative concept", "make a creative concept",
+        "prepare a video", "prepare video", "design a video", "design video",
+        "video concept", "make a creative", "build a video",
     ),
     "analyze": (
+        # original
         "performance", "analyze performance", "roas", "ctr", "meta insights",
         "campaign analysis", "review performance", "feedback loop",
         "negative constraint", "run analyst",
+        # V1.9 additions: natural performance-review phrasings
+        "check meta results", "check meta", "meta results", "review meta",
+        "underperforming", "what's underperforming", "what is underperforming",
+        "check performance", "performance check", "report performance",
+        "campaign performance",
     ),
 }
 
@@ -346,23 +386,38 @@ def locate_artifact(
 
 
 def _streamlit_guidance_for_plan(client_id: str, plan_id: str) -> str:
-    """Markdown the manager returns when MCP can't safely approve."""
+    """Markdown the manager returns when MCP can't safely approve.
+
+    V1.9: explicit "I cannot approve this via MCP; approve in Streamlit
+    here" framing as the user requested. The fallback also lists the
+    MCP escape hatch for operators who DO know the thread_id.
+    """
     return (
-        f"**Cannot approve plan `{plan_id}` for client `{client_id}` via MCP.**\n\n"
+        f"**I cannot approve plan `{plan_id}` for client `{client_id}` via MCP.**\n"
+        f"Approval channel: **streamlit** (no matching MCP resume context).\n\n"
         f"The plan exists in `video_plans` with status `pending_approval`, "
         f"but no matching MCP pending-runs row was found. This usually means "
         f"the pause originated in Streamlit, or the MCP server was restarted "
         f"before the durable-pending-registry landed.\n\n"
-        f"To approve, use Streamlit:\n"
+        f"**Approve here (Streamlit):**\n"
         f"1. `streamlit run ui/app.py`\n"
         f"2. Sidebar -> select client `{client_id}`\n"
         f"3. The HITL approval panel renders at the top with the compiled plan.\n"
         f"4. Click **Approve - submit to Kling**.\n\n"
-        f"Alternatively, if you originated this via an MCP `run_agency_agent` "
-        f"call in the current session and remember the thread_id, run:\n\n"
+        f"If you originated this pause via MCP in the current session and "
+        f"remember the thread_id, the MCP escape hatch is:\n\n"
         f"    resume_agency_workflow(thread_id=\"<that-thread-id>\", approve=True)\n\n"
         f"The manager will not silently submit this plan to Kling."
     )
+
+
+def _channel_label(source_channel: Optional[str]) -> str:
+    """Operator-facing label for a source_channel value."""
+    if source_channel == "mcp":
+        return "MCP (resume_agency_workflow / manager_request)"
+    if source_channel == "streamlit":
+        return "Streamlit HITL panel"
+    return "unknown channel"
 
 
 def approve_plan_safely(
@@ -422,13 +477,21 @@ def approve_plan_safely(
         return _streamlit_guidance_for_plan(client_id, plan_id)
 
     if len(matches) > 1:
-        thread_ids = ", ".join(repr(r["thread_id"]) for r in matches)
+        # V1.9: list each candidate with its source_channel so the
+        # operator can pick the right resume path (the dominant case
+        # is two MCP-channel rows from a retry; mixing channels in one
+        # plan_id should be vanishingly rare).
+        details = "\n".join(
+            f"- thread `{r['thread_id']}`  (channel: {_channel_label(r.get('source_channel'))})"
+            for r in matches
+        )
         return (
-            f"**Refused.** Ambiguous: {len(matches)} MCP pending workflows "
-            f"target plan `{plan_id}` for client `{client_id}`. "
+            f"**Refused.** Ambiguous: {len(matches)} pending workflows "
+            f"target plan `{plan_id}` for client `{client_id}`:\n\n"
+            f"{details}\n\n"
             f"Resolve explicitly via "
-            f"`resume_agency_workflow(thread_id=...)` for one of: "
-            f"{thread_ids}."
+            f"`resume_agency_workflow(thread_id=...)` for the right one. "
+            f"The manager will not pick on your behalf."
         )
 
     if graph is None:
@@ -478,9 +541,14 @@ def approve_plan_safely(
         mcp_pending_store.restore_pending(popped)
         mcp_pending_store.mark_decided(thread_id, "approved")
 
+    # V1.9: surface the channel that handled the approval so the operator
+    # knows where the audit row lives.
+    channel = _channel_label(row.get("source_channel"))
     return (
         f"**Approved** plan `{plan_id}` for client `{client_id}` "
-        f"(thread `{thread_id}`). Producer submitted to Kling. "
+        f"(thread `{thread_id}`).\n"
+        f"Approval channel: **{channel}**.\n"
+        f"Producer submitted to Kling. "
         f"Poll status via the Streamlit Generated videos tab."
     )
 

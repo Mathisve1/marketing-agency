@@ -230,7 +230,10 @@ def test_approve_refuses_when_no_mcp_match_returns_streamlit_guidance(
 
     fake_approve.assert_not_called()
     fake_kling.submit_omni_video.assert_not_called()
-    assert "Cannot approve plan" in out
+    # V1.9: tighter "I cannot approve" phrasing + explicit channel label.
+    # The deeper assertions live in tests/test_cross_channel_approval.py;
+    # here we keep just enough to detect a regression of the safety path.
+    assert "cannot approve" in out.lower()
     assert "Streamlit" in out
     assert "submit_omni_video" not in out  # we never describe the call
     # Plan untouched.

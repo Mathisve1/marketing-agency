@@ -593,6 +593,78 @@ with tab_overview:
 
     st.divider()
 
+    # ----- V1.9: cross-channel approval guidance -------------------------- #
+    # Operators kept asking "where do I approve plan VP-X?". This compact
+    # panel correlates every pending Producer plan with its MCP pending
+    # registry row (if any) so the right approval surface is obvious.
+    # Read-only; no buttons (per scope guard G.4 - approve must stay on
+    # the existing safe HITL surfaces).
+    from services import mcp_pending_store as _mcp_store
+
+    _mcp_pending_rows = _mcp_store.list_pending()
+    _mcp_by_plan: dict[tuple[str | None, str], dict] = {
+        (r.get("client_id"), r.get("plan_id")): r
+        for r in _mcp_pending_rows
+        if r.get("plan_id")
+    }
+
+    # Walk every onboarded client + collect pending_approval plans.
+    _pending_plans: list[tuple[str, object]] = []  # (client_id, VideoPlan)
+    for _cid in list_clients():
+        try:
+            _ctx = ClientContext.load(_cid)
+        except Exception:
+            continue
+        for _plan in _ctx.list_video_plans(status=PlanStatus.PENDING_APPROVAL):
+            _pending_plans.append((_cid, _plan))
+
+    if _pending_plans:
+        st.markdown("#### Pending approvals — where to act")
+        st.caption(
+            "Manager will only auto-approve via MCP when a matching pending "
+            "row exists. Other plans must be approved on the originating "
+            "channel; the table below tells you which."
+        )
+        for _cid, _plan in _pending_plans:
+            _row = _mcp_by_plan.get((_cid, _plan.id))
+            if _row is None:
+                _channel = "streamlit"
+                _hint = (
+                    f"Approve in **Streamlit**: select client `{_cid}` in "
+                    f"the sidebar, the HITL panel renders the compiled plan."
+                )
+            else:
+                _ch = _row.get("source_channel") or "unknown"
+                _channel = _ch
+                _tid = _row.get("thread_id", "?")
+                if _ch == "mcp":
+                    _hint = (
+                        f"Approve via **MCP**: "
+                        f"`resume_agency_workflow(thread_id='{_tid}', approve=True)` "
+                        f"or `manager_request('approve plan {_plan.id} for "
+                        f"client {_cid}', confirm=True)`."
+                    )
+                elif _ch == "streamlit":
+                    _hint = (
+                        f"Approve via **Streamlit** HITL panel for client "
+                        f"`{_cid}`. (MCP row exists but channel is "
+                        f"streamlit; do not cross-approve via MCP.)"
+                    )
+                else:
+                    _hint = (
+                        f"Channel **unknown**. Resolve via "
+                        f"`resume_agency_workflow(thread_id='{_tid}', "
+                        f"approve=True)` if you originated this MCP turn, "
+                        f"else use Streamlit."
+                    )
+            with st.container(border=True):
+                _c = st.columns([2, 2, 5])
+                _c[0].markdown(f"**{_plan.id}**")
+                _c[1].markdown(f"client `{_cid}`")
+                _c[2].markdown(f"channel: **{_channel}**")
+                st.caption(_hint)
+        st.divider()
+
     if not filtered:
         st.success("No open tasks for the current filter.")
     else:

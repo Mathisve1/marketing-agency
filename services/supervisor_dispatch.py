@@ -221,6 +221,10 @@ def dispatch_supervisor_run(
 
         # V1.7 durable registry: persists the operator-facing context so
         # MCP restart no longer drops the thread_id needed to resume.
+        # V1.9: tag the row with source_channel='mcp' - this helper backs
+        # both run_agency_agent and manager_request, and both run inside
+        # the MCP server process. A future Streamlit-side dispatch helper
+        # would pass source_channel='streamlit' instead.
         mcp_pending_store.record_pending(
             thread_id,
             client_id=client_id,
@@ -229,6 +233,7 @@ def dispatch_supervisor_run(
             task_type=result.get("task_type"),
             plan_id=plan_id,
             config=config,
+            source_channel="mcp",
         )
 
         formatted = _format_paused_text(

@@ -72,6 +72,11 @@ is the fallback.
 
 ## Running the agency
 
+> **Day-2 / runbook:** see [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for
+> install, daily commands, runtime-state reset, backups, and
+> troubleshooting (failed Kling jobs, stuck pending plans, MCP restart
+> recovery, etc). The README covers concepts; OPERATIONS covers tasks.
+
 ### Manager Agent (preferred operator interface)
 
 Talk to the Manager. It's the single interface for everything.

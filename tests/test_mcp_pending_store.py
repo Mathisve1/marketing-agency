@@ -181,3 +181,106 @@ def test_list_pending_returns_only_pending_newest_first(db_path: Path):
     plan_ids = [p["plan_id"] for p in pending]
     assert "VP-002" not in plan_ids  # decided row is excluded
     assert set(plan_ids) == {"VP-001", "VP-003"}
+
+
+# --------------------------------------------------------------------------- #
+# V1.9: source_channel column + idempotent migration
+# --------------------------------------------------------------------------- #
+
+
+def test_record_pending_defaults_source_channel_to_mcp(db_path: Path):
+    """The Manager + supervisor_dispatch are the dominant writers; both go
+    through 'mcp'. Default should match the dominant case so callers that
+    don't pass the kwarg get the right semantic."""
+    _record(db_path, thread_id="t-default")
+    payload = mcp_pending_store.get_pending("t-default", db_path=db_path)
+    assert payload["source_channel"] == "mcp"
+
+
+def test_record_pending_accepts_streamlit_channel(db_path: Path):
+    mcp_pending_store.record_pending(
+        "t-streamlit",
+        client_id="acme", model="claude-sonnet-4-6",
+        prompt="Produce video", task_type="produce", plan_id="VP-100",
+        config={"configurable": {"thread_id": "t-streamlit"}},
+        source_channel="streamlit",
+        db_path=db_path,
+    )
+    payload = mcp_pending_store.get_pending("t-streamlit", db_path=db_path)
+    assert payload["source_channel"] == "streamlit"
+
+
+def test_record_pending_rejects_invalid_channel(db_path: Path):
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="source_channel"):
+        mcp_pending_store.record_pending(
+            "t-bad",
+            client_id=None, model="claude-sonnet-4-6",
+            prompt="x", task_type=None, plan_id=None,
+            config={},
+            source_channel="email",  # not in VALID_SOURCE_CHANNELS
+            db_path=db_path,
+        )
+
+
+def test_restore_pending_preserves_source_channel(db_path: Path):
+    """After a graph-resume failure the row is restored; the channel must
+    survive so the Manager keeps routing correctly on retry."""
+    mcp_pending_store.record_pending(
+        "t-restore",
+        client_id="acme", model="claude-sonnet-4-6",
+        prompt="Produce video", task_type="produce", plan_id="VP-200",
+        config={"configurable": {"thread_id": "t-restore"}},
+        source_channel="streamlit",
+        db_path=db_path,
+    )
+    payload = mcp_pending_store.pop_pending("t-restore", db_path=db_path)
+    mcp_pending_store.restore_pending(payload, db_path=db_path)
+    again = mcp_pending_store.get_pending("t-restore", db_path=db_path)
+    assert again["source_channel"] == "streamlit"
+
+
+def test_legacy_db_without_source_channel_migrates_idempotently(tmp_path):
+    """Belt-and-suspenders: a DB created with the pre-V1.9 schema must
+    upgrade in place via the ALTER, and reads of legacy rows default to
+    'unknown' rather than crashing."""
+    import json
+    import sqlite3
+    legacy_db = tmp_path / "legacy.db"
+    # Build the V1.7 schema by hand - no source_channel column.
+    with sqlite3.connect(str(legacy_db)) as conn:
+        conn.execute("""
+            CREATE TABLE mcp_pending_runs (
+                thread_id    TEXT PRIMARY KEY,
+                client_id    TEXT,
+                model        TEXT NOT NULL,
+                prompt       TEXT NOT NULL,
+                task_type    TEXT,
+                plan_id      TEXT,
+                config_json  TEXT NOT NULL,
+                status       TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected')),
+                created_at   TEXT NOT NULL,
+                decided_at   TEXT,
+                decided_by   TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO mcp_pending_runs "
+            "(thread_id, client_id, model, prompt, task_type, plan_id, "
+            " config_json, status, created_at) "
+            "VALUES ('t-legacy', 'acme', 'claude-sonnet-4-6', 'p', 'produce', "
+            " 'VP-legacy', ?, 'pending', '2026-01-01T00:00:00+00:00')",
+            (json.dumps({"configurable": {"thread_id": "t-legacy"}}),),
+        )
+        conn.commit()
+
+    # Now read via the V1.9 store - the migration should have applied
+    # transparently and the legacy row should report channel='unknown'.
+    payload = mcp_pending_store.get_pending("t-legacy", db_path=legacy_db)
+    assert payload is not None
+    assert payload["plan_id"] == "VP-legacy"
+    assert payload["source_channel"] == "unknown"
+
+    # Second open should not re-add the column (idempotent ALTER).
+    payload2 = mcp_pending_store.get_pending("t-legacy", db_path=legacy_db)
+    assert payload2["source_channel"] == "unknown"
