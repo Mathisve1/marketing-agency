@@ -143,7 +143,17 @@ Your workflow this turn:
         country, locale, weaknesses (the strategic gaps from step c),
         winning_hooks, referral_motions, and competitor_ads (the top 10
         scrape from step b).
-     g. Call `generate_pitch_pdf` with the prospect_id and a one-sentence
+     g. (Optional) Call `collect_brand_assets` with the prospect_id and
+        the brand's website URL (if known). This pulls logo + a couple
+        of product images from the homepage so the pitch deck renders
+        real brand imagery. Safe to skip - failures are non-fatal.
+     h. (Optional) Call `capture_ad_screenshots` with the prospect_id.
+        This downloads any inline `image_url` / `video_preview_image_url`
+        already on each ad (and attempts a Playwright screenshot of the
+        Meta Ads Library URL when those are missing). The pitch deck
+        embeds the resulting local images on the 'From live ad to video
+        route' page. Safe to skip - failures are non-fatal.
+     i. Call `generate_pitch_pdf` with the prospect_id and a one-sentence
         CTA.
   4. Report back: list of prospects audited with their pitch PDF paths.
 
@@ -253,6 +263,7 @@ def _make_save_audit_tool():
         referral_motions: list[dict],
         competitor_ads: list[dict],
         locale: Optional[str] = None,
+        brand_profile: Optional[dict] = None,
     ) -> str:
         """Persist a prospect's audit findings to prospects/<prospect_id>/audit.json.
 
@@ -269,6 +280,14 @@ def _make_save_audit_tool():
         referral_motions: list of {description, reference_path, pacing, camera_style, duration_seconds}
         competitor_ads: list of raw FB ad dicts from search_fb_ads_library
         locale: e.g. 'en-GB' for UK, 'en-US' for US, 'nl-BE' for Flemish-Belgium
+        brand_profile: optional V3 brand-immersive context for the pitch
+            deck. All fields optional; the renderer degrades gracefully
+            on absence. Suggested keys:
+              brand_name, website_url, instagram_url, facebook_url,
+              logo_url, logo_path, primary_color (hex), secondary_color,
+              visual_style_notes, product_category, brand_tone,
+              audience_assumption, website_screenshot_path,
+              social_screenshot_path
         """
         audit = ProspectAudit(
             prospect_id=prospect_id,
@@ -281,12 +300,129 @@ def _make_save_audit_tool():
             weaknesses=list(weaknesses),
             winning_hooks=list(winning_hooks),
             referral_motions=list(referral_motions),
+            brand_profile=brand_profile,
         )
         store = ProspectStore(prospect_id)
         path = store.save_audit(audit)
         return str(path.resolve())
 
     return save_prospect_audit
+
+
+def _make_collect_brand_assets_tool():
+    """V4: lightweight optional brand-asset collector.
+
+    The LLM can call this AFTER save_prospect_audit (so prospects/<id>/
+    exists) and BEFORE generate_pitch_pdf. It fetches the prospect's
+    website homepage, extracts logo + hero + a few product images, and
+    writes them under prospects/<id>/assets/. The collected paths are
+    merged into the audit's brand_profile so the pitch deck renders
+    real brand imagery.
+
+    Safe to skip - generate_pitch_pdf degrades gracefully if no assets
+    are present.
+    """
+    from agents.outreach.brand_assets import collect_brand_assets
+
+    @tool("collect_brand_assets")
+    def collect_brand_assets_tool(prospect_id: str, website_url: str) -> str:
+        """Download a prospect's homepage logo + hero + a couple of
+        product images to prospects/<prospect_id>/assets/ and merge the
+        local paths into the audit's brand_profile.
+
+        Conservative: 1 HTTP request, max 6 images downloaded total,
+        4MB cap per image, same-origin or recognised CDN only. Failures
+        are non-fatal - the pitch deck still renders without assets.
+
+        Returns a short status string summarising what was collected.
+        """
+        from agents.outreach.prospect_store import ProspectStore
+
+        store = ProspectStore(prospect_id)
+        audit = store.read_audit()
+        if audit is None:
+            return f"ERROR: no audit.json for prospect {prospect_id!r}; call save_prospect_audit first."
+
+        result = collect_brand_assets(prospect_id, website_url)
+
+        # Merge collected fields into the audit's brand_profile, never
+        # overwriting an operator-supplied value.
+        bp = dict(audit.brand_profile or {})
+        for key in ("website_url", "logo_path", "hero_image_path", "title", "meta_description"):
+            if not bp.get(key) and result.get(key):
+                bp[key] = result[key]
+        if result.get("product_images"):
+            existing = bp.get("product_images") or []
+            merged = list(existing)
+            for p in result["product_images"]:
+                if p not in merged:
+                    merged.append(p)
+            bp["product_images"] = merged
+        audit.brand_profile = bp
+        store.save_audit(audit)
+
+        n_products = len(result.get("product_images") or [])
+        bits = []
+        if result.get("logo_path"):
+            bits.append("logo")
+        if result.get("hero_image_path"):
+            bits.append("hero")
+        if n_products:
+            bits.append(f"{n_products} product image(s)")
+        if not bits:
+            err = ",".join(result.get("errors") or ["no_assets_found"])
+            return f"collected nothing usable for {prospect_id}: {err}"
+        return f"collected for {prospect_id}: {', '.join(bits)}"
+
+    return collect_brand_assets_tool
+
+
+def _make_capture_ad_screenshots_tool():
+    """V4 asset pipeline: capture local screenshots / thumbnails for
+    each sampled ad in an existing audit.
+
+    Two-path: (1) direct download of any `image_url` /
+    `video_preview_image_url` already on the ad, (2) optional
+    Playwright screenshot of the Meta Ads Library URL. Local paths are
+    merged onto the audit's competitor_ads as `ad_screenshot_path`,
+    which the pitch deck embeds on the 'From live ad to video route'
+    page.
+
+    Safe to skip - the deck still renders without ad imagery. Failures
+    are non-fatal."""
+    from agents.outreach.ad_screenshots import capture_ad_screenshots
+
+    @tool("capture_ad_screenshots")
+    def capture_ad_screenshots_tool(prospect_id: str) -> str:
+        """Capture local screenshots / thumbnails for each ad in a
+        prospect's saved audit. Writes the files under
+        prospects/<prospect_id>/assets/ and stores the relative path
+        on each ad as `ad_screenshot_path`.
+
+        Returns a short status string summarising what was captured.
+        """
+        from agents.outreach.prospect_store import ProspectStore
+
+        store = ProspectStore(prospect_id)
+        audit = store.read_audit()
+        if audit is None:
+            return f"ERROR: no audit.json for prospect {prospect_id!r}; call save_prospect_audit first."
+
+        result = capture_ad_screenshots(prospect_id, list(audit.competitor_ads))
+        audit.competitor_ads = result["ads"]
+        store.save_audit(audit)
+
+        bits = []
+        if result["captured"]:
+            bits.append(f"{result['captured']} ad screenshot(s)")
+        if not result["playwright_available"]:
+            bits.append("playwright not installed (only direct image_url downloads attempted)")
+        if not bits:
+            errs = "; ".join(result.get("errors") or ["no_capture"])
+            return f"captured nothing for {prospect_id}: {errs}"
+        return f"captured for {prospect_id}: {', '.join(bits)}"
+
+    return capture_ad_screenshots_tool
 
 
 def _make_generate_pitch_tool():
@@ -327,6 +463,8 @@ def _make_generate_pitch_tool():
             ),
             cta=cta,
             agency_name=os.getenv("AGENCY_NAME", "Our Agency"),
+            brand_profile=audit.brand_profile,
+            prospect_root=store.root,
         )
         return str(store.pitch_path.resolve())
 
@@ -347,6 +485,8 @@ def outreach_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         _make_capped_tavily_tool(),
         _make_capped_fb_ads_tool(),
         _make_save_audit_tool(),
+        _make_collect_brand_assets_tool(),
+        _make_capture_ad_screenshots_tool(),
         _make_generate_pitch_tool(),
     ]
 

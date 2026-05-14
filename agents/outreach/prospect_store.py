@@ -74,6 +74,31 @@ class ProspectAudit:
     italic sub-bullet, confidence label) and strings as plain bullets.
     Promote-to-client reads neither — only winning_hooks/referral_motions
     are seeded into the new client silo.
+
+    V3 adds an optional `brand_profile` dict carrying brand-immersive
+    context the pitch deck uses for the cover + brand context page.
+    Suggested shape (every field optional, missing fields degrade
+    gracefully):
+
+        {
+          "brand_name":                str,
+          "website_url":               str,
+          "instagram_url":             str,
+          "facebook_url":              str,
+          "logo_url":                  str,       # remote URL (not auto-fetched)
+          "logo_path":                 str,       # local file relative to prospect dir
+          "primary_color":             str,       # hex, e.g. '#1A1A1A'
+          "secondary_color":           str,
+          "visual_style_notes":        str,
+          "product_category":          str,
+          "brand_tone":                str,
+          "audience_assumption":       str,
+          "website_screenshot_path":   str,       # local file
+          "social_screenshot_path":    str,       # local file
+        }
+
+    The pitch_builder reads what is present and falls back to a tasteful
+    brand monogram when nothing is available.
     """
     prospect_id: str
     prospect_name: str
@@ -85,9 +110,10 @@ class ProspectAudit:
     weaknesses: list = field(default_factory=list)             # list[str | dict] - see docstring
     winning_hooks: list[dict] = field(default_factory=list)    # WinningHook-shaped
     referral_motions: list[dict] = field(default_factory=list) # ReferralMotion-shaped
+    brand_profile: Optional[dict] = None                       # V3 brand-immersive context
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "prospect_id": self.prospect_id,
             "prospect_name": self.prospect_name,
             "niche": self.niche,
@@ -99,6 +125,11 @@ class ProspectAudit:
             "winning_hooks": self.winning_hooks,
             "referral_motions": self.referral_motions,
         }
+        # Only include brand_profile in the JSON when present, so audits
+        # written before V3 stay byte-identical on a no-op rewrite.
+        if self.brand_profile:
+            out["brand_profile"] = self.brand_profile
+        return out
 
     @classmethod
     def from_dict(cls, raw: dict) -> "ProspectAudit":
@@ -113,6 +144,7 @@ class ProspectAudit:
             weaknesses=raw.get("weaknesses", []),
             winning_hooks=raw.get("winning_hooks", []),
             referral_motions=raw.get("referral_motions", []),
+            brand_profile=raw.get("brand_profile"),
         )
 
 
