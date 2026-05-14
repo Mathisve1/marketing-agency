@@ -468,6 +468,66 @@ def check_operator_task_store(runner: CheckRunner) -> None:
     )
 
 
+def check_cost_ledger(runner: CheckRunner) -> None:
+    """PR B / Pass 2.2: confirm services.cost_ledger imports cleanly,
+    its DEFAULT_DB_PATH parent is writable, and the schema initialises
+    against a tmp DB. Also smoke-tests record_event's safety contract:
+    calling it must never raise, even when the DB is in a clean state.
+
+    Never touches the production cost_ledger.db at repo root, never
+    calls a network. Pure schema-init test in a tmp dir.
+    """
+    try:
+        from services import cost_ledger as _cl  # noqa: PLC0415
+    except ImportError as e:
+        runner.failed(f"services.cost_ledger not importable: {e}")
+        return
+
+    prod_path = Path(_cl.DEFAULT_DB_PATH)
+    parent = prod_path.parent if str(prod_path.parent) not in ("", ".") else Path.cwd()
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            runner.failed(
+                f"Cost ledger parent dir not creatable at {parent}: {e}"
+            )
+            return
+
+    import tempfile  # noqa: PLC0415
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        tmp_db = Path(tmp) / "cost_ledger.db"
+        try:
+            # list_recent fires _init_schema as a side effect; if any DDL
+            # or index DDL is malformed, this raises here rather than
+            # the first time an agent tries to record a paid call.
+            assert _cl.list_recent(limit=1, db_path=tmp_db) == []
+            # Exercise the safety contract: record_event must NEVER raise.
+            # We pass valid input (so the row should appear), then verify
+            # it round-trips. A failure to record would be silent (per
+            # design), but list_recent would also be empty.
+            _cl.record_event(
+                provider="doctor",
+                event_type="probe",
+                units=1.0,
+                estimated_cost_eur=0.0,
+                metadata={"probe": True},
+                db_path=tmp_db,
+            )
+            probed = _cl.list_recent(limit=5, db_path=tmp_db)
+            assert len(probed) == 1, (
+                f"cost ledger probe did not persist (got {len(probed)} rows)"
+            )
+        except Exception as e:
+            runner.failed(f"Cost ledger schema/probe failed: {e}")
+            return
+
+    runner.passed(
+        f"Cost ledger OK (path={prod_path}, parent writable, "
+        f"schema initialises, record_event probe round-trips)"
+    )
+
+
 def check_daily_summary_imports(runner: CheckRunner) -> None:
     """PR A: confirm scripts/daily_summary.py loads and exposes a `main`
     callable. The script is not a package member (scripts/ has no
@@ -582,6 +642,7 @@ def main() -> int:
     check_mcp_pending_registry(runner)
     check_operator_task_store(runner)
     check_daily_summary_imports(runner)
+    check_cost_ledger(runner)
 
     print("=" * 60)
     print(

@@ -745,6 +745,93 @@ with tab_overview:
         for _t in filtered:
             _render_task_card(_t)
 
+    # ----------------------------------------------------------------- #
+    # PR B / Pass 2.2 - Cost & Activity section.
+    #
+    # Read-only summary of provider events recorded by services/cost_ledger.
+    # Records are written from agents/producer (Kling submit), strategist
+    # tools (Tavily, Apify), and analyst (Meta). NO new tab; this section
+    # lives at the bottom of the existing Agency Overview tab.
+    # ----------------------------------------------------------------- #
+
+    st.divider()
+    st.markdown("### Cost & activity")
+    st.caption(
+        "Rough estimates. Anthropic / LLM token costs are NOT tracked "
+        "in this pass. Override the rough EUR constants with "
+        "`COST_KLING_VIDEO_SUBMIT_EUR`, `COST_TAVILY_SEARCH_EUR`, "
+        "`COST_APIFY_SCRAPE_EUR_PER_AD`, `COST_META_INSIGHTS_EUR` in `.env`. "
+        "See docs/OPERATIONS.md for what's tracked vs. deferred."
+    )
+
+    from services import cost_ledger as _cost_ledger
+
+    _since = datetime.now(timezone.utc) - timedelta(days=7)
+    try:
+        _by_provider = _cost_ledger.summarise_by_provider(since=_since)
+        _by_client = _cost_ledger.summarise_by_client(since=_since)
+        _recent = _cost_ledger.list_recent(limit=10)
+    except Exception as _e:
+        st.warning(f"Cost ledger query failed: {type(_e).__name__}: {_e}")
+        _by_provider, _by_client, _recent = {}, {}, []
+
+    ccols = st.columns(2)
+    with ccols[0]:
+        st.markdown("**Last 7 days by provider**")
+        if _by_provider:
+            st.table([
+                {
+                    "provider": p,
+                    "events": d["events"],
+                    "units": round(d["units"], 2),
+                    "EUR (est.)": round(d["cost_eur"], 2),
+                }
+                for p, d in sorted(
+                    _by_provider.items(),
+                    key=lambda kv: kv[1]["cost_eur"],
+                    reverse=True,
+                )
+            ])
+        else:
+            st.caption("No cost events in the last 7 days.")
+    with ccols[1]:
+        st.markdown("**Last 7 days by client**")
+        if _by_client:
+            st.table([
+                {
+                    "client": c,
+                    "events": d["events"],
+                    "units": round(d["units"], 2),
+                    "EUR (est.)": round(d["cost_eur"], 2),
+                }
+                for c, d in sorted(
+                    _by_client.items(),
+                    key=lambda kv: kv[1]["cost_eur"],
+                    reverse=True,
+                )
+            ])
+        else:
+            st.caption("No cost events attributable to a specific client.")
+
+    st.markdown("**Last 10 events**")
+    if _recent:
+        st.table([
+            {
+                "when": (r.get("created_at") or "")[:19].replace("T", " "),
+                "provider": r.get("provider"),
+                "event": r.get("event_type"),
+                "client": r.get("client_id") or "—",
+                "units": r.get("units"),
+                "EUR (est.)": (
+                    round(r["estimated_cost_eur"], 4)
+                    if r.get("estimated_cost_eur") is not None else None
+                ),
+            }
+            for r in _recent
+        ])
+    else:
+        st.caption("No events recorded yet. Run a paid agent turn to populate.")
+
 
 with tab_run:
     # Show post-HITL outcome from a previous rerun, if any.

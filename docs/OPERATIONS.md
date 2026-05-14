@@ -13,7 +13,8 @@ This document does NOT cover:
 
 Pass 2.1 added: persistent operator task store, daily summary script,
 and Streamlit task-action buttons (Mark done / Dismiss / Snooze).
-Pass 2.2 will add: cost ledger + provider instrumentation + cost dashboard.
+Pass 2.2 added: local cost / activity ledger + provider instrumentation
+(Kling, Tavily, Apify, Meta) + Streamlit "Cost & activity" section.
 
 ---
 
@@ -174,6 +175,7 @@ deleting per-client commercial data is not.
 | `mcp_pending_runs.db`, `*.db-shm`, `*.db-wal` | Operator-facing MCP pending registry | When you've abandoned every paused MCP workflow and want to clear the table |
 | `operator_tasks.db`, `*.db-shm`, `*.db-wal` | Persistent operator task store (Pass 2.1) | When you want to drop every operator decision (done / dismissed / snoozed) and re-sync the inferred inbox from scratch |
 | `reports/daily-summary-*.md` | Daily summary exports (Pass 2.1) | Any time; regenerated on demand by re-running `scripts/daily_summary.py` |
+| `cost_ledger.db`, `*.db-shm`, `*.db-wal` | Cost / activity ledger (Pass 2.2) | When you want to drop the rolling cost history; agents will simply start a fresh ledger on the next paid call |
 | `clients/<id>/client_data.db-shm`, `*.db-wal` | SQLite WAL sidecars only | Almost never needed; SQLite manages these itself |
 
 ```bash
@@ -184,6 +186,10 @@ rm -f mcp_pending_runs.db mcp_pending_runs.db-shm mcp_pending_runs.db-wal
 # Wipe operator decisions (Pass 2.1). The inferred inbox will re-populate
 # the store on the next Streamlit / Manager / daily_summary call.
 rm -f operator_tasks.db operator_tasks.db-shm operator_tasks.db-wal
+
+# Wipe cost / activity history (Pass 2.2). Future paid calls will
+# repopulate; nothing else depends on past rows.
+rm -f cost_ledger.db cost_ledger.db-shm cost_ledger.db-wal
 ```
 
 ### NEVER delete without intent
@@ -333,10 +339,94 @@ MCP without the right resume context.
   script (`scripts/daily_summary.py`) you can wire to cron / Windows
   Task Scheduler. The agency itself never reaches out — Manager only
   answers when asked.
-- **No cost ledger / dashboard yet** — Pass 2.2.
+- **Cost ledger is rough, not billing-accurate** (Pass 2.2). The
+  per-event EUR estimates are env-overridable constants — see the
+  "Cost & activity ledger" section below. Anthropic / LLM token costs
+  are NOT tracked in this pass.
 - **Anthropic LLM call costs are not instrumented** even after Pass 2
   ships the cost ledger. Token accounting requires LangChain callbacks
   and is a separate workstream.
 - **Single-operator only.** No auth / RBAC / multi-tenant boundary.
   Anyone with shell access to the host can dispatch any client's
   agents and read every `client_data.db`.
+
+---
+
+## 7. Cost & activity ledger
+
+`services/cost_ledger.py` writes one row to `cost_ledger.db` (WAL,
+gitignored, hygiene-protected) per **successful** paid provider call.
+The Streamlit Agency Overview tab shows totals for the last 7 days
+under a "Cost & activity" section below the task list.
+
+### What is tracked
+
+| Provider | Event type | Recorded after | Rough EUR estimate (default) |
+|---|---|---|---|
+| `kling`  | `video_submit`        | `KlingClient.submit_omni_video` returns a `task_id`, before any local bookkeeping | `0.50 * (duration/10)` |
+| `tavily` | `search`              | `TavilyClient.search` returns + results materialise          | `0.01 per call` |
+| `apify`  | `ads_library_scrape`  | Apify actor call returns + dataset materialises              | `0.002 per ad returned` |
+| `meta`   | `insights_fetch`      | Graph API pagination loop exits cleanly                      | `0.00 per call (rate-limit unit, not currency)` |
+
+Failure paths NEVER record. Atomic-claim refusals, `submit_omni_video`
+raises, Tavily / Apify / Meta API errors, missing env vars — all
+short-circuit before the `record_event` call.
+
+### What is NOT tracked
+
+- **Anthropic / LLM token costs.** Token accounting requires LangChain
+  callbacks across every agent and is deferred to a later workstream.
+  The Streamlit caption + this paragraph are the canonical disclosure.
+- **Kling render compute cost beyond submission.** We log one event per
+  *submission*, not per minute of GPU time. If Kling later issues a
+  refund on a failed render, the ledger over-claims.
+- **Apify dataset transfer / storage.** Per-ad estimate only.
+
+### Override the rough EUR estimates
+
+The four constants live at the top of `services/cost_ledger.py` and read
+from `.env` at import time. Edit `.env` to match your real per-call
+costs (or the contracted rate card):
+
+```bash
+COST_KLING_VIDEO_SUBMIT_EUR=0.50
+COST_TAVILY_SEARCH_EUR=0.01
+COST_APIFY_SCRAPE_EUR_PER_AD=0.002
+COST_META_INSIGHTS_EUR=0.00
+```
+
+Negative or unparseable values silently fall back to the conservative
+defaults — a typo in `.env` does not cause the ledger to misbehave.
+
+### Read the ledger
+
+- **Streamlit:** Agency Overview tab → scroll past tasks. Three blocks:
+  by-provider, by-client, last 10 events.
+- **Python REPL** (for the spend-by-day chart we haven't built yet):
+  ```python
+  from datetime import datetime, timedelta, timezone
+  from services import cost_ledger
+  since = datetime.now(timezone.utc) - timedelta(days=30)
+  print(cost_ledger.summarise_by_provider(since=since))
+  print(cost_ledger.summarise_by_day(since=since))
+  ```
+
+### Where the DB lives + how to reset / back up
+
+- Location: `cost_ledger.db` at repo root. WAL mode → expect
+  `cost_ledger.db-shm` and `cost_ledger.db-wal` sidecars.
+- Gitignored: yes (`.gitignore` lines 74-77, hygiene rule
+  `cost-ledger-db`).
+- Reset: see the reset table above; safe to delete at any time.
+- Backup: optional. Add `cost_ledger.db` to the weekly tarball in
+  section 4 if you want spend history to survive a laptop wipe;
+  otherwise let it regenerate.
+
+### Safety contract
+
+`cost_ledger.record_event` is wrapped in a top-level `try/except` and
+**never propagates an exception**. A broken ledger (disk full, schema
+error, unserialisable metadata) cannot break the success path of a paid
+Kling submit or any other provider call. A one-line warning to stderr
+is the only signal; check stderr if Streamlit's table is suspiciously
+empty after a paid turn.

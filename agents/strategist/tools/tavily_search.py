@@ -13,6 +13,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
+from services import cost_ledger
 from services.api_errors import format_api_error
 
 
@@ -55,7 +56,7 @@ def make_tavily_competitor_search_tool():
                 search_depth="advanced",
                 max_results=limit * 2,  # over-fetch then trim, accounts for low-quality hits
             )
-            return [
+            out = [
                 {
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
@@ -64,6 +65,18 @@ def make_tavily_competitor_search_tool():
                 }
                 for r in (response.get("results") or [])[:limit]
             ]
+            # Pass 2.2 cost ledger: success-only. The list comprehension
+            # above materialised the response without raising, so we
+            # commit a single 'search' event before returning. record_event
+            # is internally safe - never propagates an exception.
+            cost_ledger.record_event(
+                provider="tavily",
+                event_type="search",
+                units=float(len(out)),
+                estimated_cost_eur=cost_ledger.TAVILY_SEARCH_EUR,
+                metadata={"brand": brand, "country": country, "limit": limit},
+            )
+            return out
         except Exception as e:
             # V1.7: classified error format - operator can grep on the
             # bracketed token (RATE_LIMIT, MISSING_KEY, TIMEOUT, ...)

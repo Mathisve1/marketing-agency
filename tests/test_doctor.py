@@ -156,3 +156,16 @@ def test_check_daily_summary_imports_passes_on_clean_repo(doctor_module):
     assert runner.failures == [], (
         f"check_daily_summary_imports unexpectedly failed: {runner.failures}"
     )
+
+
+def test_check_cost_ledger_passes_on_clean_repo(doctor_module):
+    """Doctor's check_cost_ledger imports services.cost_ledger, validates
+    DEFAULT_DB_PATH parent, runs the schema smoke test against a tmp DB,
+    and verifies record_event's safety contract (probe round-trip). A
+    failure here means either the import broke or the schema / probe
+    didn't behave."""
+    runner = doctor_module.CheckRunner()
+    doctor_module.check_cost_ledger(runner)
+    assert runner.failures == [], (
+        f"check_cost_ledger unexpectedly failed: {runner.failures}"
+    )

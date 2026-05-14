@@ -23,6 +23,8 @@ from typing import Optional
 
 import requests
 
+from services import cost_ledger
+
 META_GRAPH_VERSION = os.getenv("META_GRAPH_VERSION", "v19.0")
 META_API_BASE = os.getenv(
     "META_API_BASE_URL",
@@ -169,4 +171,18 @@ def fetch_meta_insights_data(time_preset: str = "last_14d") -> list[dict]:
         params = None
 
     rows.sort(key=lambda r: r.get("spend") or 0, reverse=True)
+
+    # Pass 2.2 cost ledger: success-only. We reach this line iff the
+    # entire pagination loop completed without raising - a Graph API
+    # error path at `if not r.ok: raise RuntimeError(...)` short-circuits
+    # above and never records a row. ad_account_id is sensitive and
+    # intentionally NOT in metadata. record_event is internally safe.
+    cost_ledger.record_event(
+        provider="meta",
+        event_type="insights_fetch",
+        units=float(len(rows)),
+        estimated_cost_eur=cost_ledger.META_INSIGHTS_EUR,
+        metadata={"time_preset": normalised, "rows_returned": len(rows)},
+    )
+
     return rows[:MAX_ADS_RETURNED]

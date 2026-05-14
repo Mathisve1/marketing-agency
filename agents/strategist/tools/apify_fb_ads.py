@@ -15,6 +15,8 @@ from apify_client import ApifyClient
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from services import cost_ledger
+
 # Default to the most-used community FB Ads Library actor. Override via
 # APIFY_FB_ADS_ACTOR_ID if you've licensed a different one.
 DEFAULT_ACTOR_ID = os.getenv(
@@ -161,6 +163,24 @@ def make_fb_ads_search_tool(actor_id: str = DEFAULT_ACTOR_ID):
             raise RuntimeError(f"Apify actor {actor_id!r} returned no dataset.")
 
         dataset = client.dataset(run["defaultDatasetId"])
-        return [_normalise(item).model_dump(mode="json") for item in dataset.iterate_items()]
+        out = [_normalise(item).model_dump(mode="json") for item in dataset.iterate_items()]
+        # Pass 2.2 cost ledger: success-only. The list comprehension above
+        # materialised every ad without raising, and `run` had a dataset
+        # ID. We can commit a single scrape event before returning.
+        # record_event is internally safe.
+        cost_ledger.record_event(
+            provider="apify",
+            event_type="ads_library_scrape",
+            units=float(len(out)),
+            estimated_cost_eur=cost_ledger.APIFY_SCRAPE_EUR_PER_AD * len(out),
+            metadata={
+                "actor_id": actor_id,
+                "country": country,
+                "max_ads_per_page": max_ads_per_page,
+                "active_only": active_only,
+                "competitor_pages_n": len(competitor_pages),
+            },
+        )
+        return out
 
     return search_fb_ads_library

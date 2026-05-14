@@ -44,6 +44,7 @@ from core.client_context import ClientContext
 from core.context_schema import JobStatus, VideoJob, VideoPlan
 from core.models import SUPPORTED_MODEL_IDS, validate_model_id
 from core.state import AgentState
+from services import cost_ledger
 
 # Kling task statuses still considered "in flight" (mirrors kling/client.py).
 _NON_TERMINAL_STATUSES = {"pending", "processing", "queued", "running", "created", "submitted"}
@@ -566,6 +567,29 @@ def producer_submit_node(state: AgentState, config: RunnableConfig) -> dict[str,
         }
 
     # ---- Success: persist job + transition plan ----
+    # Pass 2.2 cost ledger: one event per successful Kling submission.
+    # Recorded AFTER the paid call returned but BEFORE the local
+    # bookkeeping so that, even if create_video_job fails (a local DB
+    # bug, vanishingly rare), the spend is still recorded for audit.
+    # cost_ledger.record_event swallows all errors internally - a broken
+    # ledger cannot break this success path. See services/cost_ledger.py.
+    cost_ledger.record_event(
+        provider="kling",
+        event_type="video_submit",
+        client_id=state.get("client_id"),
+        task_type=state.get("task_type"),
+        units=1.0,
+        estimated_cost_eur=cost_ledger.KLING_VIDEO_SUBMIT_EUR
+            * (plan.duration / 10.0 if plan.duration else 1.0),
+        metadata={
+            "kling_task_id": task_id,
+            "plan_id": plan_id,
+            "duration_s": plan.duration,
+            "mode": plan.mode,
+            "aspect_ratio": plan.aspect_ratio,
+        },
+    )
+
     ctx.create_video_job(VideoJob(
         kling_task_id=task_id,
         plan_id=plan_id,
