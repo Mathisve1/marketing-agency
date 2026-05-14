@@ -72,6 +72,61 @@ is the fallback.
 
 ## Running the agency
 
+### Manager Agent (preferred operator interface)
+
+Talk to the Manager. It's the single interface for everything.
+
+The Manager is a thin coordination layer (no LLM, deterministic
+classifier) that sits in front of the existing Strategist / Producer /
+Analyst / Outreach agents. You ask it questions in natural language; it
+classifies the request and either:
+
+- **answers directly** for read-only requests (overview, "what's
+  waiting", locate-artifact),
+- **dispatches** to the right sub-agent through the same supervisor
+  path the legacy `run_agency_agent` tool uses (so HITL is preserved
+  exactly — Producer always pauses before Kling),
+- **safely approves** a paused plan via the existing HITL/resume path,
+  but only when (a) the operator passes `confirm=True` AND (b) a
+  matching MCP pending-runs row exists. Otherwise refuses with explicit
+  Streamlit guidance.
+- **rejects** a plan through the existing safe service.
+- **asks for clarification** when the request is ambiguous.
+
+Example prompts you can send to `manager_request`:
+
+| Prompt | What the Manager does |
+|---|---|
+| `"What do I need to approve today?"` | Returns the agency-wide inbox markdown. |
+| `"What is waiting for me?"` | Same as above. |
+| `"Give me overview for client acme."` | Returns just acme's open tasks. |
+| `"Start outreach research for fitness brands in Belgium."` | Dispatches the Outreach worker via the supervisor. |
+| `"Run strategist for client acme."` | Dispatches the Strategist worker. |
+| `"Analyze performance for client acme."` | Dispatches the Analyst worker. |
+| `"Create a video plan for client acme using hook WH-001."` | Dispatches the Producer planner; **pauses** at producer_submit before any Kling spend. |
+| `"Approve plan VP-004 for client acme."` (with `confirm=True`) | Resumes the paused Producer via `hitl_service.approve_and_resume` — only if a matching MCP pending row exists. |
+| `"Reject plan VP-004 for client acme."` | Marks the plan rejected via `hitl_service.reject_pending_plan`. |
+| `"Where can I find the pitch PDF for prospect gymshark?"` | Returns `prospects/gymshark/pitch.pdf`. |
+
+**Paid Producer submissions still require HITL approval.** The Manager
+never bypasses `interrupt_before=['producer_submit']`. The Producer
+plan-and-submit architecture is unchanged; the Manager merely talks to
+the same supervisor with the same gate.
+
+#### Manager limitations (current pass)
+
+- Tasks are **inferred from existing state**, not stored in a separate
+  `operator_tasks` table. If outputs are produced outside the normal
+  flows, the Manager may miss them.
+- The classifier is **deterministic keyword-based** (no LLM). It is
+  conservative: if it can't classify, it asks for clarification rather
+  than guessing.
+- The Manager **does not send proactive notifications**. It only
+  answers when the operator asks.
+- `approve_plan_safely` requires an MCP-pending-row match. Plans paused
+  via Streamlit must be approved via Streamlit (the manager returns
+  explicit guidance pointing you there).
+
 ### Streamlit UI
 
 ```bash
@@ -97,20 +152,30 @@ V1.7 operator surfaces:
   the agent just produced; same JSONL backing file as
   `python scripts/eval_review.py`.
 
+V1.8 Manager surface:
+- **Agency overview** tab (now tab #1) — the Manager's inbox view:
+  every open task across every client + prospect, critical first,
+  filterable by priority and client. Backed by `services/operator_inbox`,
+  which infers tasks from existing SQL/JSON state without running any
+  agent.
+
 ### MCP server (Claude Desktop integration)
 
 ```bash
 python mcp_server.py
 ```
 
-Exposes two tools:
+Exposes five tools. **`manager_request` is the preferred operator
+interface**; the others are kept for backward compatibility and
+explicit programmatic dispatch.
 
-- `run_agency_agent(prompt, client_id=None, task_type=None, model=None)` —
-  dispatches the supervisor. When routing resolves to the Producer it
-  returns a `Workflow paused` message containing the `thread_id` and the
-  exact compiled plan.
-- `resume_agency_workflow(thread_id, approve)` — approves the paused
-  Producer run (spending Kling credits) or rejects it (no spend).
+| Tool | When to use | Spends? |
+|---|---|---|
+| **`manager_request(prompt, ...)`** | **Preferred.** Natural-language operator interface. Classifies and routes to overview / dispatch / approve / reject / clarify. | Routes paid work via the existing supervisor + HITL gate. |
+| `get_agency_overview()` | Shortcut: "what's open across all clients?" Returns markdown. | No |
+| `get_client_overview(client_id)` | Shortcut: per-client tasks. Returns markdown. | No |
+| `run_agency_agent(prompt, client_id, task_type, model)` | Legacy explicit programmatic dispatch. Same supervisor path as `manager_request` for dispatch intents. | Yes (Producer paused) |
+| `resume_agency_workflow(thread_id, approve)` | Approve / reject a paused Producer workflow by thread_id. Used internally by the manager's safe-approve path; available directly when you have the thread_id. | `approve=True` spends |
 
 To wire it into Claude Desktop add a block to `claude_desktop_config.json`:
 

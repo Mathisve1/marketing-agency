@@ -486,9 +486,13 @@ _render_operator_status(ctx)
 st.divider()
 
 
-tab_run, tab_ctx, tab_hooks, tab_motions, tab_constraints, tab_videos, tab_log, tab_eval = st.tabs([
-    "Run agent", "Context", "Winning hooks", "Referral motions",
-    "Negative constraints", "Generated videos", "Performance log", "Grade output",
+(
+    tab_overview, tab_run, tab_ctx, tab_hooks, tab_motions, tab_constraints,
+    tab_videos, tab_log, tab_eval,
+) = st.tabs([
+    "Agency overview", "Run agent", "Context", "Winning hooks",
+    "Referral motions", "Negative constraints", "Generated videos",
+    "Performance log", "Grade output",
 ])
 
 TASK_TYPE_OPTIONS: dict[str, str | None] = {
@@ -525,6 +529,74 @@ def _display_result(result: dict, model_id_used: str) -> None:
     if artifacts:
         with st.expander("All artifacts (audit)"):
             st.json(artifacts)
+
+
+# --------------------------------------------------------------------------- #
+# V1.8 Agency Overview tab - the operator's single dashboard for "what is
+# waiting across all clients/prospects". Backed by services/operator_inbox
+# (read-only, no agent run, no API call).
+# --------------------------------------------------------------------------- #
+
+
+with tab_overview:
+    from services import operator_inbox  # local import to avoid cycle at module load
+    from services.operator_inbox import VALID_PRIORITIES
+
+    st.markdown("### Agency overview")
+    st.caption(
+        "Read-only inbox inferred from `video_plans`, `video_jobs`, "
+        "`mcp_pending_runs`, `prospects/`, and `evals/output_reviews.jsonl`. "
+        "No agent runs from this tab. Use *Run agent* to dispatch."
+    )
+
+    # Filter widgets
+    fcols = st.columns([1, 1, 1])
+    with fcols[0]:
+        priority_filter = st.selectbox(
+            "Priority",
+            options=["all", *VALID_PRIORITIES],
+            index=0,
+        )
+    with fcols[1]:
+        # Client filter populated from the actual client list + a sentinel
+        # for prospect/system rows that have no client_id.
+        all_clients = list_clients()
+        client_filter = st.selectbox(
+            "Client",
+            options=["all", "(prospects + system)", *all_clients],
+            index=0,
+        )
+    with fcols[2]:
+        if st.button("Refresh", help="Re-scan SQL + filesystem"):
+            st.rerun()
+
+    all_tasks = operator_inbox.collect_operator_tasks()
+
+    def _matches(task: operator_inbox.OperatorTask) -> bool:
+        if priority_filter != "all" and task.priority != priority_filter:
+            return False
+        if client_filter == "(prospects + system)":
+            return task.client_id is None
+        if client_filter != "all" and task.client_id != client_filter:
+            return False
+        return True
+
+    filtered = [t for t in all_tasks if _matches(t)]
+
+    # Counts strip
+    by_pri = operator_inbox.group_tasks_by_priority(filtered)
+    cstrip = st.columns(4)
+    cstrip[0].metric("Critical", len(by_pri.get("critical") or []))
+    cstrip[1].metric("High", len(by_pri.get("high") or []))
+    cstrip[2].metric("Medium", len(by_pri.get("medium") or []))
+    cstrip[3].metric("Low", len(by_pri.get("low") or []))
+
+    st.divider()
+
+    if not filtered:
+        st.success("No open tasks for the current filter.")
+    else:
+        st.markdown(operator_inbox.summarize_operator_tasks(filtered))
 
 
 with tab_run:

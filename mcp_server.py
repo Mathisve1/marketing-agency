@@ -15,10 +15,8 @@ Or wire into Claude Desktop via claude_desktop_config.json (see README).
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -39,21 +37,17 @@ except ImportError:
 
 from mcp.server.fastmcp import FastMCP
 
-from agents.producer.agent import format_plan_summary
 from core.client_context import ClientContext
-from core.models import SUPPORTED_MODEL_IDS
-from core.supervisor import (
-    build_supervisor_graph,
-    get_pending_node,
-    initial_state,
-    run_supervisor_async,
-)
-from services import mcp_pending_store
+from core.supervisor import build_supervisor_graph
+from services import manager_service, mcp_pending_store
 from services.hitl_service import approve_and_resume, reject_pending_plan
+from services.supervisor_dispatch import (
+    dispatch_supervisor_run,
+    format_run_result,
+)
 
-# Hidden default - Sonnet 4.6 is the cheaper/faster tier. Override per call
-# via the `model` arg if a heavier reasoning pass is worth the cost.
-DEFAULT_MCP_MODEL = "claude-sonnet-4-6"
+# DEFAULT_MCP_MODEL is now sourced from services.supervisor_dispatch so the
+# manager service and the legacy run_agency_agent share one default.
 
 
 mcp = FastMCP("marketing-agency")
@@ -87,32 +81,6 @@ _GRAPH = build_supervisor_graph(interrupt_before=["producer_submit"])
 # used to be a process-local dict here.
 
 
-def _format_run_result(result: dict, chosen_model: str) -> str:
-    """Render a completed graph result as the text payload returned to Claude."""
-    if result.get("error"):
-        return f"ERROR: {result['error']}"
-
-    lines: list[str] = [
-        f"Routed to: {result.get('current_agent', 'unknown')}",
-        f"Task type: {result.get('task_type', 'unknown')}",
-        f"Model:     {chosen_model}",
-        "---",
-    ]
-    for msg in result.get("messages", []):
-        role = msg.__class__.__name__
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        lines.append(f"[{role}] {content}")
-
-    artifacts = result.get("artifacts") or {}
-    if artifacts:
-        lines.append("---")
-        lines.append("Artifacts:")
-        for key, value in artifacts.items():
-            lines.append(f"  {key}: {value}")
-
-    return "\n".join(lines)
-
-
 @mcp.tool()
 def run_agency_agent(
     prompt: str,
@@ -120,102 +88,126 @@ def run_agency_agent(
     task_type: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    """Run the marketing agency LangGraph supervisor and return the result.
+    """(LEGACY) Programmatic dispatch to the supervisor graph.
+
+    V1.8: prefer the `manager_request` tool for natural-language operator
+    interaction. This tool stays for explicit programmatic dispatch and
+    backward compatibility - both go through the same
+    services.supervisor_dispatch.dispatch_supervisor_run helper, so the
+    HITL safety guarantees are identical.
 
     The supervisor routes to one of four workers:
-      - 'research' (Strategist)  - competitor scrape + winning hook extraction. Needs client_id.
-      - 'produce'  (Producer)    - Kling Omni-Video generation. Needs client_id.
-                                   PAUSES for human approval before running.
-      - 'analyze'  (Analyst)     - Meta Insights -> negative constraints. Needs client_id.
-      - 'outreach' (Outreach)    - prospect discovery + pitch PDFs. NO client_id.
+      - 'research' (Strategist)  - competitor scrape + candidate-hook extraction.
+      - 'produce'  (Producer)    - Kling Omni-Video plan + paused HITL gate.
+      - 'analyze'  (Analyst)     - Meta Insights -> negative constraints.
+      - 'outreach' (Outreach)    - prospect discovery + pitch PDFs.
 
-    HITL: when routing resolves to the Producer, the graph pauses before any
-    paid Kling API call. This tool returns a 'paused' message containing the
-    thread_id; call resume_agency_workflow(thread_id, approve=True/False) to
-    finish or abandon the run.
+    Producer always pauses before Kling submission via
+    interrupt_before=['producer_submit']. The pause message contains the
+    thread_id; call resume_agency_workflow(thread_id, approve=True/False)
+    to finish or cancel.
+    """
+    out = dispatch_supervisor_run(
+        graph=_GRAPH,
+        prompt=prompt,
+        client_id=client_id,
+        task_type=task_type,
+        model=model,
+    )
+    if not out.ok:
+        return f"ERROR running agency graph: {out.error}"
+    return out.formatted_text or ""
+
+
+# --------------------------------------------------------------------------- #
+# V1.8 Manager Agent tools (preferred operator interface)
+#
+# manager_request is the single tool the operator should normally talk to.
+# get_agency_overview / get_client_overview are useful direct shortcuts
+# for read-only inspection without going through the classifier.
+#
+# All three preserve the existing HITL gate (the manager dispatches via
+# the same shared dispatch_supervisor_run helper that backs
+# run_agency_agent) and never call Kling directly.
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+def get_agency_overview() -> str:
+    """Markdown overview of all open operator tasks across every client
+    + prospect, critical first.
+
+    Read-only. Inferred from the existing state (video_plans, video_jobs,
+    mcp_pending_runs, prospects/, evals/output_reviews.jsonl) - no agent
+    run, no external API call. Use this to answer "what do I need to
+    approve today?" / "what is waiting?" / "give me a daily overview".
+    """
+    return manager_service.get_agency_overview()
+
+
+@mcp.tool()
+def get_client_overview(client_id: str) -> str:
+    """Markdown overview scoped to one client. Excludes prospects + MCP
+    rows for other clients. Read-only.
+    """
+    return manager_service.get_client_overview(client_id)
+
+
+@mcp.tool()
+def manager_request(
+    prompt: str,
+    client_id: Optional[str] = None,
+    task_type: Optional[str] = None,
+    model: Optional[str] = None,
+    confirm: bool = False,
+) -> str:
+    """Central Manager Agent. The PREFERRED operator interface.
+
+    The Manager classifies the request and:
+
+      - Returns a markdown overview for "what do I need to approve",
+        "what is waiting", "give me overview for client X".
+
+      - Dispatches to the right sub-agent through the existing safe
+        supervisor path:
+          * outreach research / prospects -> Outreach
+          * competitor research / market research -> Strategist
+          * video plan / creative production -> Producer (HITL-paused)
+          * performance / ROAS / recommendations -> Analyst
+        Producer ALWAYS pauses before any paid Kling submission - the
+        manager never bypasses interrupt_before=['producer_submit'].
+
+      - Approves a paused plan via the existing safe HITL/resume path,
+        but ONLY when:
+          * the operator passes confirm=True, AND
+          * a matching MCP pending-runs row exists for the plan.
+        Otherwise refuses and returns Streamlit guidance.
+
+      - Rejects a plan through hitl_service (works regardless of which
+        channel paused the workflow).
+
+      - Asks for clarification when the request is ambiguous instead of
+        guessing.
 
     Args:
-        prompt: The instruction (e.g. 'Find 5 fitness apparel brands in the UK',
-                'Produce a video using hook WH-003 with our default character').
-        client_id: Optional client slug for client-scoped work. Required when
-                   task_type is research/produce/analyze. Must be None (or
-                   omitted) when task_type is outreach.
-        task_type: Optional explicit routing ('research' | 'produce' | 'analyze'
-                   | 'outreach'). When omitted, the supervisor's keyword router
-                   infers from the prompt.
-        model: Optional Anthropic model ID. Defaults to 'claude-sonnet-4-6'.
-               Pass 'claude-opus-4-7' for premium reasoning (~3x cost).
-
-    Returns:
-        Either a formatted text result, or a 'paused' message with the
-        thread_id when the Producer HITL gate triggered.
+        prompt: Natural-language request from the operator.
+        client_id: Optional explicit client scope. Wins over keyword
+                   inference when supplied.
+        task_type: Optional explicit task_type ('research' | 'produce' |
+                   'analyze' | 'outreach'). When supplied, the manager
+                   skips classification and dispatches directly.
+        model: Optional Anthropic model override (default sonnet-4-6).
+        confirm: REQUIRED to be True for approve intents. Without it,
+                 approve requests are refused with a clarification.
     """
-    chosen_model = model or DEFAULT_MCP_MODEL
-    if chosen_model not in SUPPORTED_MODEL_IDS:
-        return (
-            f"ERROR: Unsupported model {chosen_model!r}. "
-            f"Choose one of: {', '.join(SUPPORTED_MODEL_IDS)}"
-        )
-
-    # Fresh thread_id per submission - prevents accidental collision with a
-    # prior pending run on the same client.
-    thread_id = f"mcp-{client_id or 'global'}-{uuid.uuid4().hex[:8]}"
-    config = {"configurable": {"thread_id": thread_id, "model": chosen_model}}
-
-    try:
-        result = asyncio.run(run_supervisor_async(
-            _GRAPH,
-            initial_state(
-                client_id=client_id, user_message=prompt, task_type=task_type
-            ),
-            config=config,
-        ))
-    except Exception as e:
-        # Catch-all so the MCP server never crashes mid-tool-call; surface
-        # the error back to Claude Desktop as text.
-        return f"ERROR running agency graph: {type(e).__name__}: {e}"
-
-    # V1.4: paused before producer_submit? Pull the compiled plan from SQL
-    # so the operator reviews the EXACT prompt about to be sent to Kling.
-    pending_node = get_pending_node(_GRAPH, config=config)
-    if pending_node == "producer_submit":
-        plan_id = result.get("plan_id")
-        plan_summary = "(no plan compiled - submit will refuse)"
-        if plan_id and client_id:
-            try:
-                ctx = ClientContext.load(client_id)
-                plan = ctx.get_video_plan(plan_id)
-                if plan is not None:
-                    plan_summary = format_plan_summary(plan)
-            except Exception as e:
-                plan_summary = f"(could not load plan {plan_id}: {e})"
-
-        # V1.7: durable replacement for the in-memory _PENDING_RUNS dict.
-        mcp_pending_store.record_pending(
-            thread_id,
-            client_id=client_id,
-            model=chosen_model,
-            prompt=prompt,
-            task_type=result.get("task_type"),
-            plan_id=plan_id,
-            config=config,
-        )
-        return (
-            "Workflow paused for financial safety. Review the COMPILED plan "
-            "below and use the resume_agency_workflow tool to approve or reject.\n"
-            f"\nthread_id: {thread_id}"
-            f"\nclient_id: {client_id}"
-            f"\nmodel:     {chosen_model}"
-            f"\nrouted_to: producer_submit"
-            f"\n---\nOperator instruction:\n{prompt}"
-            f"\n---\nCompiled plan:\n{plan_summary}"
-            f"\n---\nNext step: call resume_agency_workflow("
-            f"thread_id='{thread_id}', approve=True) to submit this plan "
-            f"to Kling (this WILL spend credits), or approve=False to "
-            f"cancel (plan will be marked rejected)."
-        )
-
-    return _format_run_result(result, chosen_model)
+    return manager_service.route_manager_request(
+        prompt,
+        graph=_GRAPH,
+        client_id=client_id,
+        task_type=task_type,
+        model=model,
+        confirm=confirm,
+    )
 
 
 @mcp.tool()
@@ -296,7 +288,7 @@ def resume_agency_workflow(thread_id: str, approve: bool) -> str:
     # decision shows up in list_decided for the Streamlit status panel).
     mcp_pending_store.restore_pending(pending)
     mcp_pending_store.mark_decided(thread_id, "approved")
-    return f"Producer approved.\n{_format_run_result(result, chosen_model)}"
+    return f"Producer approved.\n{format_run_result(result, chosen_model)}"
 
 
 if __name__ == "__main__":
