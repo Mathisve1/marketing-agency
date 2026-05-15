@@ -81,3 +81,7 @@ cost_ledger.db-wal
 # directory is created on demand.
 reports/daily-summary-*.md
 reports/daily-summary-*.txt
+
+# Wrangler (Cloudflare Pages CLI) writes a local cache here on first
+# deploy. Per-machine, regenerated automatically; never commit.
+.wrangler/
