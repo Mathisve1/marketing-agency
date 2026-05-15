@@ -340,3 +340,101 @@ def test_corrupted_manifest_token_is_regenerated(tmp_path: Path):
     new_token = manifest["private_slug"].rsplit("-", 1)[-1]
     assert len(new_token) == TOKEN_LENGTH
     assert all(c in TOKEN_ALPHABET for c in new_token)
+
+
+# --------------------------------------------------------------------------- #
+# intended_status override (Live-banner-on-first-deploy fix)
+# --------------------------------------------------------------------------- #
+
+
+# The banner div carries either of two element-level classes; both
+# CSS rules ship in every page (the stylesheet is embedded), so the
+# only reliable way to tell which banner is *active* is to look at
+# the rendered `<div class="status-banner status-banner--{state}"` —
+# not the bare class substring.
+_DRAFT_BANNER_DIV = '<div class="status-banner status-banner--draft"'
+_LIVE_BANNER_DIV = '<div class="status-banner status-banner--live"'
+
+
+def test_intended_status_deployed_renders_live_banner(tmp_path: Path):
+    """`intended_status="deployed"` must produce HTML whose status banner
+    is the Live variant - not the amber Draft banner. This is the fix
+    for the first-deploy-ships-draft-HTML bug: the deploy script passes
+    this override so the file uploaded to Cloudflare already shows Live."""
+    prospect_root, brief = _setup_prospect(tmp_path)
+    manifest = build_microsite(
+        "acme-skincare",
+        brief=brief,
+        intended_status="deployed",
+    )
+    html = (prospect_root / "site" / "index.html").read_text(encoding="utf-8")
+    # Live banner present.
+    assert _LIVE_BANNER_DIV in html
+    # Draft banner absent.
+    assert _DRAFT_BANNER_DIV not in html
+    assert "Local draft preview" not in html
+    # Public URL is the planned location even though the manifest's
+    # `status` field stays "draft" until mark_manifest_deployed runs
+    # after a successful upload. This split is intentional: the HTML
+    # we hand to Cloudflare needs to be Live-banner so a successful
+    # first deploy is visually correct; the on-disk manifest stays
+    # honest so an upload failure doesn't leave us claiming "deployed"
+    # locally.
+    assert manifest["status"] == "draft"
+    assert manifest["public_url"].endswith(f"{manifest['private_slug']}/")
+
+
+def test_intended_status_none_uses_existing_manifest_status(tmp_path: Path):
+    """Without an override, the renderer should preserve whatever status
+    the existing manifest claims. This is what lets a rebuild-after-deploy
+    keep showing the Live banner across regenerations."""
+    prospect_root, brief = _setup_prospect(tmp_path)
+    # First build seeds the manifest at "draft".
+    build_microsite("acme-skincare", brief=brief)
+    # Simulate a successful prior deploy: flip the on-disk manifest to
+    # "deployed" the way mark_manifest_deployed would.
+    manifest_path = prospect_root / "site" / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["status"] = "deployed"
+    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+    # Rebuild without an override - HTML should still render Live.
+    build_microsite("acme-skincare", brief=brief)
+    html = (prospect_root / "site" / "index.html").read_text(encoding="utf-8")
+    assert _LIVE_BANNER_DIV in html
+    assert _DRAFT_BANNER_DIV not in html
+
+
+def test_intended_status_draft_explicitly_forces_draft_banner(tmp_path: Path):
+    """Passing `intended_status="draft"` explicitly must render the Draft
+    banner even if the existing manifest claims deployed. This gives
+    callers a rollback path (e.g. an operator wants to force-revert a
+    local preview without deleting the manifest)."""
+    prospect_root, brief = _setup_prospect(tmp_path)
+    # Seed a deployed manifest on disk.
+    site_dir = prospect_root / "site"
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "manifest.json").write_text(
+        json.dumps({
+            "private_slug": "acme-skincare-aaaa11",
+            "status": "deployed",
+        }),
+        encoding="utf-8",
+    )
+    build_microsite("acme-skincare", brief=brief, intended_status="draft")
+    html = (site_dir / "index.html").read_text(encoding="utf-8")
+    assert _DRAFT_BANNER_DIV in html
+    assert _LIVE_BANNER_DIV not in html
+    assert "Local draft preview" in html
+
+
+def test_intended_status_invalid_value_falls_back_to_existing(tmp_path: Path):
+    """An out-of-range `intended_status` is silently ignored and the
+    existing-manifest behaviour kicks in. This prevents typos in the
+    deploy script from corrupting the rendered status banner."""
+    prospect_root, brief = _setup_prospect(tmp_path)
+    # Fresh prospect, no prior manifest - existing-status fallback is "draft".
+    build_microsite("acme-skincare", brief=brief, intended_status="bogus-value")
+    html = (prospect_root / "site" / "index.html").read_text(encoding="utf-8")
+    # Fresh prospect: no manifest -> defaults to draft.
+    assert _DRAFT_BANNER_DIV in html
+    assert _LIVE_BANNER_DIV not in html

@@ -204,9 +204,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         manifest = {"public_url": manifest_public_url}
     else:
         print("\n[build] running build_microsite()...")
+        # On a real (non-dry-run) deploy, render the HTML with the Live
+        # banner before upload. Without this, the first deploy of a
+        # fresh prospect ships the amber Draft banner because the
+        # manifest only flips to "deployed" via mark_manifest_deployed
+        # *after* upload - so the HTML in build/pitches/ would still
+        # claim "not deployed yet". Dry-run intentionally leaves
+        # intended_status=None so the local preview keeps the Draft
+        # banner.
+        build_intended_status = None if args.dry_run else "deployed"
         manifest = build_microsite(
             args.prospect_id,
             prospects_root=prospects_root,
+            intended_status=build_intended_status,
         )
         print(f"  private_slug : {manifest['private_slug']}")
         print(f"  public_url   : {manifest['public_url']}")

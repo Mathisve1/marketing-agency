@@ -62,7 +62,7 @@ CLOUDFLARE_PAGES_PROJECT=yuvo-pitches              # Pages project name
 
 # Optional
 PITCH_BASE_URL=https://yuvo-pitches.pages.dev      # default if unset
-WRANGLER_BIN=wrangler                              # override the executable name
+WRANGLER_BIN=                                      # Windows: see "Install wrangler" below
 ```
 
 `CLOUDFLARE_API_TOKEN` is **never printed** by the deploy script. Wrangler
@@ -109,6 +109,11 @@ py -3.11 scripts/deploy_pitch_microsite.py haeckels
 This:
 
 1. Rebuilds `prospects/haeckels/site/` and `build/pitches/p/<slug>/`.
+   The HTML rendered for a real (non-dry-run) deploy already carries
+   the **Live** banner — the deploy script passes
+   `intended_status="deployed"` into `build_microsite()` so the page
+   that gets uploaded is the one the prospect should see. Dry-runs
+   keep the amber Draft banner.
 2. Runs `wrangler pages deploy build/pitches --project-name=yuvo-pitches --branch=main`.
    `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are passed via
    the child environment so they never appear on the command line.
@@ -164,9 +169,62 @@ You only do this once.
 npm install -g wrangler
 ```
 
-The deploy script calls `wrangler pages deploy ...` via subprocess. If
-wrangler is on a non-standard path, set `WRANGLER_BIN` to the full
-path (e.g. `C:\Program Files\nodejs\wrangler.cmd`).
+The deploy script calls `wrangler pages deploy ...` via subprocess.
+
+### Windows: set `WRANGLER_BIN`
+
+On Windows, Python's `subprocess.run` uses `CreateProcess`, which does
+**not** honour `PATHEXT`. A bare `"wrangler"` argv resolves to the
+npm-installed shell shim (no extension), and `CreateProcess` refuses
+to spawn it with:
+
+```
+[WinError 2] The system cannot find the file specified
+```
+
+The `.cmd` next to the shim does work. The deploy script tries
+`shutil.which("wrangler.cmd")` first and falls back to
+`shutil.which("wrangler")` — both honour `PATHEXT` — so on most
+Windows installs the absolute path of `wrangler.cmd` resolves
+without any extra setup. If your install lives somewhere unusual,
+or if the auto-resolution does not pick the right binary, set the
+full path explicitly:
+
+```ini
+# .env (Windows)
+WRANGLER_BIN=C:/Users/<you>/AppData/Roaming/npm/wrangler.cmd
+```
+
+On POSIX (`macOS`, `Linux`), leave `WRANGLER_BIN` unset; bare
+`wrangler` works because the shell shim is directly executable.
+
+### Safe UTF-8 decoding of wrangler output
+
+`wrangler pages deploy` prints UTF-8 box-drawing characters and
+emoji in its progress output. The deploy script reads the
+subprocess streams with `encoding="utf-8", errors="replace"` so a
+noisy line on Windows (where the platform default is `cp1252`)
+never crashes the capture with `UnicodeDecodeError`. The
+`deployment_url` parser is also resilient to replacement
+characters in the surrounding lines, so the `.pages.dev` URL is
+still extracted even when other characters in the output were
+unrepresentable.
+
+### First deploy already ships the Live banner
+
+The deploy script passes `intended_status="deployed"` into
+`build_microsite()` for a real (non-dry-run) deploy. That means
+the HTML uploaded to Cloudflare on the **first** deploy already
+carries the green Live banner instead of the amber Draft banner —
+no second deploy is needed to swap it. Dry-runs deliberately keep
+`intended_status` unset so the local preview operators eyeball
+before deploying still shows Draft.
+
+On a real deploy the manifest only flips to `status="deployed"`
+**after** wrangler reports success: `mark_manifest_deployed()`
+stamps `deployed_at`, `deployment_provider`, and the wrangler-
+reported `deployment_url`. So if the upload fails, the on-disk
+manifest stays honest about the public URL not yet being live.
 
 ## Interest form
 

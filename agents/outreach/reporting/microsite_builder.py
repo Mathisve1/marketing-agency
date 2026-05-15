@@ -405,6 +405,7 @@ def build_microsite(
     output_dir: Optional[Path] = None,
     contact_email: Optional[str] = None,
     form_endpoint: Optional[str] = None,
+    intended_status: Optional[str] = None,
 ) -> dict:
     """Build the private microsite for `prospect_id` and return its manifest.
 
@@ -427,6 +428,17 @@ def build_microsite(
         (typically `/api/interest`). When set, the interest form posts
         to it instead of opening mailto. Read from `PITCH_FORM_ENDPOINT`
         when the kwarg is None.
+      `intended_status` - when set to `"draft"` or `"deployed"`,
+        overrides the rendered status banner. The deploy script passes
+        `"deployed"` for a real (non-dry-run) deploy so the uploaded
+        HTML already carries the Live banner instead of the amber
+        Draft banner. The manifest's `status` field stays `"draft"`
+        until `mark_manifest_deployed()` runs after a successful
+        upload - so a deploy that fails leaves the file-on-disk
+        manifest honest about the public URL not being live yet.
+        When `None`, falls back to whatever status the existing
+        manifest carries (so re-running `build_microsite()` after a
+        successful deploy preserves the Live banner across rebuilds).
     """
     if brief is None:
         brief = DeckBrief.from_audit(prospect_id, prospects_root=prospects_root)
@@ -461,8 +473,17 @@ def build_microsite(
     # un-deployed link and hit a 404.
     base = resolve_public_base_url(public_base_url)
     planned_public_url = f"{base}/p/{private_slug}/"
-    existing_status = _read_existing_status(manifest_path)
-    render_status = existing_status if existing_status in ("draft", "deployed") else "draft"
+    # `intended_status` (from the deploy script's real-deploy path)
+    # wins over the existing manifest state, so the first deploy can
+    # upload Live-banner HTML without needing a second deploy. When
+    # the caller passes nothing, fall back to whatever the existing
+    # manifest claims so rebuilds after a successful deploy keep the
+    # Live banner across regenerations.
+    if intended_status in ("draft", "deployed"):
+        render_status = intended_status
+    else:
+        existing_status = _read_existing_status(manifest_path)
+        render_status = existing_status if existing_status in ("draft", "deployed") else "draft"
     out_html = build_html_deck(
         site_brief,
         output_dir=site_dir,

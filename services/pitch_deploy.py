@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,7 +93,29 @@ def check_required_env(env: Optional[dict] = None) -> list[str]:
 
 
 def _resolve_wrangler_cmd() -> str:
-    return os.environ.get(WRANGLER_BIN_ENV) or DEFAULT_WRANGLER_CMD
+    """Pick the wrangler executable to spawn.
+
+    Priority:
+      1. `WRANGLER_BIN` env var (operator override; tests use this).
+      2. On Windows, `shutil.which("wrangler.cmd")` then
+         `shutil.which("wrangler")` so we resolve to the absolute path
+         of the npm-installed batch shim. `subprocess.run` on Windows
+         uses `CreateProcess`, which does not honour `PATHEXT`, so a
+         bare `"wrangler"` argv fails to spawn even when
+         `wrangler.cmd` is on `PATH`. `shutil.which` honours
+         `PATHEXT`, so it returns the right absolute path.
+      3. Plain `"wrangler"` — works on POSIX where the shell shim is
+         directly executable.
+    """
+    explicit = os.environ.get(WRANGLER_BIN_ENV)
+    if explicit:
+        return explicit
+    if sys.platform == "win32":
+        for name in ("wrangler.cmd", DEFAULT_WRANGLER_CMD):
+            resolved = shutil.which(name)
+            if resolved:
+                return resolved
+    return DEFAULT_WRANGLER_CMD
 
 
 def _build_argv(
@@ -190,11 +213,20 @@ def deploy_to_cloudflare_pages(
     child_env["CLOUDFLARE_API_TOKEN"] = api_token
 
     try:
+        # `encoding="utf-8", errors="replace"` is load-bearing: wrangler
+        # prints UTF-8 box-drawing chars and emoji in its progress
+        # output. Without an explicit encoding, Python falls back to
+        # the platform default (cp1252 on Windows) and the reader
+        # thread raises UnicodeDecodeError, which corrupts capture and
+        # leaves `_parse_deployment_url` with no text to scan even
+        # though wrangler itself exited 0.
         completed = subprocess.run(
             argv,
             env=child_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except FileNotFoundError as e:
