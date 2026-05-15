@@ -274,6 +274,8 @@ def capture_ad_screenshots(
     max_screenshots: int = MAX_SCREENSHOTS,
     timeout: float = TIMEOUT_SECS,
     user_agent: str = DEFAULT_UA,
+    assets_subdir: Optional[str] = None,
+    filename_prefix: str = "ad",
 ) -> dict:
     """Capture local screenshots/thumbnails for each ad in `ads`.
 
@@ -283,9 +285,34 @@ def capture_ad_screenshots(
 
     Input ads are NOT mutated - the returned `ads` list is a shallow
     copy with the new field merged onto each entry.
+
+    Optional kwargs (used by the strategy-page competitor proof pass):
+      assets_subdir   - subdirectory under `prospects/<id>/assets/` to
+                        write into, e.g. `"competitors/upcircle-beauty"`.
+                        Defaults to None (writes directly under
+                        `assets/`). The directory is created if absent.
+      filename_prefix - prefix for the generated filenames, e.g.
+                        `"ad"` (default) -> `ad_1.png`. Lets competitor
+                        captures sit alongside the prospect's own ads
+                        without name collisions.
     """
     prospect_root = (prospects_root / prospect_id).resolve()
     assets_dir = prospect_root / "assets"
+    if assets_subdir:
+        # Strip leading slashes / backslashes so a relative subdir
+        # cannot escape the assets folder.
+        cleaned = str(assets_subdir).replace("\\", "/").lstrip("/")
+        assets_dir = (assets_dir / cleaned).resolve()
+        # Make sure the resolved path stays inside the prospect root
+        # (defence in depth against path-traversal in a malicious
+        # subdir argument).
+        try:
+            assets_dir.relative_to(prospect_root)
+        except ValueError as e:
+            raise ValueError(
+                f"capture_ad_screenshots: assets_subdir {assets_subdir!r} "
+                f"escapes prospect root {prospect_root}"
+            ) from e
 
     out_ads: list[dict] = [dict(a) for a in ads]
     captured = 0
@@ -297,7 +324,7 @@ def capture_ad_screenshots(
             ad.setdefault("capture_status", "skipped_cap")
             continue
         direct_url, source_kind = _prefer_direct_image(ad)
-        target_path = assets_dir / f"ad_{i + 1}{_safe_ext_from_url(direct_url or '')}"
+        target_path = assets_dir / f"{filename_prefix}_{i + 1}{_safe_ext_from_url(direct_url or '')}"
 
         # Path A: direct image download (cheapest, no browser needed).
         if direct_url:
@@ -330,7 +357,7 @@ def capture_ad_screenshots(
             ad["capture_error"] = err
             continue
 
-        target_path = assets_dir / f"ad_{i + 1}.png"
+        target_path = assets_dir / f"{filename_prefix}_{i + 1}.png"
         if not pw_available:
             err = (
                 f"ad[{i}]: playwright not installed; install with "

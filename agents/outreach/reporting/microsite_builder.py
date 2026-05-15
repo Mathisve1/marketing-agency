@@ -562,6 +562,13 @@ def build_deploy_package(
     The deploy folder is upload-ready: drop it into a Cloudflare Pages
     project (or any static host) and the prospect link works.
 
+    When a sibling `prospects/<id>/strategy/` folder exists (written by
+    `build_strategy_microsite()`), it is copied into the package as
+    `<slug>/strategy/`, so the deployed Cloudflare URL serves both:
+
+        https://<host>/p/<slug>/            -> pitch microsite
+        https://<host>/p/<slug>/strategy/   -> strategy page
+
     Returns the path to the generated deploy folder.
     """
     root = Path(prospects_root) if prospects_root else Path("prospects")
@@ -582,8 +589,271 @@ def build_deploy_package(
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(site_dir, target)
+
+    # Strategy page is optional: only copy if the operator has run
+    # `build_strategy_microsite()` for this prospect. Lives at
+    # `<slug>/strategy/` so the pitch and strategy URLs share the same
+    # private-slug namespace but live at different paths.
+    strategy_dir = (root / prospect_id / "strategy").resolve()
+    if strategy_dir.is_dir():
+        shutil.copytree(strategy_dir, target / "strategy")
+        log.info(
+            "microsite_builder: strategy page packaged at %s/strategy/",
+            target,
+        )
+
     log.info("microsite_builder: deploy package ready at %s", target)
     return target
+
+
+# --------------------------------------------------------------------------- #
+# Strategy page builder (sibling of the pitch microsite)
+# --------------------------------------------------------------------------- #
+
+
+# These imports are deliberately lazy at module-level - they pull in the
+# strategy renderer + brief layer only when the operator actually builds
+# a strategy page, keeping `build_microsite()`'s import graph tight.
+from agents.outreach.reporting.html_strategy_builder import build_strategy_html  # noqa: E402
+from agents.outreach.reporting.strategy_brief import StrategyBrief  # noqa: E402
+
+
+def _gather_strategy_asset_paths(brief: StrategyBrief) -> list[Path]:
+    """All asset Paths the strategy page actually references, deduped,
+    in order. Used by `_copy_strategy_assets()` to populate the local
+    `strategy/assets/` folder so the page is self-contained when
+    served from any path."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+
+    def _push(p: Optional[Path]) -> None:
+        if p is None or p in seen:
+            return
+        try:
+            if not p.is_file():
+                return
+        except OSError:
+            return
+        seen.add(p)
+        out.append(p)
+
+    _push(brief.logo_path)
+    _push(brief.hero_image_path)
+    for p in brief.product_images:
+        _push(p)
+    for ad in brief.ad_patterns:
+        _push(ad.screenshot_path)
+    # Competitor ad proof - screenshots referenced by section 04
+    # competitor cards AND by section 05 pattern cards.
+    for comp in brief.competitors:
+        for sampled_ad in comp.sampled_ads:
+            _push(sampled_ad.screenshot_path)
+    for pat in brief.creative_patterns:
+        for ev_ad in pat.ad_evidence:
+            _push(ev_ad.screenshot_path)
+    return out
+
+
+def _copy_strategy_assets(
+    brief: StrategyBrief,
+    strategy_dir: Path,
+) -> StrategyBrief:
+    """Copy every asset the strategy page references into
+    `<strategy_dir>/assets/` and return a brief whose Paths point at
+    the copies. Keeps the strategy page self-contained for the deploy
+    package - paths inside the rendered HTML become `assets/<name>`.
+    """
+    from dataclasses import replace
+
+    from agents.outreach.reporting.strategy_brief import (
+        CompetitorAdProof,
+        CreativePattern,
+        StrategyAdPattern,
+    )
+
+    assets_dir = strategy_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    mapping: dict[Path, Path] = {}
+    used_names: set[str] = set()
+    for src in _gather_strategy_asset_paths(brief):
+        base = _safe_assets_name(src)
+        candidate = base
+        i = 1
+        while candidate in used_names:
+            stem, ext = os.path.splitext(base)
+            candidate = f"{stem}_{i}{ext}"
+            i += 1
+        dst = assets_dir / candidate
+        try:
+            shutil.copy2(src, dst)
+        except OSError as e:
+            log.warning(
+                "microsite_builder: failed to copy strategy asset %s -> %s: %s",
+                src, dst, e,
+            )
+            continue
+        mapping[src] = dst
+        used_names.add(candidate)
+
+    def remap(p: Optional[Path]) -> Optional[Path]:
+        return mapping.get(p, p) if p is not None else None
+
+    def remap_ad(ad: CompetitorAdProof) -> CompetitorAdProof:
+        return replace(ad, screenshot_path=remap(ad.screenshot_path))
+
+    new_ad_patterns = [
+        StrategyAdPattern(
+            archive_id=p.archive_id,
+            pattern=p.pattern,
+            weakness=p.weakness,
+            opportunity=p.opportunity,
+            library_url=p.library_url,
+            screenshot_path=remap(p.screenshot_path),
+            body_excerpt=p.body_excerpt,
+            days_active=p.days_active,
+        )
+        for p in brief.ad_patterns
+    ]
+
+    new_competitors = [
+        replace(
+            c,
+            sampled_ads=tuple(remap_ad(ad) for ad in c.sampled_ads),
+        )
+        for c in brief.competitors
+    ]
+    # The CreativePattern.ad_evidence list references the SAME
+    # CompetitorAdProof objects we just remapped on the competitors
+    # list - but `frozen=True` means we can't rely on identity to
+    # share them. Re-derive by competitor-name + ad_archive_id so
+    # both sides see the file in `strategy/assets/`.
+    _remapped_by_key: dict[tuple[str, str], CompetitorAdProof] = {}
+    for c in new_competitors:
+        for ad in c.sampled_ads:
+            _remapped_by_key[(c.name, ad.ad_archive_id)] = ad
+
+    new_creative_patterns: list[CreativePattern] = []
+    for pat in brief.creative_patterns:
+        new_evidence: list[CompetitorAdProof] = []
+        for ad in pat.ad_evidence:
+            key = (ad.competitor_name, ad.ad_archive_id)
+            new_evidence.append(_remapped_by_key.get(key, remap_ad(ad)))
+        new_creative_patterns.append(replace(pat, ad_evidence=tuple(new_evidence)))
+
+    return replace(
+        brief,
+        logo_path=remap(brief.logo_path),
+        hero_image_path=remap(brief.hero_image_path),
+        product_images=[remap(p) for p in brief.product_images if p is not None],
+        ad_patterns=new_ad_patterns,
+        competitors=new_competitors,
+        creative_patterns=new_creative_patterns,
+        prospect_root=strategy_dir,  # so the renderer's `_url_for` walks the right tree
+    )
+
+
+def build_strategy_microsite(
+    prospect_id: str,
+    *,
+    prospects_root: Optional[Path] = None,
+    public_base_url: Optional[str] = None,
+    public_pitch_url: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> dict:
+    """Build the private strategy / creative-research page for
+    `prospect_id` and return a small manifest.
+
+    Steps:
+      1. Build a StrategyBrief from the prospect's audit.json.
+      2. Resolve the private slug from the existing pitch
+         `site/manifest.json` (the strategy page deploys to
+         `<slug>/strategy/`, so we want both surfaces to share the
+         same slug).
+      3. Copy every used asset into `<strategy_dir>/assets/` so the
+         page is self-contained.
+      4. Render the strategy HTML.
+      5. Write a small `manifest.json` next to it.
+
+    Returns the manifest dict (also persisted at
+    `prospects/<id>/strategy/manifest.json`).
+    """
+    root = Path(prospects_root) if prospects_root else Path("prospects")
+    prospect_root = (root / prospect_id).resolve()
+
+    # Pitch manifest tells us the slug + public URL base; if the pitch
+    # microsite hasn't been built yet, we can still write the strategy
+    # page locally - we just don't have a private_slug to record.
+    pitch_manifest_path = prospect_root / "site" / "manifest.json"
+    pitch_manifest: dict = {}
+    if pitch_manifest_path.exists():
+        try:
+            pitch_manifest = json.loads(
+                pitch_manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            pitch_manifest = {}
+    private_slug = pitch_manifest.get("private_slug")
+    pitch_public_url = pitch_manifest.get("public_url")
+
+    # Resolve target public URL for the strategy page.
+    base = resolve_public_base_url(public_base_url)
+    strategy_public_url: Optional[str] = None
+    if private_slug:
+        strategy_public_url = f"{base}/p/{private_slug}/strategy/"
+
+    # Build the brief.
+    brief = StrategyBrief.from_audit(
+        prospect_id,
+        prospects_root=prospects_root,
+        public_pitch_url=public_pitch_url or pitch_public_url or "../",
+    )
+
+    # Decide output dir + copy assets locally for self-containment.
+    strategy_dir = Path(output_dir) if output_dir else (prospect_root / "strategy")
+    strategy_dir.mkdir(parents=True, exist_ok=True)
+    site_brief = _copy_strategy_assets(brief, strategy_dir)
+
+    # Render the HTML.
+    out_html = build_strategy_html(
+        site_brief,
+        output_dir=strategy_dir,
+        noindex=True,
+        status="draft",
+        public_url=strategy_public_url,
+    )
+
+    # Manifest.
+    manifest: dict = {
+        "prospect_id": prospect_id,
+        "brand_name": brief.brand_name,
+        "private_slug": private_slug,
+        "kind": "strategy",
+        "local_path": str(out_html.resolve()),
+        "public_url": strategy_public_url,
+        "status": "draft",
+        "review_required": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest_path = strategy_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if existing.get("created_at"):
+                manifest["created_at"] = existing["created_at"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+        newline="\n",
+    )
+    log.info(
+        "microsite_builder: strategy page written to %s (slug=%s)",
+        manifest_path, private_slug,
+    )
+    return manifest
 
 
 # --------------------------------------------------------------------------- #
