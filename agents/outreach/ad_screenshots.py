@@ -228,21 +228,28 @@ def _screenshot_via_playwright(
 # --------------------------------------------------------------------------- #
 
 
-def _prefer_direct_image(ad: dict) -> Optional[str]:
-    """Return the best static URL we can download directly, or None.
-    Order: image_url > video_preview_image_url > snapshot_url (only if
-    the snapshot is a static image, which is rare but possible)."""
-    for key in ("image_url", "video_preview_image_url"):
-        v = ad.get(key)
-        if isinstance(v, str) and v.lower().startswith(("http://", "https://")):
-            return v.strip()
-    # Pick from image_urls if image_url itself is empty.
+def _prefer_direct_image(ad: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return (best_static_url, source_kind) we can download directly.
+
+    `source_kind` is one of:
+      - "image_url"          : a static Apify image URL
+      - "video_preview"      : the static thumbnail of a video ad
+      - "image_urls"         : an entry from the bulk image_urls list
+
+    Returns (None, None) when no inline asset is present.
+    """
+    v = ad.get("image_url")
+    if isinstance(v, str) and v.lower().startswith(("http://", "https://")):
+        return v.strip(), "image_url"
+    v = ad.get("video_preview_image_url")
+    if isinstance(v, str) and v.lower().startswith(("http://", "https://")):
+        return v.strip(), "video_preview"
     image_urls = ad.get("image_urls") or []
     if isinstance(image_urls, list):
         for v in image_urls:
             if isinstance(v, str) and v.lower().startswith(("http://", "https://")):
-                return v.strip()
-    return None
+                return v.strip(), "image_urls"
+    return None, None
 
 
 def _ad_library_url(ad: dict) -> Optional[str]:
@@ -287,38 +294,66 @@ def capture_ad_screenshots(
 
     for i, ad in enumerate(out_ads):
         if captured >= max_screenshots:
-            break
-        target_path = assets_dir / f"ad_{i + 1}{_safe_ext_from_url(_prefer_direct_image(ad) or '')}"
+            ad.setdefault("capture_status", "skipped_cap")
+            continue
+        direct_url, source_kind = _prefer_direct_image(ad)
+        target_path = assets_dir / f"ad_{i + 1}{_safe_ext_from_url(direct_url or '')}"
 
         # Path A: direct image download (cheapest, no browser needed).
-        direct = _prefer_direct_image(ad)
-        if direct:
-            result = _download_image_to(direct, target_path, timeout=timeout, user_agent=user_agent)
+        if direct_url:
+            result = _download_image_to(direct_url, target_path, timeout=timeout, user_agent=user_agent)
             if result is not None:
-                ad["ad_screenshot_path"] = (
-                    str(result.relative_to(prospect_root)).replace("\\", "/")
-                )
+                rel = str(result.relative_to(prospect_root)).replace("\\", "/")
+                ad["ad_screenshot_path"] = rel
+                ad["capture_status"] = f"download_{source_kind}"
+                # Mirror the path under a source-named field so callers
+                # who want to distinguish "this is a video thumbnail" vs
+                # "this is the ad still" can do so without re-deriving.
+                if source_kind == "image_url":
+                    ad["image_path_local"] = rel
+                elif source_kind == "video_preview":
+                    ad["video_preview_path_local"] = rel
+                else:
+                    ad["image_path_local"] = rel  # image_urls bulk-list entry
                 captured += 1
                 continue
-            errors.append(f"ad[{i}]: direct download failed for {direct}")
+            err = f"ad[{i}]: direct download failed for {direct_url}"
+            errors.append(err)
+            ad["capture_error"] = err
 
         # Path B: Playwright screenshot of the public ads-library URL.
         lib_url = _ad_library_url(ad)
         if not lib_url:
-            errors.append(f"ad[{i}]: no URL to screenshot")
+            err = f"ad[{i}]: no URL to screenshot"
+            errors.append(err)
+            ad["capture_status"] = "no_url"
+            ad["capture_error"] = err
             continue
 
         target_path = assets_dir / f"ad_{i + 1}.png"
+        if not pw_available:
+            err = (
+                f"ad[{i}]: playwright not installed; install with "
+                "`py -3.11 -m pip install playwright` then "
+                "`py -3.11 -m playwright install chromium`"
+            )
+            errors.append(err)
+            ad["capture_status"] = "playwright_missing"
+            ad["capture_error"] = err
+            continue
         result = _screenshot_via_playwright(
             lib_url, target_path, timeout=timeout, user_agent=user_agent
         )
         if result is not None:
-            ad["ad_screenshot_path"] = (
-                str(result.relative_to(prospect_root)).replace("\\", "/")
-            )
+            rel = str(result.relative_to(prospect_root)).replace("\\", "/")
+            ad["ad_screenshot_path"] = rel
+            ad["capture_status"] = "screenshot_playwright"
             captured += 1
         else:
-            errors.append(f"ad[{i}]: playwright capture skipped or failed for {lib_url}")
+            err = f"ad[{i}]: playwright capture skipped or failed for {lib_url}"
+            errors.append(err)
+            ad["capture_status"] = "playwright_failed"
+            ad["capture_error"] = err
 
     return {
         "captured": captured,

@@ -65,6 +65,16 @@ scheme + host (no trailing `/p`)."""
 PITCH_BASE_URL_ENV = "PITCH_BASE_URL"
 """Name of the env var that overrides DEFAULT_PUBLIC_BASE_URL at runtime."""
 
+PITCH_CONTACT_EMAIL_ENV = "PITCH_CONTACT_EMAIL"
+"""Env var holding the mailto destination for the interest-form fallback.
+Defaults to `hello@yuvostudio.com` when unset. Public; safe in HTML."""
+
+PITCH_FORM_ENDPOINT_ENV = "PITCH_FORM_ENDPOINT"
+"""Env var holding the optional Cloudflare Pages Function / Worker URL
+(typically `/api/interest`). When set, the interest form renders a
+real `<form method="POST">` instead of the mailto fallback. The
+frontend carries no secret; the endpoint reads its own bindings."""
+
 TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 """URL-safe alphabet for the private-slug token. ~36^6 = 2.2 B combinations."""
 
@@ -108,6 +118,21 @@ def _generate_token(length: int = TOKEN_LENGTH) -> str:
 def _compose_private_slug(brand_slug: str, token: str) -> str:
     """`<brand-slug>-<token>` - the user-facing route key."""
     return f"{brand_slug}-{token}"
+
+
+def _read_existing_status(manifest_path: Path) -> Optional[str]:
+    """Best-effort: return the `status` field of an existing manifest, or
+    None if the manifest is missing/unreadable. Used so that re-running
+    `build_microsite` after a deploy keeps the 'Live' banner instead of
+    silently downgrading the page back to 'draft'."""
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    s = data.get("status")
+    return s if isinstance(s, str) else None
 
 
 def _existing_token(manifest_path: Path) -> Optional[str]:
@@ -343,6 +368,34 @@ def resolve_public_base_url(override: Optional[str] = None) -> str:
     return raw.strip().rstrip("/")
 
 
+def resolve_contact_email(override: Optional[str] = None) -> Optional[str]:
+    """Pick the interest-form mailto destination.
+
+    Priority:
+      1. Explicit `override` argument.
+      2. `PITCH_CONTACT_EMAIL` env var.
+      3. None - `build_html_deck` substitutes its own DEFAULT_CONTACT_EMAIL.
+    """
+    raw = override if override is not None else os.environ.get(PITCH_CONTACT_EMAIL_ENV)
+    if not raw or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def resolve_form_endpoint(override: Optional[str] = None) -> Optional[str]:
+    """Pick the optional POST endpoint for the interest form.
+
+    Priority:
+      1. Explicit `override` argument.
+      2. `PITCH_FORM_ENDPOINT` env var.
+      3. None - the deck falls back to the mailto path.
+    """
+    raw = override if override is not None else os.environ.get(PITCH_FORM_ENDPOINT_ENV)
+    if not raw or not raw.strip():
+        return None
+    return raw.strip()
+
+
 def build_microsite(
     prospect_id: str,
     *,
@@ -350,6 +403,8 @@ def build_microsite(
     public_base_url: Optional[str] = None,
     brief: Optional[DeckBrief] = None,
     output_dir: Optional[Path] = None,
+    contact_email: Optional[str] = None,
+    form_endpoint: Optional[str] = None,
 ) -> dict:
     """Build the private microsite for `prospect_id` and return its manifest.
 
@@ -363,6 +418,15 @@ def build_microsite(
       5. Write `manifest.json`.
 
     Returns the manifest dict (also persisted at site/manifest.json).
+
+    Interest-form configuration:
+      `contact_email` - mailto destination for the MVP fallback. When
+        None, reads `PITCH_CONTACT_EMAIL` from the env, else defaults
+        to the public `hello@yuvostudio.com` baked into the renderer.
+      `form_endpoint` - optional Cloudflare Pages Function / Worker URL
+        (typically `/api/interest`). When set, the interest form posts
+        to it instead of opening mailto. Read from `PITCH_FORM_ENDPOINT`
+        when the kwarg is None.
     """
     if brief is None:
         brief = DeckBrief.from_audit(prospect_id, prospects_root=prospects_root)
@@ -391,11 +455,25 @@ def build_microsite(
     )
 
     # 4. Render HTML deck with noindex + optional preview embed.
+    # The 'public_url' here is the PLANNED URL (where the page will live
+    # once deployed). The HTML carries a draft banner that explicitly
+    # states the page is not deployed yet, so reviewers do not click an
+    # un-deployed link and hit a 404.
+    base = resolve_public_base_url(public_base_url)
+    planned_public_url = f"{base}/p/{private_slug}/"
+    existing_status = _read_existing_status(manifest_path)
+    render_status = existing_status if existing_status in ("draft", "deployed") else "draft"
     out_html = build_html_deck(
         site_brief,
         output_dir=site_dir,
         noindex=True,
         preview_video_url=preview_rel,
+        status=render_status,
+        public_url=planned_public_url if render_status == "deployed" else None,
+        contact_email=resolve_contact_email(contact_email),
+        form_endpoint=resolve_form_endpoint(form_endpoint),
+        prospect_id=prospect_id,
+        private_slug=private_slug,
     )
 
     # 5. Open-ad links list (one per ad in the brief).
@@ -411,8 +489,7 @@ def build_microsite(
         existing = {}
     created_at = existing.get("created_at") or datetime.now(timezone.utc).isoformat()
 
-    base = resolve_public_base_url(public_base_url)
-    public_url = f"{base}/p/{private_slug}/"
+    public_url = planned_public_url
 
     manifest: dict = {
         "prospect_id": prospect_id,

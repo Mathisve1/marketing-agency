@@ -373,3 +373,126 @@ def test_capture_ad_screenshots_respects_max_screenshots_cap(tmp_path: Path):
         a.get("ad_screenshot_path") for a in result["ads"] if a.get("ad_screenshot_path")
     ]
     assert len(captured_paths) == 3
+
+
+# --------------------------------------------------------------------------- #
+# V3 - per-ad capture metadata (capture_status, image_path_local, ...)
+# --------------------------------------------------------------------------- #
+
+
+def test_capture_sets_image_path_local_when_image_url_downloaded(tmp_path: Path):
+    """V3: when path-A downloads a static `image_url`, both
+    `ad_screenshot_path` AND `image_path_local` carry the relative path,
+    and `capture_status` reads as `download_image_url`. The deck builder
+    only uses ad_screenshot_path; the *_path_local mirrors are operator
+    breadcrumbs for distinguishing what kind of asset we have."""
+    from agents.outreach import ad_screenshots
+
+    ads = [{"ad_archive_id": "AD-A", "image_url": "https://cdn.example/i.png"}]
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(200, _png_bytes(), headers={"Content-Type": "image/png"})
+
+    with patch.object(ad_screenshots.requests, "get", fake_get):
+        result = ad_screenshots.capture_ad_screenshots(
+            "test-prospect-v3a", ads, prospects_root=tmp_path
+        )
+
+    out = result["ads"][0]
+    assert out["capture_status"] == "download_image_url"
+    assert out["image_path_local"] == out["ad_screenshot_path"]
+    assert "video_preview_path_local" not in out
+    assert "capture_error" not in out
+
+
+def test_capture_sets_video_preview_path_local_when_video_preview_used(tmp_path: Path):
+    """V3: when only `video_preview_image_url` is present, the orchestrator
+    downloads it and records `video_preview_path_local` + status
+    `download_video_preview`."""
+    from agents.outreach import ad_screenshots
+
+    ads = [
+        {
+            "ad_archive_id": "AD-V",
+            "video_preview_image_url": "https://cdn.example/preview.jpg",
+        }
+    ]
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(200, _png_bytes(), headers={"Content-Type": "image/jpeg"})
+
+    with patch.object(ad_screenshots.requests, "get", fake_get):
+        result = ad_screenshots.capture_ad_screenshots(
+            "test-prospect-v3b", ads, prospects_root=tmp_path
+        )
+
+    out = result["ads"][0]
+    assert out["capture_status"] == "download_video_preview"
+    assert out["video_preview_path_local"] == out["ad_screenshot_path"]
+    assert "image_path_local" not in out
+
+
+def test_capture_records_playwright_missing_status(tmp_path: Path):
+    """V3: when the ad has only a library URL and Playwright is not
+    installed, the orchestrator sets `capture_status='playwright_missing'`
+    and `capture_error` with the exact install commands."""
+    from agents.outreach import ad_screenshots
+
+    ads = [
+        {
+            "ad_archive_id": "AD-PW",
+            "ad_library_url": "https://www.facebook.com/ads/library/?id=AD-PW",
+        }
+    ]
+
+    with patch.object(ad_screenshots, "_playwright_available", lambda: False):
+        result = ad_screenshots.capture_ad_screenshots(
+            "test-prospect-v3c", ads, prospects_root=tmp_path
+        )
+
+    out = result["ads"][0]
+    assert out["capture_status"] == "playwright_missing"
+    assert "py -3.11 -m pip install playwright" in out["capture_error"]
+    assert "playwright install chromium" in out["capture_error"]
+
+
+def test_capture_records_no_url_status_when_nothing_to_screenshot(tmp_path: Path):
+    """V3: an ad with no image_url, no video preview, and no library URL
+    is recorded with `capture_status='no_url'` so the operator can audit
+    why nothing was captured."""
+    from agents.outreach import ad_screenshots
+
+    # No image_url, no video_preview_image_url, no ad_archive_id => no library URL.
+    ads = [{"page_name": "Some Brand"}]
+
+    result = ad_screenshots.capture_ad_screenshots(
+        "test-prospect-v3d", ads, prospects_root=tmp_path
+    )
+
+    out = result["ads"][0]
+    assert out["capture_status"] == "no_url"
+    assert "no URL to screenshot" in out["capture_error"]
+
+
+def test_capture_skipped_cap_status_on_overflow_ads(tmp_path: Path):
+    """V3: ads beyond the max_screenshots cap are marked `skipped_cap`
+    so it is obvious from audit.json why they don't have screenshots."""
+    from agents.outreach import ad_screenshots
+
+    ads = [
+        {"ad_archive_id": str(i), "image_url": f"https://cdn.example/{i}.png"}
+        for i in range(5)
+    ]
+
+    def fake_get(url, **kwargs):
+        return _FakeResp(200, _png_bytes(), headers={"Content-Type": "image/png"})
+
+    with patch.object(ad_screenshots.requests, "get", fake_get):
+        result = ad_screenshots.capture_ad_screenshots(
+            "test-prospect-v3e", ads, prospects_root=tmp_path, max_screenshots=2
+        )
+
+    statuses = [a.get("capture_status") for a in result["ads"]]
+    # First two captured, remaining three marked `skipped_cap`.
+    assert statuses[:2] == ["download_image_url", "download_image_url"]
+    assert statuses[2:] == ["skipped_cap", "skipped_cap", "skipped_cap"]

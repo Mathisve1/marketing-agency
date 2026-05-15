@@ -235,6 +235,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     account_id = os.environ["CLOUDFLARE_ACCOUNT_ID"]
     api_token = os.environ["CLOUDFLARE_API_TOKEN"]
 
+    if args.dry_run:
+        print()
+        print("#" * 60)
+        print("#  DRY-RUN MODE  -  NOTHING WILL BE UPLOADED TO CLOUDFLARE  #")
+        print("#  The public URL below WILL 404 until you run this again  #")
+        print("#  WITHOUT --dry-run.                                       #")
+        print("#" * 60)
+    else:
+        print()
+        print("=" * 60)
+        print("  REAL DEPLOY  -  uploading deploy package to Cloudflare    ")
+        print("  Pages now. Public URL should be reachable when this       ")
+        print("  finishes successfully.                                    ")
+        print("=" * 60)
+
     print("\n[deploy] calling wrangler...")
     result = deploy_to_cloudflare_pages(
         deploy_dir=deploy_root,
@@ -280,9 +295,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print()
     print("=" * 60)
-    print(f"DONE - prospect public URL: {manifest.get('public_url', '(unknown)')}")
+    if args.dry_run:
+        print("DRY-RUN COMPLETE - NO URL IS LIVE.")
+        print(
+            "The 'public_url' below is the planned location; it returns "
+            "404 until you re-run this script without --dry-run."
+        )
+    else:
+        print("DEPLOY COMPLETE - prospect public URL should now be reachable.")
+    print(f"  public_url   : {manifest.get('public_url', '(unknown)')}")
     if result.deployment_url:
-        print(f"      wrangler reports: {result.deployment_url}")
+        print(f"  wrangler url : {result.deployment_url}")
     print("=" * 60)
     return 0
 

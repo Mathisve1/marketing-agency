@@ -213,8 +213,16 @@ class DeckBrief:
         # Asset resolution + uniqueness budget.
         used_paths: set[Path] = set()
 
+        # Logo: looser file-size threshold (32x32 favicons are ~2-3 KB)
+        # plus a circle-safe check so a wide wordmark export never lands
+        # inside the small circular brand badge. When the brand has
+        # supplied a logo that fails the circle-safe check, the
+        # downstream renderer falls back to text initials - cleaner
+        # than a chopped-up wordmark.
         logo = _resolve_asset_path(bp.get("logo_path"), prospect_root)
-        if not _is_useful_image(logo):
+        if not _is_useful_logo(logo):
+            logo = None
+        if logo is not None and not _logo_is_circle_safe(logo):
             logo = None
         if logo:
             used_paths.add(logo)
@@ -227,18 +235,55 @@ class DeckBrief:
         )
         if not _is_useful_image(hero) or (hero is not None and hero in used_paths):
             hero = None
+        # Reject a logo-shaped image as the hero - a 32x32 favicon on a
+        # full-bleed hero background looks like a missing asset. Better to
+        # let the hero fall through to the designed mock.
+        if hero is not None and _looks_like_logo_path(hero):
+            hero = None
         if hero:
             used_paths.add(hero)
 
+        # Product images are NOT added to `used_paths` at collection
+        # time - that pre-claim caused every concept card to fall back
+        # to the empty phone mock (the concept builder's "not in
+        # used_paths" filter rejected all candidates). Instead, only
+        # the path actually consumed by a concept (or by the hero
+        # fallback) gets recorded in `used_paths`, so the asset can't
+        # be embedded twice across the deck. Within product_images
+        # itself we still dedupe so a brand_profile that lists the
+        # same URL twice doesn't double-render.
+        #
+        # V4: also filter out logo-shaped filenames. The brand-asset
+        # collector occasionally relabels a second logo file as a
+        # "product" image (when logo_path is already set), which then
+        # ends up rendered full-bleed on a concept card. That looks
+        # weak. When a path is logo-shaped AND the deck has no logo
+        # yet, we promote it to logo_path; otherwise we drop it from
+        # product_images entirely.
         product_images: list[Path] = []
+        product_seen: set[Path] = set()
         for raw in bp.get("product_images") or []:
             p = _resolve_asset_path(raw, prospect_root)
             if not _is_useful_image(p):
                 continue
             if p in used_paths:
+                # Logo/hero already used this path - skip so we don't
+                # surface the same file in the concept rail.
+                continue
+            if p in product_seen:
+                continue
+            if _looks_like_logo_path(p):
+                # Logo-shaped files dumped into product_images are
+                # almost always full-bleed wordmark exports (the YANA
+                # 400x457 'YANA_Logo_black' case). They don't crop
+                # cleanly into the circular brand badge AND they
+                # destroy concept frames when rendered full-bleed.
+                # Drop them entirely - operator can configure
+                # logo_path explicitly when a real circle-safe logo
+                # exists.
                 continue
             product_images.append(p)
-            used_paths.add(p)
+            product_seen.add(p)
 
         # Cover headline: niche-aware, brand-led.
         cover_headline = _build_cover_headline(prospect_name, niche)
@@ -353,6 +398,126 @@ def _is_useful_image(path: Optional[Path]) -> bool:
     return True
 
 
+def _is_useful_logo(path: Optional[Path]) -> bool:
+    """Logo / brand-mark variant of `_is_useful_image`.
+
+    Logos sit inside a small (~76 px) circular badge in the topbar.
+    A real 32x32 favicon export is often only 2-3 KB - well under the
+    4 KB threshold we use for hero/concept photos - but it still
+    renders beautifully in that badge. The bar for logos is just:
+    a real PNG/JPG/etc with at least a few hundred bytes of payload.
+    """
+    if path is None:
+        return False
+    suffix = path.suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    return size >= 500
+
+
+def _logo_is_circle_safe(path: Optional[Path]) -> bool:
+    """True when a logo asset is safe to embed in a small circular
+    brand badge without disastrous cropping.
+
+    Rules:
+      * approximately square (aspect ratio <= 1.4) so a horizontal
+        wordmark like 'YANA Active' doesn't get cropped into 4
+        unreadable letters by object-fit: cover.
+      * source dimensions <= 256 px on the long edge. Anything bigger
+        is almost always a full-bleed wordmark / lockup export
+        intended for header strips, not a circular badge.
+      * we fall back to True when Pillow isn't importable - the
+        downstream renderer's text-initials fallback is the only
+        safety net in that environment, and we don't want a missing
+        Pillow to silently strip legitimate small favicons from
+        every deck.
+    """
+    if path is None:
+        return False
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except Exception:
+        # Pillow missing: trust the file. The HTML side can still
+        # decide to render text initials instead via its own check.
+        return True
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+    except Exception:
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    long_edge = max(w, h)
+    short_edge = min(w, h)
+    if long_edge > 256:
+        return False
+    if short_edge == 0 or long_edge / short_edge > 1.4:
+        return False
+    return True
+
+
+# Tokens that, when present in a filename, mark the file as a brand mark
+# rather than a product / lifestyle photograph. We keep the list tight on
+# purpose - false positives in either direction (logo->concept, product->
+# logo) hurt visual quality more than the strict heuristic could.
+_LOGO_FILENAME_TOKENS = (
+    "logo",
+    "wordmark",
+    "word-mark",
+    "favicon",
+    "brandmark",
+    "brand-mark",
+    "apple-touch",
+    "icon-",
+    "_icon",
+    "site-icon",
+)
+
+
+def _looks_like_logo_path(path: Optional[Path]) -> bool:
+    """True when a Path's filename matches our logo/brand-mark heuristic.
+
+    This is the single source of truth used by:
+      * `_select_product_images()` - to keep logo files out of the
+        concept rail's main visual.
+      * Hero selection - to avoid hero panels that show a brand-mark on
+        a dark background instead of a real photograph.
+
+    The check is filename-based only. Image-dimension probing (favicons
+    are typically 16-256px square, real logos can be larger) would add
+    a Pillow open per asset on every deck build; the filename hint
+    catches the cases that actually hurt in practice (Shopify/Squarespace
+    auto-export filenames almost always carry 'logo' / 'favicon' /
+    'wordmark' in the path).
+    """
+    if path is None:
+        return False
+    name = path.name.lower()
+    return any(tok in name for tok in _LOGO_FILENAME_TOKENS)
+
+
+def _is_likely_logo_file(path: Optional[Path]) -> bool:
+    """Combined heuristic: filename token AND very small file size (a real
+    full-bleed photo is typically >50 KB; a vector logo PNG export is
+    usually well under that). The filename check by itself is sometimes
+    overzealous - this combined gate is the conservative form used when
+    we have to decide whether to PROMOTE a stray asset to logo_path.
+    """
+    if not _looks_like_logo_path(path):
+        return False
+    try:
+        size = path.stat().st_size  # type: ignore[union-attr]
+    except OSError:
+        return True
+    # Logos are usually flat vectors exported small; > 1 MB is almost
+    # certainly a hero photo with the word "logo" mistakenly in its name.
+    return size < 1_000_000
+
+
 def _clean_url(raw: Any) -> Optional[str]:
     """Return a clean http(s) URL or None."""
     if not isinstance(raw, str):
@@ -426,24 +591,23 @@ def _build_forty_five_second(
         FortyFiveSecondCard(
             label="What we'd make",
             body=(
-                "Three short-form video routes in your brand world - hook, "
-                "product proof, founder anchor - shot against assets you "
-                "already own, edited for paid social."
+                "Three short-form video routes built in your brand world - hook, "
+                "product proof, founder anchor - cut from assets you already own."
             ),
         ),
         FortyFiveSecondCard(
             label="What it costs to try",
             body=(
-                "GBP 90 for one finished route. GBP 260 for the starter trio "
-                "(three openings against one product). No retainer, no shoot day."
+                "GBP 90 for one finished route. GBP 260 for the starter trio: "
+                "three openings against one product, fixed price, pay per cut."
             ),
         ),
         FortyFiveSecondCard(
-            label="Why it is low-risk",
+            label="How we'd start",
             body=(
-                f"We use {name}'s existing imagery and brand voice. Two-round "
-                f"revisions. You keep every original asset. We only scale a "
-                f"route after it earns its place against your current ads."
+                f"We'd pick the strongest opening for {name} and ship one "
+                f"finished cut against your current best ad. You keep every "
+                f"original asset, every edit decision, every source file."
             ),
         ),
     ]
@@ -587,22 +751,32 @@ def _build_concepts(
     product_images: Sequence[Path],
     used_paths: set[Path],
 ) -> list[ConceptRoute]:
-    """Build up to 4 concept routes, each with at most one product image."""
+    """Build up to 4 concept routes, each with at most one product image.
+
+    `product_images` is the already-deduped list from the audit's
+    brand_profile (callers must NOT pre-add these paths to
+    `used_paths` - doing so caused every concept to fall back to the
+    empty phone mock).
+
+    Image assignment policy:
+      * Concept 0 gets product_images[0] when available.
+      * Concept 1 gets product_images[1] when available.
+      * ...etc, up to len(product_images).
+      * Concepts past the image count get `visual_path=None` and
+        render the designed-fallback frame (premium gradient + brand
+        monogram).
+      * Each assigned path is added to `used_paths` so the HTML
+        renderer's deck-wide dedup check sees them and never double-
+        embeds the same file across the deck.
+    """
     base = _concept_pack(prospect_name, niche)
     out: list[ConceptRoute] = []
-    img_iter = iter(product_images)
     for idx, c in enumerate(base[:4]):
         label = f"Route {chr(ord('A') + idx)}"
         visual: Optional[Path] = None
-        # Pull next unused product image off the queue.
-        while True:
-            cand = next(img_iter, None)
-            if cand is None:
-                break
-            if cand not in used_paths:
-                visual = cand
-                used_paths.add(cand)
-                break
+        if idx < len(product_images):
+            visual = product_images[idx]
+            used_paths.add(visual)
         out.append(
             ConceptRoute(
                 label=label,
@@ -673,8 +847,8 @@ def _build_cta(*, prospect_name: str) -> tuple[str, str]:
     name = _short_name(prospect_name)
     headline = f"Want to see one {name} video?"
     body = (
-        "Reply with 'send the route' and we will draft one short-form "
-        "cut against your strongest current ad - on us. No retainer, no "
-        "shoot day, two-round revisions."
+        "Reply with 'send the route' and we will draft one short-form cut "
+        "against your strongest current ad. Fixed price, two-round "
+        "revisions, original files yours."
     )
     return headline, body

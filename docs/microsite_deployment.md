@@ -168,6 +168,79 @@ The deploy script calls `wrangler pages deploy ...` via subprocess. If
 wrangler is on a non-standard path, set `WRANGLER_BIN` to the full
 path (e.g. `C:\Program Files\nodejs\wrangler.cmd`).
 
+## Interest form
+
+Every microsite carries a closing **"Want the first route?"** section
+with a name / email / preferred-times / message form. The form has two
+operating modes; the active mode is decided at build time by the env.
+
+### MVP mode: `mailto:` fallback
+
+When `PITCH_FORM_ENDPOINT` is unset (the default today), the form
+renders as a polished card whose submit button is a `mailto:` link
+pre-addressed to the configured contact email. Clicking the button
+opens the prospect's email client with:
+
+- Subject: `Interested in the first route for <Brand>`
+- Body: pre-filled `Brand: / Prospect ID: / Private slug: / Public URL:`
+  identifiers plus blank `Name / Email / Preferred call times / Message`
+  lines for the prospect to fill in.
+
+The only secret-shaped value in the HTML is the destination email,
+which is **public by design** (it is just a mailbox we already own).
+**No API token or credential ever ships in the HTML.**
+
+Configure the destination:
+
+```ini
+# .env
+PITCH_CONTACT_EMAIL=hello@yuvostudio.com   # defaults to this if unset
+```
+
+This works **today** with no Cloudflare configuration. Until we
+register a domain and set up Email Routing, this is the path we use.
+
+### Future mode: Cloudflare endpoint POST
+
+Once a backend endpoint exists at `/api/interest`, switch the form to
+real POST mode by setting:
+
+```ini
+# .env
+PITCH_FORM_ENDPOINT=/api/interest
+```
+
+When this is set, the form renders as a real
+`<form method="POST" action="/api/interest">` with hidden
+`prospect_id`, `private_slug`, `brand_name`, and `public_url` fields,
+plus a helper note that the submission "submits securely through our
+Cloudflare form endpoint". The mailto fallback is suppressed.
+
+#### Building the endpoint (separate task)
+
+The frontend is future-ready, but the backend endpoint is **not**
+shipped in this repo yet. Two paths are open when you build it:
+
+1. **Cloudflare Pages Function**: add `functions/api/interest.ts` to
+   the Pages project. Receives the form POST, validates fields,
+   and forwards via:
+   - **Cloudflare Email Routing `send_email` binding** - requires a
+     verified destination address on a verified zone. Today we have
+     neither, so this path is not yet usable.
+   - **Resend** (or any HTTP email API) - simpler to start with: store
+     the Resend API key as a Pages secret and call their REST API from
+     the function. No DNS work required.
+2. **Cloudflare Worker**: same idea, decoupled from the Pages project.
+   Useful if you want one shared endpoint across multiple microsites.
+
+In all cases the credential lives **only** in the Pages/Worker
+environment - the HTML carries no token. Until the endpoint is live,
+leave `PITCH_FORM_ENDPOINT` unset and the deck stays in mailto mode.
+
+> **We deliberately do not claim "automatic email" anywhere in the
+> deck until the backend endpoint is actually deployed and we have
+> tested it end-to-end with a real send.**
+
 ## robots.txt
 
 Add a single `robots.txt` at the deployment root before going live:

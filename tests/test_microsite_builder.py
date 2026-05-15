@@ -132,7 +132,8 @@ def test_preview_video_section_appears_when_watermarked_mp4_present(tmp_path: Pa
     _write_fake_video(prospect_root / "assets" / WATERMARKED_PREVIEW_FILENAME)
     manifest = build_microsite("acme-skincare", brief=brief)
     html = (prospect_root / "site" / "index.html").read_text(encoding="utf-8")
-    assert "Your first route preview" in html
+    # V3 section heading.
+    assert "Watermarked route preview" in html
     assert "Want the clean version?" in html
     assert "<video" in html
     assert manifest.get("preview_video_path") == f"assets/{WATERMARKED_PREVIEW_FILENAME}"
@@ -141,14 +142,21 @@ def test_preview_video_section_appears_when_watermarked_mp4_present(tmp_path: Pa
 
 def test_unwatermarked_preview_mp4_is_not_embedded(tmp_path: Path):
     """A bare `preview.mp4` must be ignored - only `_watermarked` files
-    are embedded. The microsite still renders without a video slide."""
+    are embedded. The preview SECTION still renders (as the simple
+    locked-frame placeholder) - what must not happen is an actual
+    `<video>` tag pointing at the unwatermarked file."""
     prospect_root, brief = _setup_prospect(tmp_path)
     # ONLY the bare preview.mp4 (no watermarked variant).
     _write_fake_video(prospect_root / "assets" / "preview.mp4")
     manifest = build_microsite("acme-skincare", brief=brief)
     html = (prospect_root / "site" / "index.html").read_text(encoding="utf-8")
-    assert "Your first route preview" not in html
+    # No <video> tag because no watermarked source exists.
     assert "<video" not in html
+    # Rollback after V7: the simple locked placeholder renders, not the
+    # storyboard-beat treatment.
+    assert "preview__storyboard-beat" not in html
+    assert "Your first route lives here" in html
+    assert 'id="preview-video"' in html
     assert "preview_video_path" not in manifest
     assert "watermarked_video" not in manifest
 

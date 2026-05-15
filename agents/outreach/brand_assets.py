@@ -406,10 +406,26 @@ def collect_brand_assets(
     for label, image_url in deduped:
         if written_total >= max_images:
             break
+        # V4: never silently demote a logo-shaped image to "product".
+        # That used to drop favicons + wordmark exports straight into
+        # the concept rail, producing weak full-bleed logo cards. If we
+        # already have a logo, skip the extra logo asset entirely.
         if label == "logo" and have_logo:
-            label = "product"
+            continue
         if label == "hero" and have_hero:
+            # A second "hero" candidate is fine to keep as a product
+            # photo - it's a real image we discovered, just not the
+            # primary one - so the previous relabel is preserved here.
             label = "product"
+        # Guard: even when our HTML scanner labelled the URL as "product"
+        # or "hero", a URL whose filename screams 'logo' / 'favicon' /
+        # 'wordmark' usually IS one. Re-route those to the logo slot
+        # (or skip when we already have a logo) rather than embedding a
+        # vector mark on a 9:16 phone frame later.
+        if label != "logo" and _looks_like_logo(image_url):
+            if have_logo:
+                continue
+            label = "logo"
         path = _download_image(
             image_url, assets_dir, label=label, timeout=timeout, user_agent=user_agent
         )
