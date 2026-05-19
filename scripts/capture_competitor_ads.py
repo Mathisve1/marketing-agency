@@ -405,6 +405,11 @@ def _capture_one_competitor(
     n_with_shot = 0
     for ad in captured_ads:
         tags, why_by_tag = _classify_ad(ad)
+        # Preserve any upstream video / image URLs the Apify normaliser
+        # surfaced. These are populated for VIDEO media_type ads and
+        # for some DCO cards; they're required by the production
+        # reference-video review surface (downstream operator wants to
+        # see the real video, not just the ads-library card).
         sampled_entry = {
             "ad_archive_id": str(ad.get("ad_archive_id") or "").strip(),
             "ad_library_url": (ad.get("ad_library_url") or "").strip() or None,
@@ -422,6 +427,11 @@ def _capture_one_competitor(
             ),
             "capture_status": ad.get("capture_status"),
             "capture_error": ad.get("capture_error"),
+            # ── video / image metadata (preserved when Apify provides) ──
+            "video_url": (ad.get("video_url") or "").strip() or None,
+            "video_preview_image_url": (ad.get("video_preview_image_url") or "").strip() or None,
+            "image_url": (ad.get("image_url") or "").strip() or None,
+            "image_urls": list(ad.get("image_urls") or []),
         }
         out["sampled_ads"].append(sampled_entry)
         if ad.get("ad_screenshot_path"):
