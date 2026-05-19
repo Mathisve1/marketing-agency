@@ -166,6 +166,12 @@ _RULES: tuple[Rule, ...] = (
 _ALLOW_LIST: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\.env\.example$", re.IGNORECASE),
     re.compile(r"^clients/_template/\.env\.example$", re.IGNORECASE),
+    # The Next dashboard ships its own .env.example template; only
+    # placeholder values + comments, no real keys (the real values live
+    # in web/.env.local, which is gitignored). Tracked since
+    # 4001fb9 "feat: add owner command center and agent workflow
+    # foundation".
+    re.compile(r"^web/\.env\.example$", re.IGNORECASE),
     re.compile(r"^evals/\.gitkeep$", re.IGNORECASE),
     re.compile(r"^prospects/\.gitkeep$", re.IGNORECASE),
     re.compile(r"^logs/\.gitkeep$", re.IGNORECASE),

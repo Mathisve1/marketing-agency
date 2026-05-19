@@ -216,8 +216,14 @@ python-multipart==0.0.28
     # via
     #   mcp
     #   streamlit
-pywin32==311
+pywin32==311 ; sys_platform == "win32"
     # via mcp
+    # CI fix: this lockfile was generated on Windows, where pip-compile
+    # drops conditional markers. mcp declares
+    # `pywin32>=310; sys_platform == 'win32'`, so we re-attach the marker
+    # by hand. Without it, `pip install -r requirements-lock.txt` fails
+    # on ubuntu-latest because there is no Linux wheel for pywin32.
+    # If you re-run `pip-compile`, re-apply this marker manually.
 pyyaml==6.0.3
     # via
     #   langchain-core
