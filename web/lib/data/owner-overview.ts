@@ -74,6 +74,7 @@ const CONTENT_ITEM_SELECT =
   "quality_tier, resolution, duration_sec, cost_estimate_credits, " +
   "cost_actual_credits, internal_raw_path, internal_audio_fixed_path, " +
   "internal_thumb_path, client_safe_poster_url, client_safe_video_url, " +
+  "client_safe_copy_preview, " +
   "shared_with_client, audio_fixer_triggered, audio_fixer_completed, " +
   "audio_fixer_credits_actual";
 
@@ -623,7 +624,13 @@ export type NextActionKind =
   // the right link to the operator on the dashboard.
   | "create_copy_draft"
   | "review_copy_draft"
-  | "ready_for_client_review_or_publish_later";
+  | "ready_for_client_review_or_publish_later"
+  // Phase 2H — client approval / change-request loop for non-video copy.
+  // Both reuse the existing client-feedback writes (no new schema, no
+  // email, no publishing); they only re-label + re-route the operator's
+  // follow-up so copy items don't appear as "publish video" actions.
+  | "revise_copy_from_client_feedback"
+  | "copy_approved_by_client";
 
 export interface NextAction {
   id: string;
@@ -656,6 +663,8 @@ const ACTION_KIND_LABELS: Record<NextActionKind, string> = {
   review_copy_draft: "Review & approve copy",
   ready_for_client_review_or_publish_later:
     "Ready for client review / publish (manual)",
+  revise_copy_from_client_feedback: "Revise copy from client feedback",
+  copy_approved_by_client: "Client approved copy (publish manual)",
 };
 
 export function nextActionLabel(kind: NextActionKind): string {
@@ -792,16 +801,26 @@ export function deriveOwnerNextActions(
           href: hrefOutputs,
         });
         break;
-      case "changes_requested_by_client":
+      case "changes_requested_by_client": {
+        // Phase 2H — non-video copy items go through the Copy Draft
+        // Agent path (re-draft + re-approve + re-share preview), not
+        // the prompt editor. Keep the video path on hrefPrompt.
+        const fmtCR = parseFormatFromPromptSummary(ci.promptSummary);
+        const isCopyCR = fmtCR !== null && COPY_FORMATS.has(fmtCR);
         out.push({
           id: `respond:${ci.id}`,
-          kind: "respond_to_feedback",
+          kind: isCopyCR
+            ? "revise_copy_from_client_feedback"
+            : "respond_to_feedback",
           priority: 1,
-          title: "Client requested changes",
+          title: isCopyCR
+            ? "Client requested changes (copy)"
+            : "Client requested changes",
           context: ci.title,
-          href: hrefPrompt,
+          href: isCopyCR ? "/agency/copy-drafts" : hrefPrompt,
         });
         break;
+      }
       case "draft":
         out.push({
           id: `approve:${ci.id}`,
@@ -812,15 +831,23 @@ export function deriveOwnerNextActions(
           href: hrefPrompt,
         });
         break;
-      case "approved_by_client":
+      case "approved_by_client": {
+        // Phase 2H — copy items route to /agency/copy-drafts with a
+        // copy-specific label so the dashboard doesn't imply a video
+        // publish step that doesn't exist for posts/email.
+        const fmtAP = parseFormatFromPromptSummary(ci.promptSummary);
+        const isCopyAP = fmtAP !== null && COPY_FORMATS.has(fmtAP);
         out.push({
           id: `publish:${ci.id}`,
-          kind: "publish_ready_video",
+          kind: isCopyAP ? "copy_approved_by_client" : "publish_ready_video",
           priority: 3,
-          title: "Client approved — ready to publish",
+          title: isCopyAP
+            ? "Client approved copy — publish is manual"
+            : "Client approved — ready to publish",
           context: ci.title,
-          href: hrefOutputs,
+          href: isCopyAP ? "/agency/copy-drafts" : hrefOutputs,
         });
+      }
         break;
     }
   }
@@ -1361,6 +1388,21 @@ export interface CopyDraftQueueItem {
   copyApprovedAt: string | null;
   /** Optional operator note from the approval block. */
   copyApprovalNotes: string | null;
+  /** Phase 2G — client-preview lifecycle for non-video copy items:
+   *    "none"               → no preview prepared yet
+   *    "prepared"           → preview text on file, NOT shared yet
+   *    "shared_with_client" → operator explicitly flipped
+   *                           `shared_with_client = true` via
+   *                           shareCopyPreviewWithClientAction
+   *  Derived from the [client copy preview] provenance block + the
+   *  content_items.shared_with_client flag. */
+  clientPreviewStatus: "none" | "prepared" | "shared_with_client";
+  /** ISO timestamp of the most recent prepare/share action. */
+  clientPreviewAt: string | null;
+  /** Phase 2G — the prepared preview text (operator-cleaned). May be
+   *  empty when no preview has been prepared. Read straight from
+   *  content_items.client_safe_copy_preview. */
+  clientPreviewText: string;
   /** Short preview of the current caption_draft. */
   captionPreview: string;
   /** Phase 2F — the full caption_draft, so the approve/edit panel can
@@ -1369,7 +1411,29 @@ export interface CopyDraftQueueItem {
   nextAction:
     | "create_copy_draft"
     | "review_copy_draft"
-    | "copy_approved_internal";
+    | "copy_approved_internal"
+    | "prepare_client_preview"
+    | "share_client_preview"
+    | "shared_with_client"
+    // Phase 2I — operator must revise from client feedback before any
+    // re-approval or re-share.
+    | "revise_from_client_feedback";
+  /** Phase 2I — latest client feedback row, if any. Surfaced so the
+   *  operator sees the change request inline with the queue item. */
+  latestClientFeedback: {
+    id: string;
+    body: string;
+    reason: string | null;
+    createdAt: string;
+  } | null;
+  /** Phase 2I — the open regeneration_request for this content item, if
+   *  any. Used to prime the revise action. */
+  openRegenerationRequest: {
+    id: string;
+    body: string;
+    reason: string | null;
+    createdAt: string;
+  } | null;
 }
 
 function parseTagFromSummary(
@@ -1413,6 +1477,77 @@ export async function listCopyDraftQueueForWorkspace(
     }
   }
 
+  // Phase 2I — batched fetch of latest client feedback + open regen
+  // request, keyed by content_item_id. Cheap workspace-scoped query;
+  // empty in demo mode.
+  const feedbackByContent = new Map<
+    string,
+    { id: string; body: string; reason: string | null; createdAt: string }
+  >();
+  const openRegenByContent = new Map<
+    string,
+    { id: string; body: string; reason: string | null; createdAt: string }
+  >();
+  if (getDataSource() === "supabase" && contentItems.length > 0) {
+    const supabase = getSupabaseServerClient();
+    const ids = contentItems.map((c) => c.id);
+    const { data: fbRows, error: fbErr } = await supabase
+      .from("content_feedback")
+      .select("id, content_item_id, body, author_kind, created_at")
+      .in("content_item_id", ids)
+      .eq("author_kind", "client")
+      .order("created_at", { ascending: false });
+    if (fbErr) {
+      throw new SupabaseDataError("listCopyDraftQueueForWorkspace", fbErr);
+    }
+    for (const r of (fbRows ?? []) as {
+      id: string;
+      content_item_id: string;
+      body: string;
+      created_at: string;
+    }[]) {
+      if (feedbackByContent.has(r.content_item_id)) continue;
+      // `body` may have a `[reason] body` prefix from joinReasonBody.
+      let reason: string | null = null;
+      let bareBody = r.body;
+      const m = r.body.match(/^\[([a-z_]+)\]\s*([\s\S]*)$/);
+      if (m) {
+        reason = m[1];
+        bareBody = m[2].trim();
+      }
+      feedbackByContent.set(r.content_item_id, {
+        id: r.id,
+        body: bareBody,
+        reason,
+        createdAt: r.created_at,
+      });
+    }
+    const { data: rqRows, error: rqErr } = await supabase
+      .from("regeneration_requests")
+      .select("id, content_item_id, body, reason, status, created_at")
+      .in("content_item_id", ids)
+      .eq("status", "open")
+      .order("created_at", { ascending: false });
+    if (rqErr) {
+      throw new SupabaseDataError("listCopyDraftQueueForWorkspace", rqErr);
+    }
+    for (const r of (rqRows ?? []) as {
+      id: string;
+      content_item_id: string;
+      body: string;
+      reason: string | null;
+      created_at: string;
+    }[]) {
+      if (openRegenByContent.has(r.content_item_id)) continue;
+      openRegenByContent.set(r.content_item_id, {
+        id: r.id,
+        body: r.body,
+        reason: r.reason,
+        createdAt: r.created_at,
+      });
+    }
+  }
+
   const items: CopyDraftQueueItem[] = [];
   for (const ci of contentItems) {
     const format = parseFormatFromPromptSummary(ci.promptSummary);
@@ -1433,12 +1568,56 @@ export async function listCopyDraftQueueForWorkspace(
       approvalStatusRaw === "approved_internal" ? "approved_internal" : "none";
     const copyApprovedAt = parseApprovalTimestamp(ci.promptSummary);
     const copyApprovalNotes = parseApprovalNotes(ci.promptSummary);
-    const nextAction: CopyDraftQueueItem["nextAction"] =
-      copyApprovalStatus === "approved_internal"
-        ? "copy_approved_internal"
-        : copyDrafted
-          ? "review_copy_draft"
-          : "create_copy_draft";
+
+    // Phase 2G — client-preview lifecycle. Three sources of truth:
+    //   1. `client_safe_copy_preview` column → preview text present
+    //   2. `[client copy preview]` block in prompt_summary →
+    //      operator's action timestamp + intent
+    //   3. content_items.status / shared_with_client → whether the
+    //      operator has explicitly flipped the share gate
+    //
+    // We treat status `shared_with_client`/`approved_by_client`/
+    // `changes_requested_by_client` as the post-share lifecycle.
+    const clientPreviewText = ci.clientSafeCopyPreview ?? "";
+    const previewBlockStatus = parseClientPreviewBlockStatus(ci.promptSummary);
+    const previewBlockAt = parseClientPreviewBlockTimestamp(ci.promptSummary);
+    const isSharedStatus =
+      ci.status === "shared_with_client" ||
+      ci.status === "approved_by_client" ||
+      ci.status === "changes_requested_by_client";
+    const clientPreviewStatus: CopyDraftQueueItem["clientPreviewStatus"] =
+      isSharedStatus && clientPreviewText
+        ? "shared_with_client"
+        : clientPreviewText
+          ? "prepared"
+          : previewBlockStatus === "prepared"
+            ? // Defensive: someone wrote a [client copy preview]
+              // block but the column is empty. Treat as not-yet
+              // prepared so the operator re-runs prepare.
+              "none"
+            : "none";
+
+    // Phase 2I — pull this item's open feedback / regen, if any.
+    const latestClientFeedback = feedbackByContent.get(ci.id) ?? null;
+    const openRegenerationRequest = openRegenByContent.get(ci.id) ?? null;
+    // The revise path takes priority over any other next-action when
+    // the client has asked for changes — operator must address them
+    // before the queue advances.
+    const needsRevise =
+      ci.status === "changes_requested_by_client" ||
+      openRegenerationRequest !== null;
+
+    let nextAction: CopyDraftQueueItem["nextAction"];
+    if (needsRevise) nextAction = "revise_from_client_feedback";
+    else if (!copyDrafted) nextAction = "create_copy_draft";
+    else if (copyApprovalStatus !== "approved_internal")
+      nextAction = "review_copy_draft";
+    else if (clientPreviewStatus === "none")
+      nextAction = "prepare_client_preview";
+    else if (clientPreviewStatus === "prepared")
+      nextAction = "share_client_preview";
+    else nextAction = "shared_with_client";
+
     items.push({
       contentItemId: ci.id,
       title: ci.title,
@@ -1453,13 +1632,53 @@ export async function listCopyDraftQueueForWorkspace(
       copyApprovalStatus,
       copyApprovedAt,
       copyApprovalNotes,
+      clientPreviewStatus,
+      clientPreviewAt: previewBlockAt,
+      clientPreviewText,
       captionPreview: (ci.captionDraft ?? "").slice(0, 160),
       captionDraftFull: ci.captionDraft ?? "",
       nextAction,
+      latestClientFeedback,
+      openRegenerationRequest,
     });
   }
   items.sort((a, b) => b.scheduledFor.localeCompare(a.scheduledFor));
   return { items, total: items.length };
+}
+
+// Phase 2G — local parsers for the [client copy preview] provenance
+// block written by web/lib/actions/copy-draft.ts. Same shape as the
+// approval-block parsers above; kept inline so the data layer is
+// self-contained.
+function parseClientPreviewBlockStatus(
+  promptSummary: string | null | undefined,
+): "prepared" | "shared_with_client" | null {
+  if (!promptSummary) return null;
+  // Marker's trailing "\n" is already consumed by the literal pattern;
+  // an additional `(?:^|\n)` anchor before the key would never match.
+  // Each key is followed by `:`, so the marker context alone is enough.
+  const m = promptSummary.match(
+    /\n\n\[client copy preview\]\n[\s\S]*?client_copy_preview_status:\s*([a-z_]+)/i,
+  );
+  if (!m) return null;
+  if (m[1] === "prepared") return "prepared";
+  if (m[1] === "shared_with_client") return "shared_with_client";
+  return null;
+}
+function parseClientPreviewBlockTimestamp(
+  promptSummary: string | null | undefined,
+): string | null {
+  if (!promptSummary) return null;
+  // Both prepared_at and shared_at use the same general shape — pick
+  // whichever appears, preferring the share timestamp over prepare.
+  const sharedAt = promptSummary.match(
+    /\n\n\[client copy preview\]\n[\s\S]*?client_copy_preview_shared_at:\s*([^\s\n]+)/i,
+  );
+  if (sharedAt) return sharedAt[1];
+  const preparedAt = promptSummary.match(
+    /\n\n\[client copy preview\]\n[\s\S]*?client_copy_preview_prepared_at:\s*([^\s\n]+)/i,
+  );
+  return preparedAt ? preparedAt[1] : null;
 }
 
 // Phase 2F — approval-block parsers. The block is written by
@@ -1471,8 +1690,11 @@ function parseApprovalStatus(
   promptSummary: string | null | undefined,
 ): string | null {
   if (!promptSummary) return null;
+  // Marker context provides enough anchoring; a `(?:^|\n)` before the
+  // key would never match (the marker already ate the only candidate
+  // newline) and would silently return null on real blocks.
   const m = promptSummary.match(
-    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approval_status:\s*([a-z_]+)/i,
+    /\n\n\[copy approval\]\n[\s\S]*?copy_approval_status:\s*([a-z_]+)/i,
   );
   return m ? m[1] : null;
 }
@@ -1481,7 +1703,7 @@ function parseApprovalTimestamp(
 ): string | null {
   if (!promptSummary) return null;
   const m = promptSummary.match(
-    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approved_at:\s*([^\s\n]+)/i,
+    /\n\n\[copy approval\]\n[\s\S]*?copy_approved_at:\s*([^\s\n]+)/i,
   );
   return m ? m[1] : null;
 }
@@ -1490,7 +1712,484 @@ function parseApprovalNotes(
 ): string | null {
   if (!promptSummary) return null;
   const m = promptSummary.match(
-    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approval_notes:\s*([^\n]+)/i,
+    /\n\n\[copy approval\]\n[\s\S]*?copy_approval_notes:\s*([^\n]+)/i,
   );
   return m ? m[1].trim() : null;
+}
+
+// ===========================================================================
+// Phase 2J - Unified Content Review Inbox (READ-ONLY).
+//
+// Composes existing queues (prompt-review, copy-draft, owner snapshot,
+// agent runs, regeneration requests) into a single prioritised stream
+// of operator review tasks. ZERO writes; ZERO provider calls. Every
+// row links into the matching domain page (jobs / prompt editor /
+// copy drafts / brand analysis) where the existing gates handle the
+// actual work.
+// ===========================================================================
+
+export type InboxItemKind =
+  | "failed_generation_job"
+  | "generated_video_needs_review"
+  | "prompt_draft_needs_review"
+  | "approved_prompt_ready_for_generation"
+  | "copy_draft_needs_review"
+  | "copy_client_requested_changes"
+  | "copy_approved_by_client"
+  | "copy_preview_ready_to_share"
+  | "video_client_requested_changes"
+  | "video_approved_by_client"
+  | "open_regeneration_request"
+  | "agent_run_completed"
+  | "content_item_missing_prompt"
+  | "calendar_item_needs_copy";
+
+export interface InboxItem {
+  id: string;
+  kind: InboxItemKind;
+  priority: 1 | 2 | 3;
+  title: string;
+  description: string;
+  brandName: string | null;
+  campaignName: string | null;
+  contentItemId: string | null;
+  status: string | null;
+  createdAt: string;
+  updatedAt: string;
+  href: string;
+  badgeLabel: string;
+  badgeTone: "neutral" | "info" | "warn" | "success" | "danger";
+  category:
+    | "video"
+    | "copy"
+    | "prompt"
+    | "client"
+    | "failed"
+    | "agent"
+    | "calendar";
+}
+
+export interface InboxSummary {
+  total: number;
+  urgent: number;
+  needsReview: number;
+  readyToShareOrGenerate: number;
+  clientDecisions: number;
+}
+
+const INBOX_KIND_LABELS: Record<InboxItemKind, string> = {
+  failed_generation_job: "Failed job",
+  generated_video_needs_review: "Video needs review",
+  prompt_draft_needs_review: "Prompt draft to review",
+  approved_prompt_ready_for_generation: "Prompt ready to queue",
+  copy_draft_needs_review: "Copy draft to review",
+  copy_client_requested_changes: "Client requested copy changes",
+  copy_approved_by_client: "Client approved copy",
+  copy_preview_ready_to_share: "Copy preview ready to share",
+  video_client_requested_changes: "Client requested video changes",
+  video_approved_by_client: "Client approved video",
+  open_regeneration_request: "Open client request",
+  agent_run_completed: "Agent run completed",
+  content_item_missing_prompt: "Item missing prompt",
+  calendar_item_needs_copy: "Calendar item needs copy",
+};
+
+function inboxCategorize(kind: InboxItemKind): InboxItem["category"] {
+  switch (kind) {
+    case "failed_generation_job":
+      return "failed";
+    case "generated_video_needs_review":
+    case "video_client_requested_changes":
+    case "video_approved_by_client":
+      return "video";
+    case "prompt_draft_needs_review":
+    case "approved_prompt_ready_for_generation":
+    case "content_item_missing_prompt":
+      return "prompt";
+    case "copy_draft_needs_review":
+    case "copy_client_requested_changes":
+    case "copy_approved_by_client":
+    case "copy_preview_ready_to_share":
+      return "copy";
+    case "open_regeneration_request":
+      return "client";
+    case "agent_run_completed":
+      return "agent";
+    case "calendar_item_needs_copy":
+      return "calendar";
+  }
+}
+
+/** Phase 2J read-only inbox. Composes the existing queues without
+ *  re-issuing their work. */
+export async function listAgencyInboxItemsForWorkspace(
+  workspaceId: string,
+): Promise<{ items: InboxItem[]; summary: InboxSummary }> {
+  const [snapshot, promptQueue, copyQueue] = await Promise.all([
+    getOwnerOverview(workspaceId),
+    listPromptReviewQueueForWorkspace(workspaceId),
+    listCopyDraftQueueForWorkspace(workspaceId),
+  ]);
+
+  const campaignById = new Map(snapshot.campaigns.map((c) => [c.id, c]));
+  const brandNameById = new Map<string, string>(
+    snapshot.brands.map((b) => [b.id, b.name]),
+  );
+  const contentItemById = new Map(snapshot.contentItems.map((c) => [c.id, c]));
+
+  const changeRequestedContentIds = new Set<string>();
+  const out: InboxItem[] = [];
+
+  function brandCampaignFor(
+    contentItemId: string | null,
+  ): { brandName: string | null; campaignName: string | null } {
+    if (!contentItemId) return { brandName: null, campaignName: null };
+    const ci = contentItemById.get(contentItemId);
+    if (!ci) return { brandName: null, campaignName: null };
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    return {
+      campaignName: camp?.title ?? null,
+      brandName: camp ? brandNameById.get(camp.brandId) ?? null : null,
+    };
+  }
+
+  function push(
+    partial: Omit<InboxItem, "badgeLabel" | "badgeTone" | "category">,
+  ): void {
+    const priorityTone: InboxItem["badgeTone"] =
+      partial.priority === 1
+        ? "danger"
+        : partial.priority === 2
+          ? "warn"
+          : "neutral";
+    const badgeTone: InboxItem["badgeTone"] =
+      partial.kind === "failed_generation_job"
+        ? "danger"
+        : partial.kind === "copy_approved_by_client" ||
+            partial.kind === "video_approved_by_client" ||
+            partial.kind === "approved_prompt_ready_for_generation"
+          ? "success"
+          : partial.kind === "agent_run_completed"
+            ? "info"
+            : priorityTone;
+    out.push({
+      ...partial,
+      badgeLabel: INBOX_KIND_LABELS[partial.kind],
+      badgeTone,
+      category: inboxCategorize(partial.kind),
+    });
+  }
+
+  // 1. Failed generation jobs (P1).
+  for (const j of snapshot.generationJobs) {
+    if (j.status !== "failed") continue;
+    const bc = brandCampaignFor(j.contentItemId);
+    push({
+      id: `failed_job:${j.id}`,
+      kind: "failed_generation_job",
+      priority: 1,
+      title: "Generation job failed",
+      description: j.errorMessage ?? `Provider ${j.provider} returned a failure.`,
+      brandName: bc.brandName,
+      campaignName: bc.campaignName,
+      contentItemId: j.contentItemId,
+      status: j.status,
+      createdAt: j.createdAt,
+      updatedAt: j.updatedAt,
+      href: `/agency/jobs/${j.id}`,
+    });
+  }
+
+  // 2. Completed jobs whose content item is still in operator-review.
+  const reviewableContentStatuses: ReadonlySet<ContentStatus> = new Set<
+    ContentStatus
+  >(["raw_ready", "audio_fixer_pending", "audio_fixed"]);
+  for (const j of snapshot.generationJobs) {
+    if (j.status !== "completed") continue;
+    const ci = contentItemById.get(j.contentItemId);
+    if (!ci || !reviewableContentStatuses.has(ci.status)) continue;
+    const bc = brandCampaignFor(j.contentItemId);
+    push({
+      id: `video_review:${j.id}`,
+      kind: "generated_video_needs_review",
+      priority: 1,
+      title: "Generated clip awaiting review",
+      description: `Content "${ci.title}" - status ${ci.status}.`,
+      brandName: bc.brandName,
+      campaignName: bc.campaignName,
+      contentItemId: j.contentItemId,
+      status: j.status,
+      createdAt: j.createdAt,
+      updatedAt: j.updatedAt,
+      href: `/agency/jobs/${j.id}`,
+    });
+  }
+
+  // 3. Copy queue projections.
+  for (const c of copyQueue.items) {
+    const bc = {
+      brandName: c.brandName,
+      campaignName: c.campaignName,
+    };
+    if (c.nextAction === "revise_from_client_feedback") {
+      changeRequestedContentIds.add(c.contentItemId);
+      const feedback = c.latestClientFeedback ?? c.openRegenerationRequest;
+      push({
+        id: `copy_changes:${c.contentItemId}`,
+        kind: "copy_client_requested_changes",
+        priority: 1,
+        title: `Client requested copy changes: ${c.title}`,
+        description: feedback
+          ? `${feedback.reason ? "(" + feedback.reason + ") " : ""}${feedback.body.slice(0, 200)}`
+          : `Content status: ${c.contentStatus}.`,
+        ...bc,
+        contentItemId: c.contentItemId,
+        status: c.contentStatus,
+        createdAt: feedback?.createdAt ?? c.scheduledFor,
+        updatedAt: feedback?.createdAt ?? c.scheduledFor,
+        href: "/agency/copy-drafts",
+      });
+    } else if (c.nextAction === "review_copy_draft") {
+      push({
+        id: `copy_review:${c.contentItemId}`,
+        kind: "copy_draft_needs_review",
+        priority: 2,
+        title: `Copy draft to review: ${c.title}`,
+        description: c.captionPreview || "Operator review the draft.",
+        ...bc,
+        contentItemId: c.contentItemId,
+        status: c.contentStatus,
+        createdAt: c.scheduledFor,
+        updatedAt: c.copyApprovedAt ?? c.scheduledFor,
+        href: "/agency/copy-drafts",
+      });
+    } else if (c.nextAction === "share_client_preview") {
+      push({
+        id: `copy_share:${c.contentItemId}`,
+        kind: "copy_preview_ready_to_share",
+        priority: 2,
+        title: `Copy preview ready to share: ${c.title}`,
+        description:
+          "Internally approved, preview prepared. Operator can share with client.",
+        ...bc,
+        contentItemId: c.contentItemId,
+        status: c.contentStatus,
+        createdAt: c.scheduledFor,
+        updatedAt: c.clientPreviewAt ?? c.scheduledFor,
+        href: "/agency/copy-drafts",
+      });
+    } else if (c.nextAction === "create_copy_draft") {
+      push({
+        id: `copy_missing:${c.contentItemId}`,
+        kind: "calendar_item_needs_copy",
+        priority: 2,
+        title: `Calendar item needs copy: ${c.title}`,
+        description: `${c.channel ?? "other"} - ${c.format ?? "feed_post"}`,
+        ...bc,
+        contentItemId: c.contentItemId,
+        status: c.contentStatus,
+        createdAt: c.scheduledFor,
+        updatedAt: c.scheduledFor,
+        href: "/agency/copy-drafts",
+      });
+    } else if (c.contentStatus === "approved_by_client") {
+      push({
+        id: `copy_approved:${c.contentItemId}`,
+        kind: "copy_approved_by_client",
+        priority: 3,
+        title: `Client approved copy: ${c.title}`,
+        description: "Publishing is manual - no email or social posting wired.",
+        ...bc,
+        contentItemId: c.contentItemId,
+        status: c.contentStatus,
+        createdAt: c.scheduledFor,
+        updatedAt: c.copyApprovedAt ?? c.scheduledFor,
+        href: "/agency/copy-drafts",
+      });
+    }
+  }
+
+  // 4. Video-side client decisions.
+  for (const ci of snapshot.contentItems) {
+    const fmt = parseFormatFromPromptSummary(ci.promptSummary);
+    const isCopy = fmt !== null && COPY_FORMATS.has(fmt);
+    if (isCopy) continue;
+    if (changeRequestedContentIds.has(ci.id)) continue;
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    const bc = {
+      brandName: camp ? brandNameById.get(camp.brandId) ?? null : null,
+      campaignName: camp?.title ?? null,
+    };
+    const hrefOutputs = camp
+      ? `/agency/campaigns/${camp.id}/outputs`
+      : "/agency";
+    const hrefPrompt = camp
+      ? `/agency/campaigns/${camp.id}/content/${ci.id}/prompt`
+      : "/agency";
+    if (ci.status === "changes_requested_by_client") {
+      changeRequestedContentIds.add(ci.id);
+      push({
+        id: `video_changes:${ci.id}`,
+        kind: "video_client_requested_changes",
+        priority: 1,
+        title: `Client requested video changes: ${ci.title}`,
+        description: "Open the prompt editor / regeneration request.",
+        ...bc,
+        contentItemId: ci.id,
+        status: ci.status,
+        createdAt: ci.scheduledFor,
+        updatedAt: ci.scheduledFor,
+        href: hrefPrompt,
+      });
+    } else if (ci.status === "approved_by_client") {
+      push({
+        id: `video_approved:${ci.id}`,
+        kind: "video_approved_by_client",
+        priority: 3,
+        title: `Client approved video: ${ci.title}`,
+        description: "Publishing path is manual / out of scope.",
+        ...bc,
+        contentItemId: ci.id,
+        status: ci.status,
+        createdAt: ci.scheduledFor,
+        updatedAt: ci.scheduledFor,
+        href: hrefOutputs,
+      });
+    }
+  }
+
+  // 5. Prompt review queue.
+  for (const p of promptQueue.items) {
+    const bc = {
+      brandName: p.brandName,
+      campaignName: p.campaignName,
+    };
+    if (p.nextAction === "review_prompt_draft") {
+      push({
+        id: `prompt_review:${p.contentItemId}`,
+        kind: "prompt_draft_needs_review",
+        priority: 2,
+        title: `Prompt draft to review: ${p.title}`,
+        description: `Latest version status: ${p.latestPromptStatus ?? "-"}`,
+        ...bc,
+        contentItemId: p.contentItemId,
+        status: p.contentStatus,
+        createdAt: p.scheduledFor,
+        updatedAt: p.latestUpdatedAt,
+        href: p.editorHref,
+      });
+    } else if (p.nextAction === "create_generation_job") {
+      push({
+        id: `prompt_ready:${p.contentItemId}`,
+        kind: "approved_prompt_ready_for_generation",
+        priority: 2,
+        title: `Prompt approved - ready to queue: ${p.title}`,
+        description:
+          "Operator can create a generation job from the prompt editor.",
+        ...bc,
+        contentItemId: p.contentItemId,
+        status: p.contentStatus,
+        createdAt: p.scheduledFor,
+        updatedAt: p.latestUpdatedAt,
+        href: p.editorHref,
+      });
+    } else if (p.nextAction === "create_prompt_draft") {
+      push({
+        id: `prompt_missing:${p.contentItemId}`,
+        kind: "content_item_missing_prompt",
+        priority: 2,
+        title: `Item missing prompt: ${p.title}`,
+        description: "Start a prompt draft from the editor or agent.",
+        ...bc,
+        contentItemId: p.contentItemId,
+        status: p.contentStatus,
+        createdAt: p.scheduledFor,
+        updatedAt: p.latestUpdatedAt,
+        href: p.editorHref,
+      });
+    }
+  }
+
+  // 6. Open regeneration_requests (de-duped against change-request items).
+  for (const r of snapshot.regenerationRequests) {
+    if (r.status !== "open") continue;
+    if (changeRequestedContentIds.has(r.contentItemId)) continue;
+    const ci = contentItemById.get(r.contentItemId);
+    if (!ci) continue;
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    const fmt = parseFormatFromPromptSummary(ci.promptSummary);
+    const isCopy = fmt !== null && COPY_FORMATS.has(fmt);
+    push({
+      id: `regen:${r.id}`,
+      kind: "open_regeneration_request",
+      priority: 1,
+      title: `Open regeneration request: ${ci.title}`,
+      description: `${r.reason ? "(" + r.reason + ") " : ""}${r.body.slice(0, 200)}`,
+      brandName: camp ? brandNameById.get(camp.brandId) ?? null : null,
+      campaignName: camp?.title ?? null,
+      contentItemId: r.contentItemId,
+      status: r.status,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      href: isCopy
+        ? "/agency/copy-drafts"
+        : camp
+          ? `/agency/campaigns/${camp.id}/content/${ci.id}/prompt`
+          : "/agency/prompt-review",
+    });
+  }
+
+  // 7. Recent completed agent runs (P3, capped at 5).
+  let agentCount = 0;
+  for (const a of snapshot.agentRuns) {
+    if (agentCount >= 5) break;
+    if (a.status !== "completed") continue;
+    agentCount++;
+    const url =
+      a.input && typeof a.input === "object"
+        ? String(
+            (a.input as Record<string, unknown>).productUrl ?? "(no url)",
+          )
+        : "(no url)";
+    push({
+      id: `agent:${a.id}`,
+      kind: "agent_run_completed",
+      priority: 3,
+      title: "Agent run completed",
+      description: url.slice(0, 200),
+      brandName: null,
+      campaignName: null,
+      contentItemId: null,
+      status: a.status,
+      createdAt: a.createdAt,
+      updatedAt: a.updatedAt,
+      href: "/agency/agents/brand-analysis",
+    });
+  }
+
+  out.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return b.updatedAt.localeCompare(a.updatedAt);
+  });
+
+  const summary: InboxSummary = {
+    total: out.length,
+    urgent: out.filter((i) => i.priority === 1).length,
+    needsReview: out.filter((i) => i.priority === 2).length,
+    readyToShareOrGenerate: out.filter(
+      (i) =>
+        i.kind === "approved_prompt_ready_for_generation" ||
+        i.kind === "copy_preview_ready_to_share",
+    ).length,
+    clientDecisions: out.filter(
+      (i) =>
+        i.kind === "copy_approved_by_client" ||
+        i.kind === "video_approved_by_client" ||
+        i.kind === "copy_client_requested_changes" ||
+        i.kind === "video_client_requested_changes" ||
+        i.kind === "open_regeneration_request",
+    ).length,
+  };
+
+  return { items: out, summary };
 }

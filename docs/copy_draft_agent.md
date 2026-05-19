@@ -216,11 +216,273 @@ These would replace the parsing logic in
 direct column read. Phase 2F intentionally does NOT apply this
 migration.
 
+## Phase 2G — Client-review preparation (INTERNAL → CLIENT PORTAL ONLY)
+
+Phase 2F ended at "operator has approved this copy internally". Phase
+2G adds two further steps so the operator can show the approved copy
+to the client in the portal — still without email, publishing, or
+any social-platform integration. See
+[`docs/non_video_client_review_flow.md`](./non_video_client_review_flow.md)
+for the end-to-end flow.
+
+### New column + view (migration 009)
+
+`content_items.client_safe_copy_preview text` — operator-set, NULL
+until prepared. `client_content_items_v` rebuilt to project this
+column alongside the existing fields. The view does NOT add any
+operator-only columns; the safety guarantee from migrations 001 +
+006 is preserved.
+
+### Actions (web/lib/actions/copy-draft.ts)
+
+- `prepareClientCopyPreviewAction({ contentItemId, clientSafeCopyPreview?, operatorNotes? })`
+  - Requires `copy_approval_status: approved_internal` first.
+  - Writes ONLY `client_safe_copy_preview` (and a
+    `[client copy preview]` provenance block in `prompt_summary`).
+  - NEVER flips `shared_with_client`, status, video/poster URLs,
+    caption_draft, or any cost/internal column.
+- `shareCopyPreviewWithClientAction({ contentItemId, confirmationToken, operatorNotes? })`
+  - Requires the literal token `SHARE COPY` to confirm.
+  - Refuses to run when no `client_safe_copy_preview` is on file.
+  - Flips `shared_with_client = true` AND `status = 'shared_with_client'`
+    together (the schema check constraint
+    `content_items_shared_flag_consistent` requires both).
+  - NEVER sends email, NEVER publishes to any social platform, NEVER
+    calls Seedance / Enhancor / Audio Fixer / any paid API, NEVER
+    creates a generation_jobs / prompt_versions / generated_assets /
+    audio_fixer_jobs row, NEVER touches `client_safe_video_url`.
+
+### UI
+
+`/agency/copy-drafts` now mounts a `ClientPreviewPanel` next to the
+existing `CopyDraftPanel` + `CopyApprovalPanel`. The panel is gated:
+preparation is disabled until the copy is approved internally;
+sharing is disabled until the preview is on file and the operator
+types `SHARE COPY`.
+
+### Client portal
+
+`web/app/client/[portalSlug]/content/[contentId]/page.tsx` now
+branches: for items where `mediaType === "none"` and a
+`clientSafeCopyPreview` is on file, it renders the preview text
+(via `<pre>` to preserve whitespace) instead of the video player +
+raw caption. For video items the existing layout is unchanged.
+
+## Phase 2H — Client approval / change-request loop for copy
+
+Status: shipped, **no new schema, no new actions**. The existing
+client-feedback infrastructure (Phase 1D/1O) handles copy items
+without modification:
+
+- Route: `POST /api/portal/feedback` (action handler at
+  `web/app/api/portal/feedback/route.ts`).
+- Actions: `approveContentAction`, `requestChangesContentAction`,
+  `commentContentAction` in `web/lib/actions/client-feedback.ts`.
+- Component: `ClientFeedbackPanel` (renders Approve / Request changes
+  / Comment buttons under whatever the page surfaces — video player OR
+  copy preview).
+- Tables: writes to `content_approvals` / `content_feedback` /
+  optionally `regeneration_requests`, and `bumpStatus` flips
+  `content_items.status` to `approved_by_client` or
+  `changes_requested_by_client`.
+
+None of those touch `client_safe_video_url`, video assets, generation
+jobs, Audio Fixer, or any provider. The same code path works for a
+copy-only item because the actions only know about content items, not
+media types.
+
+### How Phase 2G + 2H compose at the client portal
+
+For a copy-only content item:
+
+1. Phase 2G's page branch renders the `client_safe_copy_preview` text
+   (no player) and `ClientFeedbackPanel` below it.
+2. The client clicks **Approve** or **Request changes** in that panel.
+3. The route handler routes to `approveContentAction` or
+   `requestChangesContentAction`. Inserts the row, flips
+   `content_items.status`, revalidates the page.
+4. The dashboard's next-action surface picks up the new status (see
+   below).
+
+### Operator follow-up — Owner Command Center routing (Phase 2H)
+
+`deriveOwnerNextActions` (`web/lib/data/owner-overview.ts`) parses
+`format:` from `prompt_summary`. New `NextActionKind` values:
+
+- `revise_copy_from_client_feedback` — emitted when status is
+  `changes_requested_by_client` AND format is a copy format. Priority
+  1, links to `/agency/copy-drafts`.
+- `copy_approved_by_client` — emitted when status is
+  `approved_by_client` AND format is a copy format. Priority 3, links
+  to `/agency/copy-drafts`. Label: "Client approved copy — publish is
+  manual". (Publishing is deliberately out of scope.)
+
+Video items keep the previous `respond_to_feedback` /
+`publish_ready_video` routing.
+
+### How it differs from video review
+
+The wire / action contract is identical. The differences are only:
+
+| | video item | copy item |
+|---|---|---|
+| What the client sees | `<video>` + thumbnail | `<pre>` copy preview |
+| Source of preview | `client_safe_video_url` | `client_safe_copy_preview` |
+| Next action on approval | "Ready to publish" → outputs | "Client approved copy" → copy-drafts |
+| Next action on changes | "Respond to client feedback" → prompt editor | "Revise copy from client feedback" → copy-drafts |
+| What "publish" means | upload / scheduled push (not built) | post / email (not built) |
+
+In both cases the dashboard never publishes or sends — that gate is
+explicitly deferred.
+
+### Live verification (Phase 2H, approve path)
+
+Content item `5d11c478-68c0-4ec6-b2a5-62dbefeb9515` (Phase 2G copy
+item, was `status=shared_with_client`):
+
+- `content_approvals` row `a4710e2d…` created, `decision=approved`,
+  `actor_kind=client`.
+- `content_items.status` → `approved_by_client`,
+  `shared_with_client=true`, `client_safe_video_url=null` (unchanged),
+  `client_safe_copy_preview` unchanged (431 chars), `prompt_summary`
+  unchanged (no leak).
+- `client_content_items_v` still does NOT project `prompt_summary` and
+  still projects the copy preview.
+- `generation_jobs`, `prompt_versions`, `generated_assets`,
+  `audio_fixer_jobs` byte-identical pre/post.
+
+### Request-changes path (documented, not exercised on the same row)
+
+Identical wire path via the same handler with `action: "request_changes"`:
+
+- Inserts `content_feedback` row.
+- Optionally inserts `regeneration_requests` row (existing behavior).
+- Bumps status to `changes_requested_by_client`.
+- Owner Command Center surfaces `revise_copy_from_client_feedback`
+  pointing at `/agency/copy-drafts`.
+
+Not executed on `5d11c478…` because it would conflict with the
+approve we just ran. To test it cleanly: run on a fresh non-video
+draft + shared item.
+
+## Phase 2I — Revise copy from client feedback
+
+Status: shipped. Single new action; no new schema. Strips and rewrites
+provenance via the audited Phase 2E path.
+
+Action: `reviseCopyDraftFromClientFeedbackAction` in
+`web/lib/actions/copy-draft.ts`.
+
+Input: `contentItemId`, optional `feedbackId` /
+`regenerationRequestId` overrides, optional `operatorNotes`.
+
+Behavior:
+
+1. Load the content item, validate format is a copy format (rejects
+   video formats which use the prompt-version flow).
+2. Resolve sources: explicit `feedbackId` / `regenerationRequestId` if
+   given, otherwise pick the latest client `content_feedback` + the
+   open `regeneration_requests` row. At least one source is required
+   (the action refuses to "revise" without a change request to
+   address — re-run the regular Copy Draft Agent for blank slate).
+3. Compose a revision brief (≤500 chars) combining
+   feedback/regen reason + body + the operator note, prefixed with
+   `[revise from client feedback]`.
+4. Delegate to `createCopyDraftForContentItemAction({contentItemId,
+   operatorNotes: revisionBrief})`. `stripCopyBlock` there removes the
+   prior `[copy draft]` AND every block after it — including
+   `[copy approval]` (Phase 2F) and `[client copy preview]` (Phase
+   2G). The freshly-written `[copy draft]` block is now the only
+   provenance block on the row.
+5. Single atomic UPDATE: `status='draft'`, `shared_with_client=false`.
+   The `content_items_shared_flag_consistent` CHECK is satisfied
+   because both columns flip together. The row drops out of
+   `client_content_items_v` (status=draft is not in
+   `CLIENT_VISIBLE_STATUSES`).
+6. Best-effort: mark the consumed `regeneration_requests.status =
+   'accepted'`. A failure here is non-fatal — the revision itself
+   landed; the next manual review can clear an open row.
+
+Result: `{ok, newCopyText, newStatus, regenerationRequestAccepted,
+approvalAndPreviewStripped, usedFeedbackId, usedRegenerationRequestId}`.
+
+### Why approval + preview must be repeated
+
+A revised draft has never been internally reviewed and has never had a
+new client preview prepared. Re-running Phase 2F approval and Phase 2G
+prepare→share is therefore mandatory before anything the client sees
+reflects the revision. The action enforces this implicitly: by
+stripping the two blocks AND flipping status back to `draft`, the
+queue's `nextAction` reverts to `review_copy_draft` (the operator
+must approve again) and then `prepare_client_preview` →
+`share_client_preview`.
+
+### UI
+
+`/agency/copy-drafts` queue helper now batch-fetches per-item:
+`content_feedback.author_kind='client'` (latest) and
+`regeneration_requests.status='open'` (latest). New panel
+`CopyRevisionPanel` renders before `CopyDraftPanel` only when the item
+is `changes_requested_by_client` or has an open feedback/regen row.
+The panel shows the client's words + reason + a "Revise copy from
+client feedback" button + an optional operator note. After success,
+the revised caption_draft is shown inline.
+
+Queue `nextAction` now has a `revise_from_client_feedback` value that
+takes precedence over `review_copy_draft` / `prepare_client_preview` /
+`share_client_preview` so this work is always at the top of the queue
+for an affected item.
+
+### Live verification (Phase 2I)
+
+Fresh copy item `b920e5e2-a67d-45ca-96c9-f9422218d675` (format
+`feed_post`, channel `facebook`):
+
+1. Inserted with `status=shared_with_client`, full
+   `[copy draft]` + `[copy approval]` + `[client copy preview]`
+   provenance, populated `client_safe_copy_preview`.
+2. Simulated client request-changes:
+   `content_feedback` `a12d0953-…` with `[wrong_tone]` reason,
+   `content_approvals` `decision=changes_requested`,
+   `regeneration_requests` `1d4848b2-…` `status=open`,
+   `reason=wrong_tone`, `content_items.status →
+   changes_requested_by_client`.
+3. Revise applied:
+   - `caption_draft` rewritten (504 chars) with the operator-revision
+     brief.
+   - `[copy approval]` block stripped ✓
+   - `[client copy preview]` block stripped ✓
+   - `content_items.status → draft`, `shared_with_client → false` ✓
+   - `regeneration_requests.status → accepted` ✓
+4. Safety invariants:
+   - `generation_jobs / prompt_versions / generated_assets /
+     audio_fixer_jobs` byte-identical pre/post.
+   - `client_content_items_v` no longer returns the row
+     (draft + not shared falls outside the client view).
+   - `client_safe_video_url` stayed `null` throughout.
+
+### Hard guarantees preserved
+
+- **No Seedance / Enhancor / Audio Fixer / paid API.**
+- **No email / no publishing.**
+- **No `generation_jobs` / `prompt_versions` / `generated_assets` /
+  `audio_fixer_jobs` rows** created or mutated.
+- **No automatic client share.** The revised draft is hidden from the
+  client portal by `client_content_items_v`'s status filter; the
+  operator must re-approve (Phase 2F) and re-prepare + re-share
+  (Phase 2G) before the client sees anything.
+- Client-portal boundary intact: `prompt_summary` is still not
+  projected by the client view; the revision brief lives inside the
+  `[copy draft]` block in that operator-only column.
+
 ## Future improvements
 
 - Brand-voice memory (persisted tone/voice per brand).
 - Multiple copy variants per item + pick-one.
 - Platform-specific constraints (char limits, hashtag caps, link rules).
-- Client-review preparation for non-video items (the recommended next
-  phase — see above).
+- Multiple revision variants per feedback (operator picks the best).
+- Diff view between previous and revised `caption_draft`.
+- Surface feedback categories more richly (group by `reason`).
+- Claude Code handoff for deeper rewriting when the deterministic
+  template is too generic for the feedback.
 - Publishing integrations (per-platform, behind OAuth + explicit gate).

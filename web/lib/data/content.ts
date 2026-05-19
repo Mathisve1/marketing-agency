@@ -30,10 +30,14 @@ import { SupabaseDataError, getDataSource } from "./_source";
 // Exact column list of the view. Re-stating it here gives us the same
 // belt-and-braces guarantee as the view itself. Phase 1O adds
 // `client_safe_video_url` (operator-shared MP4 URL).
+// Phase 2G — adds `client_safe_copy_preview` (migration 009). The
+// view projects this column for non-video copy items so the portal
+// can render a clean preview instead of the raw Copy Draft Agent
+// markup that lives in caption_draft.
 const CLIENT_CONTENT_SELECT =
   "id, campaign_id, content_calendar_id, title, status, scheduled_for, " +
   "platforms, hook_text, caption_draft, client_safe_poster_url, " +
-  "client_safe_video_url, duration_sec";
+  "client_safe_video_url, client_safe_copy_preview, duration_sec";
 
 /** What the client portal layout + overview pages need.
  *  No operator-internal brand fields. */

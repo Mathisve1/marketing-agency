@@ -50,6 +50,18 @@ export default async function ClientContentDetail({ params }: PageProps) {
       })
     : null;
 
+  // Phase 2G — split the layout based on whether this is a video
+  // item or a non-video copy item. Non-video items skip the
+  // <video>/<image> player entirely and render the operator-prepared
+  // `clientSafeCopyPreview` as the primary surface. The raw
+  // caption_draft is NEVER shown for non-video items because it
+  // contains operator-internal Copy Draft Agent markup; the client
+  // sees only the clean preview the operator explicitly prepared.
+  const isCopyOnly =
+    view.mediaType === "none" &&
+    typeof view.clientSafeCopyPreview === "string" &&
+    view.clientSafeCopyPreview.trim() !== "";
+
   return (
     <div className="space-y-6">
       <div>
@@ -67,61 +79,114 @@ export default async function ClientContentDetail({ params }: PageProps) {
           <span className="text-xs text-[color:var(--color-ink-muted)]">
             {platforms}
             {scheduled && <> · scheduled {scheduled}</>}
-            {view.durationSec ? <> · {view.durationSec}s</> : null}
+            {!isCopyOnly && view.durationSec ? (
+              <> · {view.durationSec}s</>
+            ) : null}
           </span>
         </div>
       </div>
 
-      <div className="grid lg:grid-cols-[360px_1fr] gap-6 items-start">
-        <ClientReviewPlayer
-          videoUrl={view.videoUrl}
-          posterUrl={view.posterUrl}
-          mediaType={view.mediaType}
-          title={view.title}
-          durationSec={view.durationSec}
-        />
-        <div className="space-y-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Review this video</CardTitle>
-            </CardHeader>
-            <CardBody className="space-y-3">
-              <p className="text-sm text-[color:var(--color-ink-muted)]">
-                Watch the clip on the left, then approve, request changes,
-                or leave a comment below. Your feedback goes directly to
-                the Yuvo team.
-              </p>
-              <ClientFeedbackPanel
-                portalSlug={portalSlug}
-                contentId={contentId}
-                initialStatus={view.status}
-                initialComments={clientVisibleComments}
-                isLive={isLive}
-              />
-            </CardBody>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Hook</CardTitle>
-            </CardHeader>
-            <CardBody>
-              <p className="text-sm leading-relaxed">{view.hook}</p>
-            </CardBody>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Caption draft</CardTitle>
-            </CardHeader>
-            <CardBody>
-              <p className="text-sm leading-relaxed text-[color:var(--color-ink-muted)]">
-                {view.captionDraft}
-              </p>
-            </CardBody>
-          </Card>
+      {isCopyOnly ? (
+        // Non-video copy layout: single-column, no media player. The
+        // <pre> preserves whitespace from the operator-prepared
+        // preview (line breaks, lists, paragraph spacing).
+        <div className="grid lg:grid-cols-[1fr_360px] gap-6 items-start">
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Preview</CardTitle>
+              </CardHeader>
+              <CardBody>
+                <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed font-sans">
+                  {view.clientSafeCopyPreview}
+                </pre>
+              </CardBody>
+            </Card>
+            {view.hook && (
+              <Card>
+                <CardHeader>
+                  <CardTitle>Hook</CardTitle>
+                </CardHeader>
+                <CardBody>
+                  <p className="text-sm leading-relaxed">{view.hook}</p>
+                </CardBody>
+              </Card>
+            )}
+          </div>
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Review this post</CardTitle>
+              </CardHeader>
+              <CardBody className="space-y-3">
+                <p className="text-sm text-[color:var(--color-ink-muted)]">
+                  Read the preview, then approve, request changes, or
+                  leave a comment below. Your feedback goes directly to
+                  the Yuvo team — nothing is published yet.
+                </p>
+                <ClientFeedbackPanel
+                  portalSlug={portalSlug}
+                  contentId={contentId}
+                  initialStatus={view.status}
+                  initialComments={clientVisibleComments}
+                  isLive={isLive}
+                />
+              </CardBody>
+            </Card>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="grid lg:grid-cols-[360px_1fr] gap-6 items-start">
+          <ClientReviewPlayer
+            videoUrl={view.videoUrl}
+            posterUrl={view.posterUrl}
+            mediaType={view.mediaType}
+            title={view.title}
+            durationSec={view.durationSec}
+          />
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Review this video</CardTitle>
+              </CardHeader>
+              <CardBody className="space-y-3">
+                <p className="text-sm text-[color:var(--color-ink-muted)]">
+                  Watch the clip on the left, then approve, request changes,
+                  or leave a comment below. Your feedback goes directly to
+                  the Yuvo team.
+                </p>
+                <ClientFeedbackPanel
+                  portalSlug={portalSlug}
+                  contentId={contentId}
+                  initialStatus={view.status}
+                  initialComments={clientVisibleComments}
+                  isLive={isLive}
+                />
+              </CardBody>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Hook</CardTitle>
+              </CardHeader>
+              <CardBody>
+                <p className="text-sm leading-relaxed">{view.hook}</p>
+              </CardBody>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Caption draft</CardTitle>
+              </CardHeader>
+              <CardBody>
+                <p className="text-sm leading-relaxed text-[color:var(--color-ink-muted)]">
+                  {view.captionDraft}
+                </p>
+              </CardBody>
+            </Card>
+          </div>
+        </div>
+      )}
 
       <Card>
         <CardHeader>

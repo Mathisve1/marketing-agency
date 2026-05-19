@@ -101,6 +101,11 @@ export interface ContentItem {
   /** Phase 1O — public-safe CDN MP4 URL the operator has explicitly
    *  shared with the client. The portal renders `<video>` when set. */
   clientSafeVideoUrl?: string;
+  /** Phase 2G — operator-prepared client-safe copy preview for
+   *  non-video items. Populated by prepareClientCopyPreviewAction.
+   *  The client portal page (via the client-safe mapper) renders this
+   *  in place of the operator's raw caption_draft. */
+  clientSafeCopyPreview?: string;
   qualityTier: QualityTierId;
   durationSec: number;
   resolution: "480p" | "720p" | "1080p";
@@ -151,6 +156,11 @@ export interface ClientContentView {
    *  is set, else "none". Pages branch on this. */
   mediaType: ClientMediaType;
   durationSec: number;
+  /** Phase 2G — operator-prepared client-safe copy preview for
+   *  non-video items. The portal page prefers this over
+   *  `captionDraft` when present. Absent for video items (the
+   *  caption_draft path stays the source of truth there). */
+  clientSafeCopyPreview?: string;
   comments: Array<{ author: "client" | "operator"; body: string; createdAt: string }>;
 }
 
@@ -190,6 +200,10 @@ export function toClientContentView(c: ContentItem): ClientContentView | null {
     videoUrl: c.clientSafeVideoUrl,
     mediaType: deriveClientMediaType(c.clientSafeVideoUrl, c.clientSafePosterUrl),
     durationSec: c.durationSec,
+    // Demo path: there is no operator-prepared preview on the
+    // in-memory demo ContentItem. Phase 2G's clientSafeCopyPreview is
+    // populated only by the live Supabase mapper.
+    clientSafeCopyPreview: undefined,
     comments: c.comments,
   };
 }

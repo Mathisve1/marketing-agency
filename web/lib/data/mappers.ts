@@ -166,6 +166,10 @@ export function contentItemRowToContentItem(row: ContentItemRow): ContentItem {
     },
     clientSafePosterUrl: row.client_safe_poster_url ?? undefined,
     clientSafeVideoUrl: row.client_safe_video_url ?? undefined,
+    clientSafeCopyPreview:
+      row.client_safe_copy_preview && row.client_safe_copy_preview.trim() !== ""
+        ? row.client_safe_copy_preview
+        : undefined,
     qualityTier: safeQualityTier(row.quality_tier),
     durationSec: row.duration_sec ?? 0,
     resolution: safeResolution(row.resolution),
@@ -202,6 +206,14 @@ export function clientContentRowToClientView(
 
   const posterUrl = row.client_safe_poster_url ?? undefined;
   const videoUrl = row.client_safe_video_url ?? undefined;
+  // Phase 2G — operator-prepared client preview. The
+  // client_content_items_v view exposes this column; we propagate it
+  // straight through as an optional string. The portal page chooses
+  // whether to render it instead of caption_draft.
+  const clientSafeCopyPreview =
+    row.client_safe_copy_preview && row.client_safe_copy_preview.trim() !== ""
+      ? row.client_safe_copy_preview
+      : undefined;
   return {
     id: row.id,
     title: row.title,
@@ -214,6 +226,7 @@ export function clientContentRowToClientView(
     videoUrl,
     mediaType: deriveClientMediaType(videoUrl, posterUrl),
     durationSec: row.duration_sec ?? 0,
+    clientSafeCopyPreview,
     comments: [],
   };
 }

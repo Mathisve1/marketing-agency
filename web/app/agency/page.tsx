@@ -29,6 +29,7 @@ import type {
   GenerationJob,
   GenerationJobStatus,
 } from "@/lib/data/generation-jobs";
+import { getClaudeCodeTaskSummaryForWorkspace } from "@/lib/data/claude-code-tasks";
 import {
   CLAUDE_CODE_TASK_TEMPLATES,
   CLAUDE_CODE_TASK_STATUS_LABELS,
@@ -230,9 +231,53 @@ export default async function AgencyHome() {
       workspaceId = persona.workspaceIds[0];
     }
   }
-  const snapshot = await getOwnerOverview(workspaceId);
+  const [snapshot, claudeTasks] = await Promise.all([
+    getOwnerOverview(workspaceId),
+    getClaudeCodeTaskSummaryForWorkspace(workspaceId),
+  ]);
   const nextActions = deriveOwnerNextActions(snapshot).slice(0, 12);
   const activity = deriveRecentActivity(snapshot, 14);
+
+  // Phase 2N — read-only Claude Code task queue health (no execution).
+  const claudeHealth: {
+    tone: "neutral" | "success" | "warn" | "danger" | "info";
+    label: string;
+    line: string;
+  } = !claudeTasks.tableReady
+    ? {
+        tone: "neutral",
+        label: "queue",
+        line: "Durable queue of prepared handoff tasks. Copy-only — the dashboard never executes Claude Code.",
+      }
+    : claudeTasks.failedCount > 0
+      ? {
+          tone: "danger",
+          label: "needs attention",
+          line: `${claudeTasks.failedCount} failed task${claudeTasks.failedCount === 1 ? "" : "s"} need review.`,
+        }
+      : claudeTasks.overdueReadyCount > 0
+        ? {
+            tone: "warn",
+            label: "overdue",
+            line: `${claudeTasks.overdueReadyCount} task${claudeTasks.overdueReadyCount === 1 ? "" : "s"} ready for >${claudeTasks.overdueThresholdHours}h and not run yet.`,
+          }
+        : claudeTasks.readyForClaudeCount > 0
+          ? {
+              tone: "info",
+              label: "ready to run",
+              line: `${claudeTasks.readyForClaudeCount} task${claudeTasks.readyForClaudeCount === 1 ? "" : "s"} ready to run in your Claude Code session.`,
+            }
+          : claudeTasks.total > 0
+            ? {
+                tone: "success",
+                label: "healthy",
+                line: "No failed or overdue tasks — queue is clear.",
+              }
+            : {
+                tone: "neutral",
+                label: "queue",
+                line: "No tasks yet. Prepare one from the Unified Inbox.",
+              };
 
   const {
     brands,
@@ -332,6 +377,75 @@ export default async function AgencyHome() {
           to the client portal.
         </p>
       </header>
+
+      {/* 0. Phase 2J/2L — review inbox + Claude task queue links */}
+      <div className="grid sm:grid-cols-2 gap-3">
+        <Link
+          href="/agency/inbox"
+          className="block rounded-md border border-[color:var(--color-accent)]/40 bg-[color:var(--color-accent)]/8 p-4 hover:bg-[color:var(--color-accent)]/15 transition-colors"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">Review Inbox →</div>
+              <div className="text-xs text-[color:var(--color-ink-muted)] mt-0.5">
+                Everything that needs your attention across video, copy,
+                prompts, and clients — in one queue.
+              </div>
+            </div>
+            <Badge tone="info">go</Badge>
+          </div>
+        </Link>
+        <Link
+          href="/agency/claude-tasks"
+          className="block rounded-md border border-[color:var(--color-hairline)] bg-white p-4 hover:bg-[color:var(--color-cream-soft)] transition-colors"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-semibold">
+                Claude Code Tasks →
+              </div>
+              <div className="text-xs text-[color:var(--color-ink-muted)] mt-0.5">
+                {claudeHealth.line}
+              </div>
+            </div>
+            <Badge tone={claudeHealth.tone}>{claudeHealth.label}</Badge>
+          </div>
+          {claudeTasks.tableReady && (
+            <>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                <Badge tone="info">
+                  {claudeTasks.readyForClaudeCount} ready
+                </Badge>
+                <Badge tone="neutral">
+                  {claudeTasks.inProgressCount} in&nbsp;progress
+                </Badge>
+                <Badge tone="success">
+                  {claudeTasks.completedCount} completed
+                </Badge>
+                <Badge
+                  tone={claudeTasks.failedCount > 0 ? "danger" : "neutral"}
+                >
+                  {claudeTasks.failedCount} failed
+                </Badge>
+                {claudeTasks.overdueReadyCount > 0 && (
+                  <Badge tone="warn">
+                    {claudeTasks.overdueReadyCount} overdue
+                  </Badge>
+                )}
+              </div>
+              {claudeTasks.latest && (
+                <div className="mt-2 text-[11px] text-[color:var(--color-ink-muted)] truncate">
+                  Latest: {claudeTasks.latest.title} ·{" "}
+                  {claudeTasks.latest.status.replace(/_/g, " ")}
+                </div>
+              )}
+            </>
+          )}
+          <div className="mt-2 text-[11px] text-[color:var(--color-ink-muted)] italic">
+            Tasks are manual. The dashboard does not execute Claude Code.
+          </div>
+        </Link>
+      </div>
 
       {/* 1. Business overview */}
       <section>

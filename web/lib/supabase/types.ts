@@ -73,6 +73,9 @@ export interface ContentItemRow {
   internal_thumb_path: string | null;
   client_safe_poster_url: string | null;
   client_safe_video_url: string | null;
+  /** Phase 2G — operator-prepared client-safe copy preview. Null
+   *  until prepareClientCopyPreviewAction runs. */
+  client_safe_copy_preview: string | null;
   shared_with_client: boolean;
   audio_fixer_triggered: boolean;
   audio_fixer_completed: boolean;
@@ -99,4 +102,7 @@ export interface ClientContentItemRow {
   /** Phase 1O — CDN MP4 URL the operator has explicitly shared. Null
    *  when there's no playable video yet (image fallback). */
   client_safe_video_url: string | null;
+  /** Phase 2G — operator-prepared clean copy preview for non-video
+   *  items. Null until prepareClientCopyPreviewAction runs. */
+  client_safe_copy_preview: string | null;
 }

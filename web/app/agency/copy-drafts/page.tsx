@@ -14,6 +14,8 @@ import { getDataSource, getDefaultWorkspaceId } from "@/lib/data/_source";
 import { listCopyDraftQueueForWorkspace } from "@/lib/data/owner-overview";
 import { CopyDraftPanel } from "@/components/agents/copy-draft-panel";
 import { CopyApprovalPanel } from "@/components/agents/copy-approval-panel";
+import { ClientPreviewPanel } from "@/components/agents/client-preview-panel";
+import { CopyRevisionPanel } from "@/components/agents/copy-revision-panel";
 import { CLAUDE_CODE_TASK_STATUS_LABELS } from "@/lib/tasks/claude-code-tasks";
 
 export const dynamic = "force-dynamic";
@@ -32,6 +34,14 @@ export default async function CopyDraftsPage() {
   const approved = items.filter(
     (i) => i.copyApprovalStatus === "approved_internal",
   ).length;
+  const prepared = items.filter(
+    (i) =>
+      i.clientPreviewStatus === "prepared" ||
+      i.clientPreviewStatus === "shared_with_client",
+  ).length;
+  const shared = items.filter(
+    (i) => i.clientPreviewStatus === "shared_with_client",
+  ).length;
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -47,11 +57,13 @@ export default async function CopyDraftsPage() {
         </p>
       </header>
 
-      <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
         <Stat label="Non-video items" value={total} />
         <Stat label="Copy drafted" value={drafted} tone="success" />
         <Stat label="Awaiting copy" value={total - drafted} tone="warn" />
         <Stat label="Approved internally" value={approved} tone="success" />
+        <Stat label="Preview prepared" value={prepared} tone="success" />
+        <Stat label="Shared with client" value={shared} tone="success" />
       </section>
 
       <Card>
@@ -91,6 +103,12 @@ export default async function CopyDraftsPage() {
                     {it.copyApprovalStatus === "approved_internal" && (
                       <Badge tone="success">approved internally</Badge>
                     )}
+                    {it.clientPreviewStatus === "prepared" && (
+                      <Badge tone="info">preview prepared</Badge>
+                    )}
+                    {it.clientPreviewStatus === "shared_with_client" && (
+                      <Badge tone="success">shared with client</Badge>
+                    )}
                   </div>
                   <div className="text-xs text-[color:var(--color-ink-muted)]">
                     {it.brandName ?? "—"} ·{" "}
@@ -107,6 +125,12 @@ export default async function CopyDraftsPage() {
                       {it.captionPreview}
                     </div>
                   )}
+                  <CopyRevisionPanel
+                    contentItemId={it.contentItemId}
+                    contentStatus={it.contentStatus}
+                    latestClientFeedback={it.latestClientFeedback}
+                    openRegenerationRequest={it.openRegenerationRequest}
+                  />
                   <CopyDraftPanel
                     contentItemId={it.contentItemId}
                     alreadyDrafted={it.copyDraftStatus === "drafted"}
@@ -117,6 +141,16 @@ export default async function CopyDraftsPage() {
                     approvalStatus={it.copyApprovalStatus}
                     approvedAt={it.copyApprovedAt}
                     approvalNotes={it.copyApprovalNotes}
+                    captionDraft={it.captionDraftFull}
+                  />
+                  <ClientPreviewPanel
+                    contentItemId={it.contentItemId}
+                    isApprovedInternally={
+                      it.copyApprovalStatus === "approved_internal"
+                    }
+                    previewStatus={it.clientPreviewStatus}
+                    previewAt={it.clientPreviewAt}
+                    previewText={it.clientPreviewText}
                     captionDraft={it.captionDraftFull}
                   />
                 </li>
