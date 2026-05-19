@@ -20,6 +20,11 @@ import {
   extractMatchedNiche,
   extractProductUrl,
 } from "@/lib/data/agent-runs";
+import {
+  CalendarAgentPanel,
+  type CalendarIdea,
+  type CampaignTarget,
+} from "@/components/agents/calendar-agent-panel";
 
 export default async function BrandAnalysisAgentPage() {
   // Demo mode lists every seeded brand; supabase mode would resolve via
@@ -77,6 +82,25 @@ export default async function BrandAnalysisAgentPage() {
       return a.contentTitle.localeCompare(b.contentTitle);
     });
 
+  // Phase 1Z — dedupe target list down to campaigns for the Calendar
+  // Agent panel (one panel per agent run picks ONE campaign as the
+  // home for the new draft content_items).
+  const campaignTargets: CampaignTarget[] = (() => {
+    const seen = new Set<string>();
+    const out: CampaignTarget[] = [];
+    for (const t of targetOptions) {
+      if (!t.campaignId || seen.has(t.campaignId)) continue;
+      seen.add(t.campaignId);
+      out.push({
+        campaignId: t.campaignId,
+        campaignTitle: t.campaignTitle,
+        brandId: t.brandId,
+        brandName: t.brandName,
+      });
+    }
+    return out;
+  })();
+
   return (
     <div className="space-y-6">
       <div>
@@ -106,7 +130,11 @@ export default async function BrandAnalysisAgentPage() {
           <CardTitle>New planning run</CardTitle>
         </CardHeader>
         <CardBody>
-          <BrandAnalysisForm brands={brandOptions} targets={targetOptions} />
+          <BrandAnalysisForm
+            brands={brandOptions}
+            targets={targetOptions}
+            campaigns={campaignTargets}
+          />
         </CardBody>
       </Card>
 
@@ -135,8 +163,53 @@ export default async function BrandAnalysisAgentPage() {
                         : "neutral";
                 const url = extractProductUrl(r.input);
                 const niche = extractMatchedNiche(r.output);
+                // Phase 1Z — extract the calendar ideas from the stored
+                // output so the operator can materialise them right
+                // from this row.
+                const ideas: CalendarIdea[] = (() => {
+                  const out = r.output as Record<string, unknown> | null;
+                  if (!out || !Array.isArray(out.contentCalendarIdeas))
+                    return [];
+                  return (out.contentCalendarIdeas as unknown[]).flatMap(
+                    (i) => {
+                      if (!i || typeof i !== "object") return [];
+                      const o = i as Record<string, unknown>;
+                      // Phase 2D: title is canonical; accept legacy
+                      // {label} runs too.
+                      const title =
+                        typeof o.title === "string"
+                          ? o.title
+                          : typeof o.label === "string"
+                            ? o.label
+                            : null;
+                      if (
+                        typeof o.dayOffset === "number" &&
+                        typeof o.brief === "string" &&
+                        title !== null
+                      ) {
+                        const s = (v: unknown) =>
+                          typeof v === "string" ? v : undefined;
+                        return [
+                          {
+                            dayOffset: o.dayOffset,
+                            title,
+                            brief: o.brief as string,
+                            suggestedChannel: s(o.suggestedChannel),
+                            suggestedFormat: s(o.suggestedFormat),
+                            distributionType: s(o.distributionType),
+                            contentGoal: s(o.contentGoal),
+                            needsGeneration: o.needsGeneration === true,
+                            needsPromptVersion:
+                              o.needsPromptVersion === true,
+                          },
+                        ];
+                      }
+                      return [];
+                    },
+                  );
+                })();
                 return (
-                  <li key={r.id} className="py-3 text-sm space-y-1">
+                  <li key={r.id} className="py-3 text-sm space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge tone={tone}>{r.status}</Badge>
                       <Badge tone="info">{niche.replaceAll("_", " ")}</Badge>
@@ -157,6 +230,13 @@ export default async function BrandAnalysisAgentPage() {
                       <div className="text-xs text-[color:var(--color-danger)] break-all">
                         error: {r.errorMessage}
                       </div>
+                    )}
+                    {r.status === "completed" && ideas.length > 0 && (
+                      <CalendarAgentPanel
+                        agentRunId={r.id}
+                        ideas={ideas}
+                        campaigns={campaignTargets}
+                      />
                     )}
                   </li>
                 );

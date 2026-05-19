@@ -29,6 +29,10 @@ import type {
   GenerationJob,
   GenerationJobStatus,
 } from "@/lib/data/generation-jobs";
+import {
+  CLAUDE_CODE_TASK_TEMPLATES,
+  CLAUDE_CODE_TASK_STATUS_LABELS,
+} from "@/lib/tasks/claude-code-tasks";
 
 // ---------------------------------------------------------------------------
 // Status label / tone maps (operator-side).
@@ -161,8 +165,44 @@ const AGENTS: Array<{
   },
   {
     key: "calendar",
-    name: "Content Calendar Agent",
-    blurb: "Suggests next-week posts from past hits + client asks.",
+    name: "Organic Content Calendar Agent",
+    blurb:
+      "Multi-format two-week plan (reels, stories, carousels, posts, email) — not only ads. Via Brand Analysis today.",
+    href: "/agency/agents/brand-analysis",
+    state: "available",
+  },
+  {
+    key: "paid-ugc",
+    name: "Paid UGC Ad Agent",
+    blurb:
+      "Video-focused: plans the paid UGC ad + clip drafts. Generation stays operator-gated.",
+    href: "/agency/jobs",
+    state: "linked",
+  },
+  {
+    key: "social-copy",
+    name: "Social Copy Agent",
+    blurb:
+      "Captions + post copy for Instagram / Facebook / LinkedIn. No video. Claude Code handoff for now.",
+    state: "planned",
+  },
+  {
+    key: "carousel",
+    name: "Carousel Outline Agent",
+    blurb: "Slide-by-slide carousel outline + copy. Static, no Seedance.",
+    state: "planned",
+  },
+  {
+    key: "story",
+    name: "Story Builder Agent",
+    blurb:
+      "Instagram/Facebook story frame brief + copy. No video by default.",
+    state: "planned",
+  },
+  {
+    key: "linkedin",
+    name: "LinkedIn Post Agent",
+    blurb: "Founder-voice LinkedIn text posts from the brand brief.",
     state: "planned",
   },
   {
@@ -385,6 +425,14 @@ export default async function AgencyHome() {
                 </div>
               ))}
             </div>
+            <div className="mt-4 pt-3 border-t border-[color:var(--color-hairline)]">
+              <Link
+                href="/agency/prompt-review"
+                className="text-sm text-[color:var(--color-accent)] underline"
+              >
+                Open Prompt Review Queue →
+              </Link>
+            </div>
           </CardBody>
         </Card>
       </section>
@@ -398,11 +446,71 @@ export default async function AgencyHome() {
           <CardBody>
             <p className="text-xs text-[color:var(--color-ink-muted)] mb-3">
               Most agents are planned for upcoming phases. None of these
-              buttons spend credits or contact a client.
+              buttons spend credits or contact a client. Video work is
+              one workflow among many — copy, story, carousel, calendar
+              and email are first-class.
             </p>
             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {AGENTS.map((a) => (
                 <AgentCard key={a.key} agent={a} />
+              ))}
+            </div>
+          </CardBody>
+        </Card>
+      </section>
+
+      {/* 5b. Claude Code task handoff (concept placeholder) */}
+      <section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Claude Code task handoff (concept)</CardTitle>
+          </CardHeader>
+          <CardBody>
+            <p className="text-xs text-[color:var(--color-ink-muted)] mb-3">
+              Hybrid model: the dashboard <em>prepares</em> a task; an
+              operator runs <strong>Claude Code</strong> (via MCP) to
+              execute it; results are written back to Supabase and shown
+              here. <strong>Nothing on this page auto-runs Claude Code,
+              calls the Claude API, or spends credits.</strong> See{" "}
+              <code className="font-mono">
+                docs/hybrid_claude_code_execution_model.md
+              </code>
+              .
+            </p>
+            <div className="flex flex-wrap gap-2 mb-3 text-[10px]">
+              {(
+                Object.entries(CLAUDE_CODE_TASK_STATUS_LABELS) as [
+                  string,
+                  string,
+                ][]
+              ).map(([k, label]) => (
+                <Badge key={k} tone="neutral">
+                  {label}
+                </Badge>
+              ))}
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {CLAUDE_CODE_TASK_TEMPLATES.map((t) => (
+                <div
+                  key={t.kind}
+                  className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 flex flex-col gap-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="font-semibold text-sm">{t.title}</div>
+                    <Badge tone="neutral">Concept</Badge>
+                  </div>
+                  <p className="text-xs text-[color:var(--color-ink-muted)] leading-relaxed">
+                    {t.instructions}
+                  </p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled
+                    className="self-start"
+                  >
+                    Prepare task (coming soon)
+                  </Button>
+                </div>
               ))}
             </div>
           </CardBody>

@@ -15,6 +15,10 @@ import {
   type BrandAnalysisActionResult,
 } from "@/lib/actions/brand-analysis";
 import { createPromptVersionFromAgentDraftAction } from "@/lib/actions/prompt-versions";
+import {
+  CalendarAgentPanel,
+  type CampaignTarget,
+} from "@/components/agents/calendar-agent-panel";
 import type {
   BrandAnalysisPlan,
   PromptDraft,
@@ -41,9 +45,10 @@ export interface TargetOption {
 interface Props {
   brands: BrandOption[];
   targets: TargetOption[];
+  campaigns: CampaignTarget[];
 }
 
-export function BrandAnalysisForm({ brands, targets }: Props) {
+export function BrandAnalysisForm({ brands, targets, campaigns }: Props) {
   const [productUrl, setProductUrl] = React.useState("");
   const [brandId, setBrandId] = React.useState<string>("");
   const [notes, setNotes] = React.useState("");
@@ -198,6 +203,7 @@ export function BrandAnalysisForm({ brands, targets }: Props) {
         <PlanView
           plan={result.plan}
           targets={targets}
+          campaigns={campaigns}
           agentRunId={result.agentRunId}
         />
       )}
@@ -211,10 +217,12 @@ export function BrandAnalysisForm({ brands, targets }: Props) {
 function PlanView({
   plan,
   targets,
+  campaigns,
   agentRunId,
 }: {
   plan: BrandAnalysisPlan;
   targets: TargetOption[];
+  campaigns: CampaignTarget[];
   agentRunId?: string;
 }) {
   return (
@@ -347,23 +355,63 @@ function PlanView({
         </div>
       </SectionCard>
 
-      <SectionCard title="Content calendar ideas">
+      <SectionCard title="Content calendar ideas (multi-format)">
+        <p className="text-[10px] text-[color:var(--color-ink-faint)] italic mb-2">
+          Not every item is a paid video ad. Channel / format /
+          distribution and whether it needs a video generation later are
+          shown per idea. Nothing is generated or sent here.
+        </p>
         <ul className="text-sm space-y-2">
           {plan.contentCalendarIdeas.map((d) => (
             <li
-              key={d.label}
+              key={`${d.dayOffset}-${d.title}`}
               className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3"
             >
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <Badge tone="info">D+{d.dayOffset}</Badge>
-                <span className="font-semibold">{d.label}</span>
+                <span className="font-semibold">{d.title}</span>
+                <Badge tone="neutral">{d.suggestedChannel}</Badge>
+                <Badge tone="neutral">{d.suggestedFormat}</Badge>
+                <Badge
+                  tone={
+                    d.distributionType === "paid" ? "warn" : "neutral"
+                  }
+                >
+                  {d.distributionType}
+                </Badge>
+                <Badge tone="neutral">{d.contentGoal}</Badge>
+                <Badge tone={d.needsGeneration ? "warn" : "success"}>
+                  {d.needsGeneration
+                    ? "video gen later"
+                    : "no video gen"}
+                </Badge>
               </div>
               <div className="text-xs text-[color:var(--color-ink-muted)] mt-1">
                 {d.brief}
               </div>
+              {d.operatorNotes && (
+                <div className="text-[10px] text-[color:var(--color-ink-faint)] italic mt-1">
+                  {d.operatorNotes}
+                </div>
+              )}
             </li>
           ))}
         </ul>
+        {agentRunId && (
+          <CalendarAgentPanel
+            agentRunId={agentRunId}
+            ideas={plan.contentCalendarIdeas}
+            campaigns={campaigns}
+          />
+        )}
+        {!agentRunId && (
+          <p className="text-[10px] text-[color:var(--color-ink-faint)] italic">
+            &ldquo;Create draft content calendar&rdquo; requires a
+            persisted agent run. This run was preview-only — apply
+            migration 008 (or check the persistence warning above) to
+            unlock the handoff.
+          </p>
+        )}
       </SectionCard>
 
       <SectionCard title="Caveats">

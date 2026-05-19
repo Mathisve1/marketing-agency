@@ -112,6 +112,27 @@ def _video_field(value: Union[str, Path]) -> str:
     return str(value)
 
 
+# Kling Omni V3 accepts a short-code `mode` value of "std" or "pro" only.
+# Older brief / preflight docs in this repo carry the human-readable
+# label "professional" (and occasionally "standard"). Translate at the
+# wire boundary so:
+#   * docs and tests can keep using the readable label
+#   * the API receives the literal short code it actually validates
+# A bare unknown value falls through verbatim so we surface a Kling
+# 400 instead of silently mapping to "std".
+_MODE_ALIASES = {
+    "professional": "pro",
+    "standard": "std",
+}
+
+
+def _normalize_mode(value: str) -> str:
+    """Map a human-readable mode label to the Kling Omni short code."""
+    if not isinstance(value, str):
+        return value
+    return _MODE_ALIASES.get(value.lower(), value)
+
+
 def _redact_asset_list(asset_list: list[dict]) -> list[dict]:
     """Replace base64 image_url / video_url payloads with '<base64>' in audit-log copies."""
     out = []
@@ -237,7 +258,7 @@ class KlingClient:
         model: str = DEFAULT_MODEL,
         duration: int = 10,
         aspect_ratio: str = "9:16",
-        mode: str = "professional",
+        mode: str = "pro",
         cfg_scale: float = 0.5,
         extra: Optional[dict] = None,
     ) -> str:
@@ -262,7 +283,7 @@ class KlingClient:
             "negative_prompt": negative_prompt,
             "duration": duration,
             "aspect_ratio": aspect_ratio,
-            "mode": mode,
+            "mode": _normalize_mode(mode),
             "cfg_scale": cfg_scale,
         }
 

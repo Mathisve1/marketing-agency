@@ -28,6 +28,18 @@ export function AgencySidebar() {
           Brands
         </Link>
         <Link
+          href="/agency/prompt-review"
+          className="block px-3 py-2 rounded-md hover:bg-[color:var(--color-hairline)]"
+        >
+          Prompt review queue
+        </Link>
+        <Link
+          href="/agency/copy-drafts"
+          className="block px-3 py-2 rounded-md hover:bg-[color:var(--color-hairline)]"
+        >
+          Copy drafts (non-video)
+        </Link>
+        <Link
           href="/agency/jobs"
           className="block px-3 py-2 rounded-md hover:bg-[color:var(--color-hairline)]"
         >

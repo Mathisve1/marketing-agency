@@ -95,7 +95,11 @@ class KlingVideoBrief:
     negative_prompt: str
     duration: int
     aspect_ratio: str = "9:16"
-    mode: str = "professional"
+    # Kling Omni V3 short code: "std" (standard) or "pro" (professional).
+    # The Kling client normalises the human-readable label "professional"
+    # to "pro" at the wire boundary, so either value is acceptable here;
+    # "pro" is the default because it matches the literal API short code.
+    mode: str = "pro"
     cfg_scale: float = 0.5
 
     # Asset paths - order is load-bearing (matches <<<image_1>>>, <<<image_2>>>, <<<video_1>>>).

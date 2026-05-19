@@ -10,6 +10,8 @@
 // safe to reuse). Nothing here should be sent to a client without
 // operator review. No claim is factual.
 
+import type { MultiFormatCalendarIdea } from "@/lib/content/taxonomy";
+
 // --------------------------------------------------------------------------- #
 // Public types
 
@@ -65,7 +67,11 @@ export interface BrandAnalysisPlan {
   contentAngles: { title: string; idea: string }[];
   ugcScenes: { title: string; scene: string; durationSec: number }[];
   promptDrafts: PromptDraft[];
-  contentCalendarIdeas: { dayOffset: number; label: string; brief: string }[];
+  /** Phase 2D — multi-format calendar ideas. Not every idea is a paid
+   *  video ad; each carries channel / format / distribution / goal +
+   *  needsGeneration / needsPromptVersion so the dashboard can route it
+   *  through the right (often non-video) workflow. */
+  contentCalendarIdeas: MultiFormatCalendarIdea[];
   caveats: string[];
   /** Categorisation key used to pick templates (informational; useful for
    *  the UI to show "matched template: skincare"). */
@@ -645,44 +651,146 @@ export function planBrandAnalysisUGCPrompt(
         }
       : null;
 
-  const calendarStart = template.scenes[0]?.durationSec ?? 0;
-  void calendarStart;
-  const contentCalendarIdeas = [
+  // Phase 2D — a multi-format two-week plan. Most of these are NOT paid
+  // video ads: organic reels, stories, carousels, LinkedIn/feed copy,
+  // an email snippet. Only the paid UGC ad needs a (later, gated) video
+  // generation. needsGeneration / needsPromptVersion tell the dashboard
+  // which workflow each item belongs to. Nothing here is auto-executed.
+  const contentCalendarIdeas: MultiFormatCalendarIdea[] = [
     {
       dayOffset: 0,
-      label: "Day 0 — concept lock",
+      title: "Concept lock + format mix",
       brief:
-        "Operator reviews this draft, decides which variant ships first, books a creator slot.",
+        "Operator reviews this plan, confirms the brand brief, and picks which formats ship this cycle. No asset work yet.",
+      suggestedChannel: "other",
+      suggestedFormat: "text_post",
+      distributionType: "client_review_only",
+      contentGoal: "awareness",
+      recommendedAssetType: "copy_only",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes:
+        "Planning checkpoint only. Decide the week's format mix before any production.",
+    },
+    {
+      dayOffset: 2,
+      title: "Organic Instagram Reel — hook-led",
+      brief:
+        "Short organic reel using the standard UGC angle. Needs a video prompt later (gated).",
+      suggestedChannel: "instagram",
+      suggestedFormat: "organic_reel",
+      distributionType: "organic",
+      contentGoal: "awareness",
+      recommendedAssetType: "short_video",
+      needsGeneration: true,
+      needsPromptVersion: true,
+      operatorNotes:
+        "Reuse the standard prompt draft. Organic, not boosted. Seedance only after explicit operator approval.",
     },
     {
       dayOffset: 3,
-      label: "Day 3 — first UGC pickup",
+      title: "Instagram Story — quick routine",
       brief:
-        "Generate / shoot the standard variant. Ingest, review internally, do NOT share yet.",
+        "2–3 frame story showing the product in a real routine. Copy + frame brief, no video generation by default.",
+      suggestedChannel: "instagram",
+      suggestedFormat: "story",
+      distributionType: "organic",
+      contentGoal: "trust_building",
+      recommendedAssetType: "story_frames",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes:
+        "Story copy + visual brief only. No Seedance unless the operator later upgrades it to a short video.",
+    },
+    {
+      dayOffset: 4,
+      title: "LinkedIn post — founder POV",
+      brief:
+        "Text post on the problem the product solves, founder voice. Copy draft only.",
+      suggestedChannel: "linkedin",
+      suggestedFormat: "text_post",
+      distributionType: "organic",
+      contentGoal: "education",
+      recommendedAssetType: "copy_only",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes:
+        "Copy Draft Agent (future) or Claude Code handoff. No video, no prompt_version.",
     },
     {
       dayOffset: 5,
-      label: "Day 5 — internal review",
+      title: "Carousel — ingredient / value breakdown",
       brief:
-        "Operator + (optionally) a peer review the first cut. Decide on Audio Fixer.",
+        "5–7 slide carousel explaining what makes the product different. Slide outline + copy.",
+      suggestedChannel: "instagram",
+      suggestedFormat: "carousel",
+      distributionType: "organic",
+      contentGoal: "education",
+      recommendedAssetType: "carousel_slides",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes:
+        "Carousel Outline Agent (future). Static slides; no Seedance.",
     },
     {
-      dayOffset: 6,
-      label: "Day 6 — client share",
-      brief: "Share the approved cut on the client portal. Wait for feedback.",
+      dayOffset: 7,
+      title: "Paid UGC video ad — primary",
+      brief:
+        promptDraftLabelStrict
+          ? "The label-strict UGC variant as a paid ad. Needs a video prompt + (later, gated) Seedance generation."
+          : "The standard UGC variant as a paid ad. Needs a video prompt + (later, gated) Seedance generation.",
+      suggestedChannel: "instagram",
+      suggestedFormat: "ugc_video_ad",
+      distributionType: "paid",
+      contentGoal: "conversion",
+      recommendedAssetType: "ugc_video",
+      needsGeneration: true,
+      needsPromptVersion: true,
+      operatorNotes:
+        "This is the only inherently-paid item. Generation stays behind the existing per-clip operator gate.",
     },
     {
       dayOffset: 9,
-      label: "Day 9 — second variant",
+      title: "Facebook feed post — social proof",
       brief:
-        promptDraftLabelStrict
-          ? "Pickup the label-strict variant for A/B against the standard."
-          : "Pickup an angle-2 variant for A/B against the standard.",
+        "Feed post pairing a short testimonial line with a static image idea. Copy + image brief.",
+      suggestedChannel: "facebook",
+      suggestedFormat: "feed_post",
+      distributionType: "organic",
+      contentGoal: "testimonial",
+      recommendedAssetType: "static_image",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes: "Copy + static image brief. No video.",
+    },
+    {
+      dayOffset: 11,
+      title: "Email snippet — nurture",
+      brief:
+        "Short email section reinforcing the core value prop for the existing list. Copy only.",
+      suggestedChannel: "email",
+      suggestedFormat: "email_snippet",
+      distributionType: "organic",
+      contentGoal: "retention",
+      recommendedAssetType: "email_copy",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes:
+        "Copy only. Never auto-sent — drafted for operator review (see hybrid execution model).",
     },
     {
       dayOffset: 14,
-      label: "Day 14 — calendar restock",
-      brief: "Re-plan next 2 weeks based on which angle landed.",
+      title: "Calendar restock + retro",
+      brief:
+        "Re-plan the next two weeks based on which formats landed. Planning checkpoint.",
+      suggestedChannel: "other",
+      suggestedFormat: "text_post",
+      distributionType: "client_review_only",
+      contentGoal: "community",
+      recommendedAssetType: "copy_only",
+      needsGeneration: false,
+      needsPromptVersion: false,
+      operatorNotes: "Planning checkpoint only. No asset work.",
     },
   ];
 

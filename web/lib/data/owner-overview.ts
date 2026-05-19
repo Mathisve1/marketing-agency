@@ -42,7 +42,17 @@ import {
   listAgentRunsForWorkspace,
   type AgentRun,
 } from "./agent-runs";
-import type { Brand, Campaign, ContentItem, ContentStatus } from "@/lib/types";
+import {
+  listPromptVersions,
+  type PromptVersionStatus,
+} from "./prompt-versions";
+import type {
+  Brand,
+  Campaign,
+  ContentItem,
+  ContentStatus,
+  Platform,
+} from "@/lib/types";
 import { contentItemRowToContentItem, campaignRowToCampaign } from "./mappers";
 import type {
   CampaignWithPortalRow,
@@ -606,7 +616,14 @@ export type NextActionKind =
   | "respond_to_feedback"
   | "approve_prompt"
   | "publish_ready_video"
-  | "plan_content_calendar";
+  | "plan_content_calendar"
+  | "create_content_calendar_from_agent_run"
+  // Phase 2F — non-video copy workflow. None of these actions trigger
+  // generation, email, publishing, or client share — they just surface
+  // the right link to the operator on the dashboard.
+  | "create_copy_draft"
+  | "review_copy_draft"
+  | "ready_for_client_review_or_publish_later";
 
 export interface NextAction {
   id: string;
@@ -633,6 +650,12 @@ const ACTION_KIND_LABELS: Record<NextActionKind, string> = {
   approve_prompt: "Approve prompt",
   publish_ready_video: "Ready to publish",
   plan_content_calendar: "Plan next content calendar",
+  create_content_calendar_from_agent_run:
+    "Create content calendar from agent run",
+  create_copy_draft: "Draft copy",
+  review_copy_draft: "Review & approve copy",
+  ready_for_client_review_or_publish_later:
+    "Ready for client review / publish (manual)",
 };
 
 export function nextActionLabel(kind: NextActionKind): string {
@@ -824,6 +847,90 @@ export function deriveOwnerNextActions(
     }
   }
 
+  // 5b. Phase 2F — non-video copy workflow next-actions.
+  //
+  //  - format tagged AND non-video AND no caption_draft           → create_copy_draft
+  //  - caption_draft populated but no [copy approval] block        → review_copy_draft
+  //  - copy_approval_status: approved_internal                     → ready_for_client_review_or_publish_later
+  //
+  //  None of these emit a paid call, email, publish, or share with
+  //  the client. They are pure UI cues that link to /agency/copy-drafts.
+  for (const ci of contentItems) {
+    const fmt = parseFormatFromPromptSummary(ci.promptSummary);
+    if (!fmt || !NON_PROMPT_FORMATS.has(fmt)) continue;
+    // Operator-decided / client-decided items don't need a copy nudge.
+    if (PROMPT_REVIEW_TERMINAL.has(ci.status)) continue;
+    const camp = campaignById.get(ci.campaignId);
+    if (!camp) continue;
+    const copyDrafted =
+      parseTagFromSummary(ci.promptSummary, "copy_draft_status") ===
+      "drafted";
+    const approvalStatus = parseApprovalStatus(ci.promptSummary);
+    if (approvalStatus === "approved_internal") {
+      out.push({
+        id: `copy-ready:${ci.id}`,
+        kind: "ready_for_client_review_or_publish_later",
+        priority: 3,
+        title: "Copy approved internally — ready for client review / publish",
+        context: `${ci.title} · approved internally; client share / publish is a separate manual step.`,
+        href: `/agency/copy-drafts`,
+        createdAt: ci.scheduledFor,
+      });
+      continue;
+    }
+    if (copyDrafted) {
+      out.push({
+        id: `copy-review:${ci.id}`,
+        kind: "review_copy_draft",
+        priority: 2,
+        title: "Review & approve copy",
+        context: `${ci.title} · copy drafted, awaiting internal approval.`,
+        href: `/agency/copy-drafts`,
+        createdAt: ci.scheduledFor,
+      });
+      continue;
+    }
+    out.push({
+      id: `copy-create:${ci.id}`,
+      kind: "create_copy_draft",
+      priority: 3,
+      title: "Draft copy",
+      context: `${ci.title} · non-video item without copy.`,
+      href: `/agency/copy-drafts`,
+      createdAt: ci.scheduledFor,
+    });
+  }
+
+  // 6. Phase 1Z — completed Brand Analysis runs can be materialised into
+  //    a draft content calendar. We do NOT track whether a given run has
+  //    already produced calendar items (that would need new schema), so
+  //    this stays generic + capped to the 3 most-recent completed runs
+  //    to avoid flooding the inbox. Priority 3 (Soon).
+  const completedAgentRuns = snapshot.agentRuns
+    .filter(
+      (r) =>
+        r.status === "completed" &&
+        r.agentType === "brand_analysis_ugc_prompt_planning",
+    )
+    .slice(0, 3);
+  for (const r of completedAgentRuns) {
+    const productUrl =
+      r.input && typeof r.input === "object"
+        ? String(
+            (r.input as Record<string, unknown>).productUrl ?? "agent run",
+          )
+        : "agent run";
+    out.push({
+      id: `cal-from-run:${r.id}`,
+      kind: "create_content_calendar_from_agent_run",
+      priority: 3,
+      title: "Create draft content calendar from agent run",
+      context: productUrl.slice(0, 120),
+      href: "/agency/agents/brand-analysis",
+      createdAt: r.createdAt,
+    });
+  }
+
   out.sort((a, b) => {
     if (a.priority !== b.priority) return a.priority - b.priority;
     const aT = a.createdAt ?? "";
@@ -946,4 +1053,444 @@ export function deriveRecentActivity(
   }
   out.sort((a, b) => b.at.localeCompare(a.at));
   return out.slice(0, limit);
+}
+
+// ===========================================================================
+// Phase 2C — Operator Prompt Review Queue (READ-ONLY).
+//
+// Workspace-wide list of content items + their prompt-draft state, with a
+// deterministic per-item next action. This module performs NO writes, NO
+// provider calls, NO generation. The UI links out to the existing prompt
+// editor (where the existing, already-audited
+// markPromptVersionApprovedForGenerationAction lives) — approval is never
+// duplicated here.
+// ===========================================================================
+
+export type PromptReviewNextAction =
+  | "create_prompt_draft"
+  | "review_prompt_draft"
+  | "approve_prompt_for_generation"
+  | "create_generation_job"
+  | "already_approved"
+  | "blocked_or_needs_attention"
+  // Phase 2D — non-video formats route through copy / brief paths
+  // instead of a prompt_versions + Seedance workflow.
+  | "create_copy_draft"
+  | "review_copy_draft"
+  | "create_carousel_outline"
+  | "create_story_brief";
+
+/** Pull `format:` out of the Phase 2D prompt_summary provenance block.
+ *  Null when absent (legacy / non-agent items). */
+function parseFormatFromPromptSummary(
+  promptSummary: string | null | undefined,
+): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(/(?:^|\n)format:\s*([a-z_]+)/i);
+  return m ? m[1] : null;
+}
+
+// Formats whose operator workflow is copy/visual-brief, NOT a
+// prompt_versions + video generation flow. Mirrors
+// web/lib/content/taxonomy.ts (kept local to avoid a client/server
+// import cycle through the data layer).
+const NON_PROMPT_FORMATS: ReadonlySet<string> = new Set([
+  "feed_post",
+  "static_image",
+  "text_post",
+  "email_snippet",
+  "blog_snippet",
+  "story",
+  "carousel",
+]);
+
+export interface PromptReviewQueueItem {
+  contentItemId: string;
+  title: string;
+  campaignId: string;
+  campaignName: string | null;
+  brandName: string | null;
+  contentStatus: ContentStatus;
+  scheduledFor: string;
+  platforms: Platform[];
+  latestPromptVersionId: string | null;
+  latestPromptStatus: PromptVersionStatus | null;
+  promptVersionCount: number;
+  hasOperatorEditingPrompt: boolean;
+  hasApprovedForGenerationPrompt: boolean;
+  latestUpdatedAt: string;
+  nextAction: PromptReviewNextAction;
+  /** Existing prompt-editor route. Approval happens THERE, not here. */
+  editorHref: string;
+}
+
+export interface PromptReviewQueueSummary {
+  total: number;
+  missingPrompt: number;
+  needsReview: number;
+  approvedReady: number;
+  blocked: number;
+}
+
+export interface PromptReviewQueue {
+  workspaceId: string;
+  items: PromptReviewQueueItem[];
+  summary: PromptReviewQueueSummary;
+}
+
+// Statuses where the operator is done deciding on the prompt (client has
+// the asset / signed off / it's mid-generation downstream).
+const PROMPT_REVIEW_TERMINAL: ReadonlySet<ContentStatus> = new Set<
+  ContentStatus
+>([
+  "generating",
+  "raw_ready",
+  "audio_fixer_pending",
+  "audio_fixed",
+  "ready_for_client_review",
+  "shared_with_client",
+  "approved_by_client",
+]);
+
+function derivePromptReviewNextAction(args: {
+  contentStatus: ContentStatus;
+  promptCount: number;
+  hasOperatorEditing: boolean;
+  hasApproved: boolean;
+  /** Phase 2D — parsed from prompt_summary. Null = legacy/video-default. */
+  format: string | null;
+}): PromptReviewNextAction {
+  if (args.contentStatus === "failed") return "blocked_or_needs_attention";
+  if (PROMPT_REVIEW_TERMINAL.has(args.contentStatus)) {
+    return "already_approved";
+  }
+  // Phase 2D — non-video formats never go through the prompt/Seedance
+  // path. Route them to a copy / brief workflow instead so the
+  // dashboard does not push everything toward video generation.
+  if (args.format && NON_PROMPT_FORMATS.has(args.format)) {
+    if (args.format === "carousel") return "create_carousel_outline";
+    if (args.format === "story") return "create_story_brief";
+    // text_post / feed_post / static_image / email_snippet /
+    // blog_snippet → copy path.
+    return args.promptCount > 0 ? "review_copy_draft" : "create_copy_draft";
+  }
+  // Video / prompt-based formats (or legacy items with no format tag).
+  if (args.promptCount === 0) return "create_prompt_draft";
+  if (args.hasApproved) return "create_generation_job";
+  if (args.hasOperatorEditing) return "review_prompt_draft";
+  // Versions exist but none is operator_editing or approved (e.g. only
+  // superseded / draft) — operator must take a fresh look.
+  return "review_prompt_draft";
+}
+
+/** Build the read-only prompt-review queue for a workspace. Demo +
+ *  supabase aware. Batched prompt_versions read (no N+1) in supabase. */
+export async function listPromptReviewQueueForWorkspace(
+  workspaceId: string,
+): Promise<PromptReviewQueue> {
+  const [contentItems, campaigns] = await Promise.all([
+    listContentItemsForWorkspace(workspaceId),
+    listCampaignsForWorkspace(workspaceId),
+  ]);
+  const campaignById = new Map(campaigns.map((c) => [c.id, c]));
+
+  // Brand-name lookup. Demo: DEMO_BRANDS. Supabase: one brands read.
+  const brandNameById = new Map<string, string>();
+  if (getDataSource() === "demo") {
+    for (const b of DEMO_BRANDS) brandNameById.set(b.id, b.name);
+  } else {
+    const supabase = getSupabaseServerClient();
+    const { data, error } = await supabase
+      .from("brands")
+      .select("id, name")
+      .eq("workspace_id", workspaceId);
+    if (error) {
+      throw new SupabaseDataError("listPromptReviewQueueForWorkspace", error);
+    }
+    for (const r of (data ?? []) as { id: string; name: string }[]) {
+      brandNameById.set(r.id, r.name);
+    }
+  }
+
+  // Prompt versions per content item — batched in supabase mode.
+  const versionsByContent = new Map<
+    string,
+    { id: string; status: PromptVersionStatus; updatedAt: string }[]
+  >();
+  const contentIds = contentItems.map((c) => c.id);
+  if (contentIds.length > 0) {
+    if (getDataSource() === "demo") {
+      for (const id of contentIds) {
+        const vs = await listPromptVersions(id);
+        versionsByContent.set(
+          id,
+          vs.map((v) => ({
+            id: v.id,
+            status: v.status,
+            updatedAt: v.updatedAt,
+          })),
+        );
+      }
+    } else {
+      const supabase = getSupabaseServerClient();
+      const { data, error } = await supabase
+        .from("prompt_versions")
+        .select("id, content_item_id, status, version_number, updated_at")
+        .in("content_item_id", contentIds)
+        .order("version_number", { ascending: false });
+      if (error) {
+        throw new SupabaseDataError(
+          "listPromptReviewQueueForWorkspace",
+          error,
+        );
+      }
+      for (const r of (data ?? []) as {
+        id: string;
+        content_item_id: string;
+        status: PromptVersionStatus;
+        updated_at: string;
+      }[]) {
+        const arr = versionsByContent.get(r.content_item_id) ?? [];
+        arr.push({ id: r.id, status: r.status, updatedAt: r.updated_at });
+        versionsByContent.set(r.content_item_id, arr);
+      }
+    }
+  }
+
+  const items: PromptReviewQueueItem[] = contentItems.map((ci) => {
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    const brandName = camp ? brandNameById.get(camp.brandId) ?? null : null;
+    // versions are version_number desc → [0] is latest.
+    const versions = versionsByContent.get(ci.id) ?? [];
+    const latest = versions[0] ?? null;
+    const hasOperatorEditing = versions.some(
+      (v) => v.status === "operator_editing",
+    );
+    const hasApproved = versions.some(
+      (v) => v.status === "approved_for_generation",
+    );
+    const format = parseFormatFromPromptSummary(ci.promptSummary);
+    const nextAction = derivePromptReviewNextAction({
+      contentStatus: ci.status,
+      promptCount: versions.length,
+      hasOperatorEditing,
+      hasApproved,
+      format,
+    });
+    const latestUpdatedAt =
+      versions.reduce<string>(
+        (acc, v) => (v.updatedAt > acc ? v.updatedAt : acc),
+        "",
+      ) || ci.scheduledFor;
+    return {
+      contentItemId: ci.id,
+      title: ci.title,
+      campaignId: ci.campaignId,
+      campaignName: camp?.title ?? null,
+      brandName,
+      contentStatus: ci.status,
+      scheduledFor: ci.scheduledFor,
+      platforms: ci.platforms,
+      latestPromptVersionId: latest?.id ?? null,
+      latestPromptStatus: latest?.status ?? null,
+      promptVersionCount: versions.length,
+      hasOperatorEditingPrompt: hasOperatorEditing,
+      hasApprovedForGenerationPrompt: hasApproved,
+      latestUpdatedAt,
+      nextAction,
+      editorHref: `/agency/campaigns/${ci.campaignId}/content/${ci.id}/prompt`,
+    };
+  });
+
+  // Newest activity first.
+  items.sort((a, b) => b.latestUpdatedAt.localeCompare(a.latestUpdatedAt));
+
+  const summary: PromptReviewQueueSummary = {
+    total: items.length,
+    missingPrompt: items.filter(
+      (i) => i.nextAction === "create_prompt_draft",
+    ).length,
+    needsReview: items.filter(
+      (i) => i.nextAction === "review_prompt_draft",
+    ).length,
+    approvedReady: items.filter((i) => i.hasApprovedForGenerationPrompt)
+      .length,
+    blocked: items.filter(
+      (i) => i.nextAction === "blocked_or_needs_attention",
+    ).length,
+  };
+
+  return { workspaceId, items, summary };
+}
+
+// ===========================================================================
+// Phase 2E — Copy Draft queue (READ-ONLY).
+//
+// Non-video draft content items that should move through the copy/brief
+// path rather than the prompt/Seedance path. Pure reads; no writes.
+// ===========================================================================
+
+const COPY_FORMATS: ReadonlySet<string> = new Set([
+  "text_post",
+  "feed_post",
+  "static_image",
+  "story",
+  "carousel",
+  "email_snippet",
+  "blog_snippet",
+]);
+
+export interface CopyDraftQueueItem {
+  contentItemId: string;
+  title: string;
+  campaignId: string;
+  campaignName: string | null;
+  brandName: string | null;
+  channel: string | null;
+  format: string | null;
+  contentStatus: ContentStatus;
+  scheduledFor: string;
+  /** "none" until the Copy Draft Agent runs, then "drafted". */
+  copyDraftStatus: "none" | "drafted";
+  /** Phase 2F — operator internal approval state for the current copy.
+   *  "approved_internal" iff the prompt_summary contains a
+   *  `[copy approval]` block with `copy_approval_status: approved_internal`.
+   *  Internal only — the client portal cannot see this. */
+  copyApprovalStatus: "none" | "approved_internal";
+  /** ISO timestamp from the approval block (if present). */
+  copyApprovedAt: string | null;
+  /** Optional operator note from the approval block. */
+  copyApprovalNotes: string | null;
+  /** Short preview of the current caption_draft. */
+  captionPreview: string;
+  /** Phase 2F — the full caption_draft, so the approve/edit panel can
+   *  show the operator exactly what is being approved. May be empty. */
+  captionDraftFull: string;
+  nextAction:
+    | "create_copy_draft"
+    | "review_copy_draft"
+    | "copy_approved_internal";
+}
+
+function parseTagFromSummary(
+  promptSummary: string | null | undefined,
+  tag: string,
+): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(
+    new RegExp(`(?:^|\n)${tag}:\s*([a-z0-9_\-]+)`, "i"),
+  );
+  return m ? m[1] : null;
+}
+
+/** Read-only list of non-video draft items for /agency/copy-drafts. */
+export async function listCopyDraftQueueForWorkspace(
+  workspaceId: string,
+): Promise<{ items: CopyDraftQueueItem[]; total: number }> {
+  const [contentItems, campaigns] = await Promise.all([
+    listContentItemsForWorkspace(workspaceId),
+    listCampaignsForWorkspace(workspaceId),
+  ]);
+  const campaignById = new Map(campaigns.map((c) => [c.id, c]));
+
+  const brandNameById = new Map<string, string>();
+  if (getDataSource() === "demo") {
+    for (const b of DEMO_BRANDS) brandNameById.set(b.id, b.name);
+  } else {
+    const supabase = getSupabaseServerClient();
+    const { data, error } = await supabase
+      .from("brands")
+      .select("id, name")
+      .eq("workspace_id", workspaceId);
+    if (error) {
+      throw new SupabaseDataError(
+        "listCopyDraftQueueForWorkspace",
+        error,
+      );
+    }
+    for (const r of (data ?? []) as { id: string; name: string }[]) {
+      brandNameById.set(r.id, r.name);
+    }
+  }
+
+  const items: CopyDraftQueueItem[] = [];
+  for (const ci of contentItems) {
+    const format = parseFormatFromPromptSummary(ci.promptSummary);
+    const channel = parseTagFromSummary(ci.promptSummary, "channel");
+    // Only surface non-video formats. Items with no format tag are
+    // legacy/video-default and stay out of the copy queue.
+    if (!format || !COPY_FORMATS.has(format)) continue;
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    const copyDrafted =
+      parseTagFromSummary(ci.promptSummary, "copy_draft_status") ===
+      "drafted";
+    // Phase 2F — parse the `[copy approval]` provenance block. The
+    // approval block is operator-only; the `client_content_items_v`
+    // VIEW does not project prompt_summary, so this state never leaks
+    // to the client portal.
+    const approvalStatusRaw = parseApprovalStatus(ci.promptSummary);
+    const copyApprovalStatus: CopyDraftQueueItem["copyApprovalStatus"] =
+      approvalStatusRaw === "approved_internal" ? "approved_internal" : "none";
+    const copyApprovedAt = parseApprovalTimestamp(ci.promptSummary);
+    const copyApprovalNotes = parseApprovalNotes(ci.promptSummary);
+    const nextAction: CopyDraftQueueItem["nextAction"] =
+      copyApprovalStatus === "approved_internal"
+        ? "copy_approved_internal"
+        : copyDrafted
+          ? "review_copy_draft"
+          : "create_copy_draft";
+    items.push({
+      contentItemId: ci.id,
+      title: ci.title,
+      campaignId: ci.campaignId,
+      campaignName: camp?.title ?? null,
+      brandName: camp ? brandNameById.get(camp.brandId) ?? null : null,
+      channel,
+      format,
+      contentStatus: ci.status,
+      scheduledFor: ci.scheduledFor,
+      copyDraftStatus: copyDrafted ? "drafted" : "none",
+      copyApprovalStatus,
+      copyApprovedAt,
+      copyApprovalNotes,
+      captionPreview: (ci.captionDraft ?? "").slice(0, 160),
+      captionDraftFull: ci.captionDraft ?? "",
+      nextAction,
+    });
+  }
+  items.sort((a, b) => b.scheduledFor.localeCompare(a.scheduledFor));
+  return { items, total: items.length };
+}
+
+// Phase 2F — approval-block parsers. The block is written by
+// `approveCopyDraftAction` in web/lib/actions/copy-draft.ts and uses
+// the literal marker "\n\n[copy approval]\n". These helpers stay local
+// to the data layer because the action layer already has its own
+// strip helper for write-side idempotency.
+function parseApprovalStatus(
+  promptSummary: string | null | undefined,
+): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(
+    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approval_status:\s*([a-z_]+)/i,
+  );
+  return m ? m[1] : null;
+}
+function parseApprovalTimestamp(
+  promptSummary: string | null | undefined,
+): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(
+    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approved_at:\s*([^\s\n]+)/i,
+  );
+  return m ? m[1] : null;
+}
+function parseApprovalNotes(
+  promptSummary: string | null | undefined,
+): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(
+    /\n\n\[copy approval\]\n[\s\S]*?(?:^|\n)copy_approval_notes:\s*([^\n]+)/i,
+  );
+  return m ? m[1].trim() : null;
 }
