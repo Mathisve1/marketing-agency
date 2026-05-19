@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Worker project name — distinct from `yuvo-pitches` (the static Pai
+  // pitch microsite on Cloudflare Pages). Do NOT rename to anything
+  // that collides with that project.
+  "name": "yuvo-dashboard",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-09-23",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  // Static + dynamic asset bindings produced by `opennextjs-cloudflare build`.
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  // Non-secret env vars. NEXT_PUBLIC_SUPABASE_URL is project-public.
+  // NEXT_PUBLIC_DATA_SOURCE and NEXT_PUBLIC_SITE_URL are public too.
+  // The anon key and the service-role key are NOT here — they go via
+  //   wrangler secret put NEXT_PUBLIC_SUPABASE_ANON_KEY
+  //   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+  // so they never appear on disk or in git.
+  "vars": {
+    "NEXT_PUBLIC_DATA_SOURCE": "supabase",
+    "NEXT_PUBLIC_SUPABASE_URL": "https://opoilimuydrfvjbchazb.supabase.co",
+    "NEXT_PUBLIC_SITE_URL": "https://yuvo-dashboard.vaneeckhoutmathis1.workers.dev"
+  }
+  // observability / logs / KV / R2 deferred — minimal config to ship.
+}

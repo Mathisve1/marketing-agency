@@ -1933,12 +1933,28 @@ def _full_yana_html(tmp_path: Path) -> str:
     repo) and uses the unmodified microsite_builder pipeline -
     nothing about this test is mocked out. It pins the V5 visual
     rules end-to-end against the real prospect data.
+
+    The `prospects/` tree is gitignored (it holds real prospect
+    scraping + audit data that must never reach GitHub). On developer
+    machines where the YANA bundle exists locally these tests run as
+    full integration checks; on a fresh checkout (including CI) the
+    fixture is absent and the tests are skipped — they would
+    otherwise raise FileNotFoundError on shutil.copytree.
     """
     import shutil
+
+    import pytest
 
     from agents.outreach.reporting.microsite_builder import build_microsite
 
     src_root = Path("prospects") / "yana-active"
+    if not src_root.is_dir():
+        pytest.skip(
+            "prospects/yana-active is not present in this checkout. "
+            "The prospects/ tree is gitignored (real-prospect data), "
+            "so these end-to-end microsite tests only run when the "
+            "operator has the live YANA bundle on disk."
+        )
     dst_root = tmp_path / "prospects" / "yana-active"
     dst_root.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_root, dst_root)
