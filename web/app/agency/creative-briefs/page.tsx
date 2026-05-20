@@ -21,7 +21,26 @@ import { CreativeBriefPanel } from "@/components/agents/creative-brief-panel";
 
 export const dynamic = "force-dynamic";
 
-export default async function CreativeBriefsPage() {
+type FilterKey =
+  | "all"
+  | "needs_brief"
+  | "drafted"
+  | "approved_internal"
+  | "ready_for_export";
+
+const FILTERS: Array<{ key: FilterKey; label: string }> = [
+  { key: "all", label: "All" },
+  { key: "needs_brief", label: "Needs brief" },
+  { key: "drafted", label: "Drafted" },
+  { key: "approved_internal", label: "Approved internal" },
+  { key: "ready_for_export", label: "Ready for export" },
+];
+
+interface PageProps {
+  searchParams: Promise<{ filter?: string }>;
+}
+
+export default async function CreativeBriefsPage({ searchParams }: PageProps) {
   // Workspace resolution mirrors the rest of /agency/*.
   let workspaceId = getDefaultWorkspaceId();
   if (getDataSource() === "supabase") {
@@ -34,6 +53,46 @@ export default async function CreativeBriefsPage() {
   }
 
   const { items, summary } = await listCreativeBriefQueueForWorkspace(workspaceId);
+  const sp = await searchParams;
+  const requested = (sp.filter ?? "all") as string;
+  const activeFilter: FilterKey = FILTERS.some((f) => f.key === requested)
+    ? (requested as FilterKey)
+    : "all";
+
+  // Counts per filter (computed in-memory from the already-loaded
+  // queue — no extra DB call).
+  const counts = {
+    all: items.length,
+    needs_brief: items.filter((i) => i.creativeBriefStatus === "none").length,
+    drafted: items.filter(
+      (i) =>
+        i.creativeBriefStatus === "drafted" &&
+        i.creativeBriefApprovalStatus !== "approved_internal",
+    ).length,
+    approved_internal: items.filter(
+      (i) => i.creativeBriefApprovalStatus === "approved_internal",
+    ).length,
+    ready_for_export: items.filter((i) => i.nextAction === "ready_for_export")
+      .length,
+  };
+
+  const filtered = items.filter((i) => {
+    switch (activeFilter) {
+      case "all":
+        return true;
+      case "needs_brief":
+        return i.creativeBriefStatus === "none";
+      case "drafted":
+        return (
+          i.creativeBriefStatus === "drafted" &&
+          i.creativeBriefApprovalStatus !== "approved_internal"
+        );
+      case "approved_internal":
+        return i.creativeBriefApprovalStatus === "approved_internal";
+      case "ready_for_export":
+        return i.nextAction === "ready_for_export";
+    }
+  });
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -53,7 +112,7 @@ export default async function CreativeBriefsPage() {
         </p>
       </div>
 
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <Stat label="Items in queue" value={summary.total} />
         <Stat
           label="Need brief"
@@ -65,6 +124,37 @@ export default async function CreativeBriefsPage() {
           value={summary.drafted}
           tone={summary.drafted > 0 ? "success" : "neutral"}
         />
+        <Stat
+          label="Approved internal"
+          value={counts.approved_internal}
+          tone={counts.approved_internal > 0 ? "success" : "neutral"}
+        />
+        <Stat
+          label="Ready for export"
+          value={counts.ready_for_export}
+          tone={counts.ready_for_export > 0 ? "success" : "neutral"}
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        {FILTERS.map((f) => {
+          const isActive = f.key === activeFilter;
+          const href = f.key === "all" ? "/agency/creative-briefs" : `/agency/creative-briefs?filter=${f.key}`;
+          const count = counts[f.key];
+          return (
+            <Link
+              key={f.key}
+              href={href}
+              className={
+                isActive
+                  ? "text-xs px-2.5 py-1 rounded-full bg-[color:var(--color-accent)]/15 text-[color:var(--color-accent)] font-semibold"
+                  : "text-xs px-2.5 py-1 rounded-full bg-[color:var(--color-hairline)]/60 text-[color:var(--color-ink-muted)] hover:text-[color:var(--color-ink)]"
+              }
+            >
+              {f.label} <span className="opacity-60">({count})</span>
+            </Link>
+          );
+        })}
       </div>
 
       <Card>
@@ -72,19 +162,20 @@ export default async function CreativeBriefsPage() {
           <CardTitle>
             Queue{" "}
             <span className="ml-2 text-xs font-normal text-[color:var(--color-ink-faint)]">
-              ({items.length})
+              ({filtered.length} of {items.length})
             </span>
           </CardTitle>
         </CardHeader>
         <CardBody>
-          {items.length === 0 ? (
+          {filtered.length === 0 ? (
             <p className="text-sm text-[color:var(--color-ink-muted)]">
-              No items in this workspace need a creative brief yet. Use the
-              Calendar Agent to plan multi-format content first.
+              {items.length === 0
+                ? "No items in this workspace need a creative brief yet. Use the Calendar Agent to plan multi-format content first."
+                : "No items match this filter. Try a different one above."}
             </p>
           ) : (
             <ul className="divide-y divide-[color:var(--color-hairline)]">
-              {items.map((it) => (
+              {filtered.map((it) => (
                 <BriefRow key={it.contentItemId} item={it} />
               ))}
             </ul>
@@ -118,6 +209,15 @@ function BriefRow({
           {item.creativeBriefMode && (
             <Badge tone="neutral">mode: {item.creativeBriefMode}</Badge>
           )}
+          {item.creativeBriefTemplateId && (
+            <Badge tone="neutral">tpl: {item.creativeBriefTemplateId}</Badge>
+          )}
+          {item.creativeBriefApprovalStatus === "approved_internal" && (
+            <Badge tone="success">approved internal</Badge>
+          )}
+          {/* Phase 4G — single readiness chip derived from the queue
+              shape. No extra DB read; pure derivation. */}
+          <ReadinessChip item={item} />
           <span className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
             {new Date(item.scheduledFor).toLocaleDateString("en-GB")}
           </span>
@@ -135,13 +235,32 @@ function BriefRow({
         {item.creativeBriefCreatedAt && (
           <div className="mt-1 text-[10px] text-[color:var(--color-ink-faint)] font-mono">
             brief drafted {new Date(item.creativeBriefCreatedAt).toLocaleString("en-GB")}
+            {item.creativeBriefApprovedAt && (
+              <>
+                {" "}· approved internally{" "}
+                {new Date(item.creativeBriefApprovedAt).toLocaleString("en-GB")}
+              </>
+            )}
           </div>
         )}
-        <div className="mt-3">
+        {item.creativeBriefStatus === "none" && (
+          <div className="mt-1 text-xs text-[color:var(--color-ink-faint)] italic">
+            Needs a creative brief before visuals can be previewed.
+          </div>
+        )}
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <CreativeBriefPanel
             contentItemId={item.contentItemId}
             currentStatus={item.creativeBriefStatus}
           />
+          {item.creativeBriefStatus === "drafted" && (
+            <Link
+              href={`/agency/creative-briefs/${item.contentItemId}/preview`}
+              className="text-xs px-2.5 py-1.5 rounded-md border border-[color:var(--color-accent)]/40 bg-[color:var(--color-accent)]/8 text-[color:var(--color-accent)] hover:bg-[color:var(--color-accent)]/15 font-semibold"
+            >
+              Preview visuals →
+            </Link>
+          )}
         </div>
       </div>
       <Link
@@ -152,6 +271,30 @@ function BriefRow({
       </Link>
     </li>
   );
+}
+
+/** Phase 4G — single-glance readiness chip for the queue rows. All
+ *  states are derived from the existing queue payload (no extra DB
+ *  read; pure transformation). The chip mirrors the readiness states
+ *  surfaced on the preview page so the operator sees the same
+ *  language end-to-end. */
+function ReadinessChip({
+  item,
+}: {
+  item: Awaited<
+    ReturnType<typeof listCreativeBriefQueueForWorkspace>
+  >["items"][number];
+}) {
+  if (item.creativeBriefStatus === "none") {
+    return <Badge tone="neutral">needs brief</Badge>;
+  }
+  if (item.nextAction === "ready_for_export") {
+    return <Badge tone="success">export ready later</Badge>;
+  }
+  if (item.creativeBriefApprovalStatus === "approved_internal") {
+    return <Badge tone="info">approved · export pending</Badge>;
+  }
+  return <Badge tone="warn">needs approval</Badge>;
 }
 
 function Stat({

@@ -2249,6 +2249,8 @@ export type CreativeBriefStatus = "none" | "drafted";
 export type CreativeBriefNextAction =
   | "create_creative_brief"
   | "review_creative_brief"
+  | "approve_creative_brief"
+  | "ready_for_export"
   | "skip_email_or_blog";
 
 export interface CreativeBriefQueueItem {
@@ -2268,6 +2270,14 @@ export interface CreativeBriefQueueItem {
   /** Mode chosen by the agent (carousel / story / feed_post / …). Null
    *  when no brief has been drafted yet. */
   creativeBriefMode: string | null;
+  /** Phase 4D2 — recorded template id (null for legacy briefs). */
+  creativeBriefTemplateId: string | null;
+  /** Phase 4D1 — internal approval lifecycle. `"approved_internal"`
+   *  iff `[creative brief approval]` block is present with
+   *  `creative_brief_approval_status: approved_internal`. */
+  creativeBriefApprovalStatus: "none" | "approved_internal";
+  /** ISO timestamp from the `[creative brief approval]` block. */
+  creativeBriefApprovedAt: string | null;
   nextAction: CreativeBriefNextAction;
   /** Short preview of the current caption_draft, if any (helps the
    *  operator decide whether they need the brief at all). */
@@ -2282,9 +2292,14 @@ export interface CreativeBriefQueueSummary {
 
 function parseCreativeBriefStatus(
   promptSummary: string | null | undefined,
-): { status: CreativeBriefStatus; createdAt: string | null; mode: string | null } {
+): {
+  status: CreativeBriefStatus;
+  createdAt: string | null;
+  mode: string | null;
+  templateId: string | null;
+} {
   if (!promptSummary || !promptSummary.includes("[creative brief]")) {
-    return { status: "none", createdAt: null, mode: null };
+    return { status: "none", createdAt: null, mode: null, templateId: null };
   }
   // The block sits behind a "\n\n[creative brief]\n" marker. Match
   // each key independently — the structured keys live at the top of
@@ -2292,13 +2307,45 @@ function parseCreativeBriefStatus(
   const block = promptSummary.split("\n\n[creative brief]\n").slice(1).join("");
   const statusMatch = block.match(/(?:^|\n)creative_brief_status:\s*([a-z_]+)/i);
   const createdAtMatch = block.match(
-    /(?:^|\n)creative_brief_created_at:\s*([0-9T:\-.Z]+)/i,
+    /(?:^|\n)creative_brief_created_at:\s*([0-9T:\-.+Z]+)/i,
   );
   const modeMatch = block.match(/(?:^|\n)creative_brief_mode:\s*([a-z_]+)/i);
+  const tplMatch = block.match(
+    /(?:^|\n)creative_brief_template_id:\s*([a-z0-9_\-]+)/i,
+  );
   return {
     status: statusMatch && statusMatch[1] === "drafted" ? "drafted" : "none",
     createdAt: createdAtMatch ? createdAtMatch[1] : null,
     mode: modeMatch ? modeMatch[1] : null,
+    templateId: tplMatch ? tplMatch[1] : null,
+  };
+}
+
+// Phase 4D1 — internal approval status parsed from the
+// `[creative brief approval]` block. Same shape as the copy approval
+// parser; kept local to avoid the data layer importing the action.
+function parseCreativeBriefApprovalStatus(
+  promptSummary: string | null | undefined,
+): { status: "none" | "approved_internal"; approvedAt: string | null } {
+  if (!promptSummary || !promptSummary.includes("[creative brief approval]")) {
+    return { status: "none", approvedAt: null };
+  }
+  const block = promptSummary
+    .split("\n\n[creative brief approval]\n")
+    .slice(1)
+    .join("");
+  const statusMatch = block.match(
+    /(?:^|\n)creative_brief_approval_status:\s*([a-z_]+)/i,
+  );
+  const approvedAtMatch = block.match(
+    /(?:^|\n)creative_brief_approved_at:\s*([0-9T:\-.+Z]+)/i,
+  );
+  return {
+    status:
+      statusMatch && statusMatch[1] === "approved_internal"
+        ? "approved_internal"
+        : "none",
+    approvedAt: approvedAtMatch ? approvedAtMatch[1] : null,
   };
 }
 
@@ -2340,9 +2387,19 @@ export async function listCreativeBriefQueueForWorkspace(
     const camp = campaignById.get(ci.campaignId) ?? null;
     const brandName = camp ? brandById.get(camp.brandId) ?? null : null;
     const briefMeta = parseCreativeBriefStatus(ci.promptSummary);
+    const approvalMeta = parseCreativeBriefApprovalStatus(ci.promptSummary);
 
+    // Phase 4D1 next-action ladder:
+    //   no brief                 -> create_creative_brief
+    //   brief drafted, not appr. -> review_creative_brief (or approve)
+    //   brief approved internal  -> ready_for_export (Phase 4D/4E)
     let nextAction: CreativeBriefNextAction = "create_creative_brief";
-    if (briefMeta.status === "drafted") nextAction = "review_creative_brief";
+    if (briefMeta.status === "drafted") {
+      nextAction =
+        approvalMeta.status === "approved_internal"
+          ? "ready_for_export"
+          : "review_creative_brief";
+    }
 
     const captionPreview = (ci.captionDraft ?? "")
       .replace(/\s+/g, " ")
@@ -2362,17 +2419,27 @@ export async function listCreativeBriefQueueForWorkspace(
       creativeBriefStatus: briefMeta.status,
       creativeBriefCreatedAt: briefMeta.createdAt,
       creativeBriefMode: briefMeta.mode,
+      creativeBriefTemplateId: briefMeta.templateId,
+      creativeBriefApprovalStatus: approvalMeta.status,
+      creativeBriefApprovedAt: approvalMeta.approvedAt,
       nextAction,
       captionPreview,
     });
   }
 
-  // Sort: items that need a brief first, then drafted (newest first), then
-  // by scheduled_for desc within each group.
+  // Sort: items that need a brief first, then drafted-not-approved,
+  // then approved (newest first), within each group by scheduled_for.
+  const order: Record<CreativeBriefQueueItem["nextAction"], number> = {
+    create_creative_brief: 0,
+    review_creative_brief: 1,
+    approve_creative_brief: 1,
+    ready_for_export: 2,
+    skip_email_or_blog: 3,
+  };
   out.sort((a, b) => {
-    if (a.creativeBriefStatus !== b.creativeBriefStatus) {
-      return a.creativeBriefStatus === "none" ? -1 : 1;
-    }
+    const oa = order[a.nextAction] ?? 99;
+    const ob = order[b.nextAction] ?? 99;
+    if (oa !== ob) return oa - ob;
     return b.scheduledFor.localeCompare(a.scheduledFor);
   });
 
