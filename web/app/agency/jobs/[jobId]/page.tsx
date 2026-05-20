@@ -27,7 +27,9 @@ import {
 import { getPromptVersionById } from "@/lib/data/prompt-versions";
 import { getContentApprovals, getContentFeedback } from "@/lib/data/feedback";
 import { ClientFeedbackSummary } from "@/components/content/client-feedback-summary";
-import { getBrand, getCampaign, getContent } from "@/lib/demo-data";
+import { getContentItemById } from "@/lib/data/owner-overview";
+import { getCampaignById } from "@/lib/data/campaigns";
+import { getBrandById } from "@/lib/data/brands";
 import {
   formatCredits,
   getEstimatedAudioFixerCredits,
@@ -145,9 +147,13 @@ export default async function GenerationJobDetail({ params }: PageProps) {
       : null;
   const rawVideoAsset =
     generatedAssets.find((a) => a.kind === "raw_video") ?? null;
-  const content = getContent(job.contentItemId);
-  const campaign = content ? getCampaign(content.campaignId) : null;
-  const brand = campaign ? getBrand(campaign.brandId) : null;
+  // Phase 3F — live brand/campaign/content lookups (no demo-data leak).
+  // Three small awaits in parallel; each falls back to null cleanly.
+  const content = await getContentItemById(job.contentItemId);
+  const campaign = content
+    ? await getCampaignById(content.campaignId)
+    : null;
+  const brand = campaign ? await getBrandById(campaign.brandId) : null;
 
   const durationSec = job.durationSeconds ?? 15;
   const seedanceEstimate = getEstimatedSeedanceCredits(
