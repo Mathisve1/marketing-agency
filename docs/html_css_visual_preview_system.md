@@ -216,3 +216,176 @@ Until then, nothing in the visual pipeline is visible to clients.
 | `web/app/agency/creative-briefs/[contentItemId]/preview/page.tsx` | new operator-only route |
 | `web/app/agency/creative-briefs/page.tsx` | "Preview visuals →" link added |
 | `docs/html_css_visual_preview_system.md` | this doc |
+
+## Phase 4E additions (shipped on top of 4C/4D)
+
+These extend the preview system without changing its safety contract.
+Nothing here renders pixels off the dashboard; nothing calls a paid
+API; nothing writes Supabase outside the already-documented
+`[creative brief approval]` block (Phase 4D1).
+
+### Template variants (Phase 4E)
+
+`web/lib/creative/templates.ts` now ships **multiple variants per
+mode** (carousel ×3, story ×3, feed_post ×3, static_image ×1,
+linkedin_image ×2, reel_thumbnail ×1, video_thumbnail ×1). Each
+`CreativeBriefTemplate` entry carries `id`, `label`, `mode`,
+`description`, `bestFor`, `aspectRatio`, `defaultTheme`, `exportSize`
+(width / height), and `status` (`"active"` | `"planned"`).
+
+For Phase 4E only one variant per mode is `"active"` (the
+`*_neutral_v1` one). The remaining variants are `"planned"` —
+metadata-only entries so the preview UI can surface the choice today
+while the per-variant rendering component lands later. When a planned
+variant is selected, the preview falls back to the active default and
+the export manifest surfaces a `template "<id>" is registered but not
+yet active` blocker.
+
+### Theme presets (Phase 4E)
+
+`web/lib/creative/themes.ts` defines five presets: `neutral`,
+`editorial`, `bold`, `soft`, `premium_dark`. Each has a description,
+a `surfaceClass`, a `highlightClass`, an `accentClass`, a
+`headlineClass`, `textHierarchyNotes`, and a `bestFor` label. Themes
+are applied at the shared `PreviewCard` surface (via a
+`ThemeIdContext` so per-template code doesn't need to thread the
+prop). Resolution precedence: `?theme=<id>` querystring override →
+template's `defaultTheme` → `"neutral"`.
+
+### Querystring overrides (Phase 4E)
+
+- `?template=<id>` overrides the recorded template. Invalid id → null
+  + an "Unknown template id" warning chip; falls back to the
+  recorded id (or default).
+- `?theme=<id>` overrides the resolved theme. Invalid id → null +
+  an "Unknown theme id" warning chip; falls back to template default.
+- `?slide=N` / `?frame=N` (Phase 4D3) still work for focused
+  carousel / story views.
+- Nothing in this flow writes to Supabase.
+
+### Export manifest (Phase 4E)
+
+`web/lib/creative/export-manifest.ts` exports `buildExportManifest`
+and `renderExportManifestText`. The manifest is a **planning-only**
+projection of the preview into the fields a future local export
+script needs: `contentItemId`, `mode`, `templateId`, `templateLabel`,
+`templateStatus`, `themeId`, `recommendedWidth/Height`,
+`aspectRatio`, `slideCount` / `frameCount`, `exportFormat = "png"`,
+`assetNamingSuggestion[]`, `exportReadiness` (`"ready"` |
+`"not_ready"`), `blockers[]`, `notes[]`.
+
+`exportReadiness === "ready"` iff there are zero blockers. Blockers
+include: unknown mode, no template id, planned-only template, zero
+slides/frames parsed, no internal approval. The preview page shows
+the manifest in a side panel and a "Copy export brief" button copies
+the plaintext rendering to the clipboard (clipboard-only; no server
+action, no fetch).
+
+### Local export script stub (Phase 4E)
+
+`scripts/export_visual_preview_stub.py` is a documented placeholder
+that prints the intended future workflow and exits 0. It imports
+nothing browser-related, talks to no service, and requires no
+credentials. The real Puppeteer / Playwright script lands in
+Phase 4D.
+
+### Internal QA checklist (Phase 4E)
+
+`PreviewQAChecklist` (in
+`web/components/creative-preview/preview-side-panels.tsx`) renders
+eight read-only checklist items: text readable, CTA visible, layout
+fits format, no forbidden text, no internal notes visible, brand
+tone OK, claim safe, ready for export later. Pure display — no
+persistence in 4E. A future phase may persist the checks against the
+`[creative brief approval]` block.
+
+### Preview shell upgrades (Phase 4E)
+
+- New chip: `theme: <id>` next to the template chip.
+- Disabled "Export PNG (Phase 4D — coming soon)" placeholder (4D4)
+  is unchanged; the export-manifest panel now provides the
+  "ready to export" signal.
+- New two-column layout: preview + manifest on the left, template
+  options + theme options + QA checklist on the right.
+- New `WhatHappensNextPanel` summarising 4D / 4E / 4F roadmap.
+- Graceful warning chips for invalid `?template=` / `?theme=` ids
+  (no thrown errors).
+
+### Limitations and forward-compatibility
+
+- Variants currently route to the active default's render
+  component. The per-variant styling lands when each `_v1` planned
+  variant gets its own component / theme-class set.
+- The export manifest is the contract the future export script
+  (Phase 4D) and the future client-share lifecycle (Phase 4E
+  migration — see `docs/client_safe_visual_preview_plan.md`) will
+  consume. Changing field shapes after 4D ships will need a deprecation
+  pass.
+
+## Phase 4F additions (shipped on top of 4E)
+
+These extend the preview system without changing its safety contract.
+Nothing here renders pixels off the dashboard, calls a paid API, or
+writes Supabase outside the already-documented provenance blocks.
+
+### Persisted internal QA checklist (Phase 4F)
+
+The Phase 4E `PreviewQAChecklist` (read-only display) has been
+retired. The preview page now mounts a single, persisted
+`CreativePreviewQAPanel` (client component) sourced from the same
+`QA_ITEMS` set. Operators flip each item pass / fail and click
+**Save QA**. The action `saveCreativePreviewQAAction` writes a
+`[creative preview QA]` block to `content_items.prompt_summary`:
+
+```
+[creative preview QA]
+qa_status: passed | needs_attention
+qa_checked_at: <ISO>
+qa_items: text_readable=pass,cta_visible=pass,…
+```
+
+Idempotent strip-then-append (mirrors `[copy approval]` from Phase
+2F). `qa_status` is `passed` iff every saved item is `pass`;
+otherwise `needs_attention`. The companion
+`resetCreativePreviewQAAction` strips the block. The QA block lives
+in `prompt_summary`, which `client_content_items_v` (migration 009)
+does NOT project — structurally invisible to the client.
+
+The action whitelists both keys and values (item ids from a fixed
+set, values must be exactly `pass` or `fail`) so no operator-supplied
+free text reaches `prompt_summary` through this path.
+
+### Approval polish (Phase 4F)
+
+`CreativeBriefApprovalPanel` now accepts the manifest's
+`exportReadiness` + `blockers[]` and renders a compact `ManifestSummary`
+beside the approve button. The blockers list is purely informational —
+approval is NOT blocked by them — but the operator sees what still
+needs resolving before the future export script will accept the brief.
+
+### Local export command handoff (Phase 4F)
+
+`CopyExportCommandButton` joins the existing `CopyExportBriefButton`
+on the preview page. It copies a future-safe local export command to
+the clipboard, referencing `scripts/export_visual_preview_stub.py`,
+the preview URL (with current `?template=` / `?theme=` querystrings
+preserved), and the content item id. **The command does not execute
+from the website.** Both copy buttons respect the same
+`disabledReason` derived from `manifest.exportReadiness !== "ready"`,
+so neither writes to the clipboard when blockers remain.
+
+### Migration 011 (PROPOSAL ONLY)
+
+`supabase/migrations/011_client_safe_visual_preview.sql` documents
+the Phase 4E/4F schema change that will eventually land
+(`client_safe_visual_url`, `client_safe_visual_thumbnail_url`,
+`visual_preview_status`). The file is idempotent (`add column if
+not exists` + `do $$ if not exists $$` for the CHECK constraint) but
+is NOT applied in this build chunk. The file's header carries an
+explicit "DO NOT APPLY — proposal only" banner.
+
+The application code does NOT read or write these proposed columns
+in Phase 4F. They become live only after both (a) migration 011 is
+applied AND (b) the proposed Phase 4E server actions
+(`prepareClientVisualPreviewAction` /
+`shareVisualPreviewWithClientAction`) ship — neither lands in 4F.

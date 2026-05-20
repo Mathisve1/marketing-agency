@@ -52,7 +52,7 @@ export function StoryPreviewTemplate({
 
       {focused && (
         <div className="grid gap-3 sm:grid-cols-[minmax(0,260px)_minmax(0,1fr)] max-w-3xl">
-          <PreviewCard aspect="story">
+          <PreviewCard aspect="story" themeId={preview.theme.themeId}>
             <div className="h-1.5 w-12 mx-auto bg-white/30 rounded-full" />
             <div className="mt-2 text-[10px] uppercase tracking-[0.18em] text-white/60 text-center">
               Frame {focused.frameNumber} — focused
@@ -87,6 +87,7 @@ export function StoryPreviewTemplate({
           const card = (
             <PreviewCard
               aspect="story"
+              themeId={preview.theme.themeId}
               className={
                 isFocused ? "ring-2 ring-[color:var(--color-accent)]" : ""
               }

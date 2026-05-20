@@ -59,7 +59,7 @@ export function CarouselPreviewTemplate({
       {focused && (
         <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,360px)] max-w-3xl">
           <div className="max-w-md">
-            <PreviewCard aspect="portrait">
+            <PreviewCard aspect="portrait" themeId={preview.theme.themeId}>
               <div className="text-[10px] uppercase tracking-[0.18em] text-white/60">
                 Slide {focused.slideNumber} — focused
               </div>
@@ -102,6 +102,7 @@ export function CarouselPreviewTemplate({
           const card = (
             <PreviewCard
               aspect="portrait"
+              themeId={preview.theme.themeId}
               className={
                 isFocused ? "ring-2 ring-[color:var(--color-accent)]" : ""
               }

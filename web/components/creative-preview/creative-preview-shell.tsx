@@ -1,13 +1,19 @@
-// Yuvo Studio — Phase 4C preview shell.
+// Yuvo Studio — Phase 4C/4E preview shell.
 //
 // Server component. Wraps a per-mode template with consistent chrome:
-// header (title / subtitle / mode chip / channel chip), warnings
-// footer, and the unambiguous "internal preview only" banner. NEVER
-// imported by /client/*.
+// header (title / subtitle / mode + format + channel + template +
+// theme chips), warnings footer, and the unambiguous "internal
+// preview only" banner. NEVER imported by /client/*.
+//
+// The theme is applied at the `PreviewCard` surface via an explicit
+// `themeId` prop. Server components can't use React.createContext, so
+// each template threads `preview.theme.themeId` into its PreviewCards
+// directly.
 
 import * as React from "react";
 import { Badge } from "@/components/ui/badge";
 import type { VisualPreviewRenderInput } from "@/lib/creative/visual-preview-types";
+import { getThemePreset } from "@/lib/creative/themes";
 
 const MODE_LABEL: Record<string, string> = {
   carousel: "Carousel",
@@ -38,6 +44,7 @@ export function CreativePreviewShell({
           {asset.templateId && (
             <Badge tone="neutral">template: {asset.templateId}</Badge>
           )}
+          <Badge tone="neutral">theme: {theme.themeId}</Badge>
           {theme.brandName && <Badge tone="neutral">brand: {theme.brandName}</Badge>}
           {theme.niche && <Badge tone="neutral">niche: {theme.niche}</Badge>}
           <Badge tone="warn">internal preview only</Badge>
@@ -92,17 +99,21 @@ export function CreativePreviewShell({
   );
 }
 
-/** Reusable "premium / neutral" card surface shared across templates.
- *  Black/white/neutral base. No external image. */
+/** Reusable themed card surface shared across templates. The theme
+ *  is passed explicitly so this can stay a server component (no
+ *  `React.createContext`, which is client-only). */
 export function PreviewCard({
   aspect = "square",
+  themeId = "neutral",
   children,
   className = "",
 }: {
   aspect?: "square" | "portrait" | "story";
+  themeId?: string;
   children: React.ReactNode;
   className?: string;
 }) {
+  const preset = getThemePreset(themeId);
   const aspectClass =
     aspect === "story"
       ? "aspect-[9/16]"
@@ -111,17 +122,9 @@ export function PreviewCard({
         : "aspect-square";
   return (
     <div
-      className={`relative w-full ${aspectClass} rounded-lg overflow-hidden bg-[color:var(--color-ink)] text-white shadow-sm ${className}`}
+      className={`relative w-full ${aspectClass} rounded-lg overflow-hidden shadow-sm ${preset.surfaceClass} ${className}`}
     >
-      {/* Subtle radial highlight for the "premium neutral" feel — pure
-          CSS, no external image. */}
-      <div
-        className="absolute inset-0 opacity-60"
-        style={{
-          backgroundImage:
-            "radial-gradient(60% 80% at 20% 0%, rgba(255,255,255,0.18) 0%, transparent 60%), radial-gradient(40% 60% at 100% 100%, rgba(255,255,255,0.08) 0%, transparent 70%)",
-        }}
-      />
+      <div className={`absolute inset-0 opacity-60 ${preset.highlightClass}`} />
       <div className="relative h-full w-full p-4 flex flex-col">{children}</div>
     </div>
   );

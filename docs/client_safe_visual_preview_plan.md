@@ -260,3 +260,38 @@ Each step keeps the same contract: nothing reaches the client without
 an explicit operator action; nothing paid runs without an explicit
 operator confirmation phrase; nothing irreversible can happen by
 loading a page.
+
+## Phase 4F status (PROPOSAL ONLY — not applied)
+
+Phase 4F shipped the **operator-side polish** that this plan
+depends on:
+
+- Persisted internal QA checklist
+  (`[creative preview QA]` block in `prompt_summary`).
+- Approval panel surfaces the manifest's `export_readiness` +
+  `blockers[]` (informational only — approval is not blocked).
+- "Copy local export command" button (clipboard only; references
+  the stub script).
+
+It did NOT ship the schema or the server actions documented above.
+The migration file `supabase/migrations/011_client_safe_visual_preview.sql`
+exists as a **proposal** that mirrors Option A:
+
+```sql
+alter table public.content_items
+  add column if not exists client_safe_visual_url           text,
+  add column if not exists client_safe_visual_thumbnail_url text,
+  add column if not exists visual_preview_status            text;
+```
+
+The migration is idempotent (`if not exists` / `do $$ … if not
+exists $$` for the CHECK constraint), but its header carries an
+explicit "**DO NOT APPLY — proposal only**" banner. It is NOT applied
+in Phase 4F. A separate, follow-up migration (proposed 012) would
+extend `client_content_items_v` to also project the new fields; that
+view extension is also NOT in scope for Phase 4F.
+
+Application code in Phase 4F does NOT read or write the proposed
+columns; they will be wired only after both the migration AND the
+proposed server actions (`prepareClientVisualPreviewAction` /
+`shareVisualPreviewWithClientAction`) ship in a later phase.

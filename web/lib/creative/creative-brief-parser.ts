@@ -504,3 +504,86 @@ export function parseCreativeBriefApproval(
     notes: sk("creative_brief_approval_notes"),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4F — internal visual QA checklist persistence. Same shape as
+// the approval / brief blocks: structured keys, idempotent strip-then-
+// append, lives in `prompt_summary`. Client portal cannot see it
+// (client_content_items_v does not project prompt_summary).
+
+const QA_MARKER = "\n\n[creative preview QA]\n";
+
+export type CreativePreviewQAStatus =
+  | "none"
+  | "passed"
+  | "needs_attention";
+
+export interface ParsedCreativePreviewQA {
+  status: "passed" | "needs_attention";
+  checkedAt: string | null;
+  checkedBy: string | null;
+  /** Compact map of `qa_item_id -> "pass" | "fail"`. The full label
+   *  set lives in `web/lib/creative/qa-items.ts` (`QA_ITEMS`) — the
+   *  persisted block stores ids only so the labels can evolve without
+   *  invalidating saved checks. */
+  items: Record<string, "pass" | "fail">;
+}
+
+export function hasCreativePreviewQA(
+  promptSummary: string | null | undefined,
+): boolean {
+  return Boolean(
+    promptSummary && promptSummary.includes("[creative preview QA]"),
+  );
+}
+
+export function getCreativePreviewQAStatus(
+  promptSummary: string | null | undefined,
+): CreativePreviewQAStatus {
+  if (!hasCreativePreviewQA(promptSummary)) return "none";
+  const block = (promptSummary as string).split(QA_MARKER).slice(1).join("");
+  const m = block.match(/(?:^|\n)qa_status:\s*([a-z_]+)/i);
+  if (!m) return "none";
+  return m[1] === "passed"
+    ? "passed"
+    : m[1] === "needs_attention"
+      ? "needs_attention"
+      : "none";
+}
+
+/** Full QA block parser. Items are encoded one per line as
+ *  `qa_items: id1=pass,id2=fail,…`. Items line is single-key for
+ *  forward-compat. Returns null when block missing / malformed. */
+export function parseCreativePreviewQA(
+  promptSummary: string | null | undefined,
+): ParsedCreativePreviewQA | null {
+  if (!hasCreativePreviewQA(promptSummary)) return null;
+  const block = (promptSummary as string).split(QA_MARKER).slice(1).join("");
+  const sk = (key: string): string | null => {
+    const m = block.match(new RegExp(`(?:^|\\n)${key}:\\s*(.+?)(?=\\n|$)`, "i"));
+    return m ? m[1].trim() : null;
+  };
+  const statusRaw = sk("qa_status");
+  const status: "passed" | "needs_attention" | null =
+    statusRaw === "passed"
+      ? "passed"
+      : statusRaw === "needs_attention"
+        ? "needs_attention"
+        : null;
+  if (!status) return null;
+
+  const items: Record<string, "pass" | "fail"> = {};
+  const itemsRaw = sk("qa_items");
+  if (itemsRaw) {
+    for (const pair of itemsRaw.split(",")) {
+      const m = pair.trim().match(/^([a-z0-9_]+)=(pass|fail)$/i);
+      if (m) items[m[1]] = m[2].toLowerCase() as "pass" | "fail";
+    }
+  }
+  return {
+    status,
+    checkedAt: sk("qa_checked_at"),
+    checkedBy: sk("qa_checked_by"),
+    items,
+  };
+}

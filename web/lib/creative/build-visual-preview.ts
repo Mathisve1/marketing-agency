@@ -7,7 +7,8 @@
 // render an internal-only preview — no PNG, no export, no client share.
 
 import type { ParsedCreativeBrief, CreativeBriefMode } from "./creative-brief-parser";
-import { resolveTemplateId } from "./templates";
+import { findTemplate, resolveTemplateId } from "./templates";
+import { resolveThemeId } from "./themes";
 import type {
   VisualPreviewAsset,
   VisualPreviewMode,
@@ -25,13 +26,21 @@ export interface BuildVisualPreviewInput {
   /** Result of `parseCreativeBriefBlock(contentItem.promptSummary)`.
    *  May be null when the operator has not run the brief yet. */
   brief: ParsedCreativeBrief | null;
+  /** Phase 4E — `?template=` querystring override (validated by the
+   *  caller; pass null when invalid so the recorded id / default
+   *  takes over). */
+  queryTemplateId?: string | null;
+  /** Phase 4E — `?theme=` querystring override (validated by the
+   *  caller; pass null when invalid so the template default / "neutral"
+   *  takes over). */
+  queryThemeId?: string | null;
 }
 
 function modeForMissingBrief(): VisualPreviewMode {
   return "unknown";
 }
 
-function previewModeFromBriefMode(mode: CreativeBriefMode): VisualPreviewMode {
+export function previewModeFromBriefMode(mode: CreativeBriefMode): VisualPreviewMode {
   switch (mode) {
     case "carousel": return "carousel";
     case "story": return "story";
@@ -48,12 +57,6 @@ function previewModeFromBriefMode(mode: CreativeBriefMode): VisualPreviewMode {
 }
 
 export function buildVisualPreview(input: BuildVisualPreviewInput): VisualPreviewRenderInput {
-  const theme: VisualPreviewTheme = {
-    brandName: input.brandName ?? null,
-    primaryColorHex: input.brandPrimaryColorHex ?? null,
-    niche: input.brandNiche ?? null,
-  };
-
   const title = input.brief?.title ?? input.contentItemTitle ?? "Untitled content item";
   const subtitleParts: string[] = [];
   if (input.brandName) subtitleParts.push(input.brandName);
@@ -68,6 +71,12 @@ export function buildVisualPreview(input: BuildVisualPreviewInput): VisualPrevie
 
   if (!input.brief) {
     // No brief yet — degrade to an unknown placeholder asset.
+    const theme: VisualPreviewTheme = {
+      brandName: input.brandName ?? null,
+      primaryColorHex: input.brandPrimaryColorHex ?? null,
+      niche: input.brandNiche ?? null,
+      themeId: resolveThemeId({ queryThemeId: input.queryThemeId ?? null }),
+    };
     const asset: VisualPreviewAsset = {
       id: input.contentItemId,
       mode: modeForMissingBrief(),
@@ -82,6 +91,20 @@ export function buildVisualPreview(input: BuildVisualPreviewInput): VisualPrevie
   }
 
   const mode = previewModeFromBriefMode(input.brief.mode);
+  // Phase 4E precedence: querystring override → recorded id → default.
+  const effectiveTemplateId =
+    resolveTemplateId(mode, input.queryTemplateId ?? input.brief.templateId);
+  const templateMeta = findTemplate(mode, effectiveTemplateId);
+  const themeId = resolveThemeId({
+    queryThemeId: input.queryThemeId ?? null,
+    templateDefault: templateMeta?.defaultTheme ?? null,
+  });
+  const theme: VisualPreviewTheme = {
+    brandName: input.brandName ?? null,
+    primaryColorHex: input.brandPrimaryColorHex ?? null,
+    niche: input.brandNiche ?? null,
+    themeId,
+  };
   const asset: VisualPreviewAsset = {
     id: input.contentItemId,
     mode,
@@ -90,7 +113,7 @@ export function buildVisualPreview(input: BuildVisualPreviewInput): VisualPrevie
     title,
     subtitle,
     callToAction: input.brief.callToAction,
-    templateId: resolveTemplateId(mode, input.brief.templateId),
+    templateId: effectiveTemplateId,
   };
 
   switch (mode) {

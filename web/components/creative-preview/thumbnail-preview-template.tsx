@@ -22,7 +22,7 @@ export function ThumbnailPreviewTemplate({
         1 × 9:16 ({isReel ? "reel" : "video"} cover frame, planning only)
       </div>
       <div className="grid gap-3 sm:grid-cols-[minmax(0,260px)_1fr] max-w-3xl items-start">
-        <PreviewCard aspect="story">
+        <PreviewCard aspect="story" themeId={preview.theme.themeId}>
           <div className="h-1.5 w-12 mx-auto bg-white/30 rounded-full" />
           <div className="mt-2 text-[10px] uppercase tracking-[0.18em] text-white/60 text-center">
             Cover frame

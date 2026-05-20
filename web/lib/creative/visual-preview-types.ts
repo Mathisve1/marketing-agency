@@ -22,6 +22,9 @@ export interface VisualPreviewTheme {
   primaryColorHex: string | null;
   /** Niche label parsed from the brief (informational chip). */
   niche: string | null;
+  /** Phase 4E — selected theme preset id (resolved from
+   *  `?theme=…` override → template default → "neutral"). */
+  themeId: string;
 }
 
 export interface VisualPreviewSlide {

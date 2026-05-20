@@ -1,26 +1,36 @@
-// Yuvo Studio — Phase 4C internal visual preview route.
+// Yuvo Studio — Phase 4C/4E/4F internal visual preview route.
 //
 // OPERATOR-ONLY. Reads the live content item from Supabase, parses
-// the [creative brief] block (Phase 4A), runs the deterministic
-// visual preview builder, and renders the format-specific React
-// template. Pure HTML/CSS, no PNG export, no client share, no paid
-// call. NEVER reachable from /client/*.
+// the [creative brief] + [creative brief approval] + [creative
+// preview QA] blocks, runs the deterministic visual preview builder,
+// and renders the format-specific React template. Pure HTML/CSS. NO
+// PNG export. NO client share. NO paid call. NEVER reachable from
+// /client/*.
 
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { getCurrentPersona } from "@/lib/auth/persona";
 import { getDataSource, getDefaultWorkspaceId } from "@/lib/data/_source";
-import {
-  getContentItemById,
-} from "@/lib/data/owner-overview";
+import { getContentItemById } from "@/lib/data/owner-overview";
 import { getCampaignById } from "@/lib/data/campaigns";
 import { getBrandById } from "@/lib/data/brands";
 import {
   parseCreativeBriefBlock,
   parseCreativeBriefApproval,
+  parseCreativePreviewQA,
 } from "@/lib/creative/creative-brief-parser";
-import { buildVisualPreview } from "@/lib/creative/build-visual-preview";
+import {
+  buildVisualPreview,
+  previewModeFromBriefMode,
+} from "@/lib/creative/build-visual-preview";
+import { isValidTemplateForMode, resolveTemplateId } from "@/lib/creative/templates";
+import { isValidThemeId } from "@/lib/creative/themes";
+import {
+  buildExportManifest,
+  renderExportManifestText,
+} from "@/lib/creative/export-manifest";
+import { QA_ITEMS } from "@/lib/creative/qa-items";
 import { CreativePreviewShell } from "@/components/creative-preview/creative-preview-shell";
 import { CarouselPreviewTemplate } from "@/components/creative-preview/carousel-preview-template";
 import { StoryPreviewTemplate } from "@/components/creative-preview/story-preview-template";
@@ -28,43 +38,66 @@ import { FeedPostPreviewTemplate } from "@/components/creative-preview/feed-post
 import { LinkedInPreviewTemplate } from "@/components/creative-preview/linkedin-preview-template";
 import { ThumbnailPreviewTemplate } from "@/components/creative-preview/thumbnail-preview-template";
 import { CreativeBriefApprovalPanel } from "@/components/agents/creative-brief-approval-panel";
+import { CreativePreviewQAPanel } from "@/components/agents/creative-preview-qa-panel";
+import { CopyExportBriefButton } from "@/components/creative-preview/copy-export-brief-button";
+import { CopyExportCommandButton } from "@/components/creative-preview/copy-export-command-button";
+import {
+  ExportManifestPanel,
+  TemplateOptionsPanel,
+  ThemeOptionsPanel,
+  WhatHappensNextPanel,
+} from "@/components/creative-preview/preview-side-panels";
 
 export const dynamic = "force-dynamic";
 
 interface PageProps {
   params: Promise<{ contentItemId: string }>;
-  searchParams: Promise<{ slide?: string; frame?: string }>;
+  searchParams: Promise<{
+    slide?: string;
+    frame?: string;
+    template?: string;
+    theme?: string;
+  }>;
 }
 
 export default async function CreativePreviewPage({
   params,
   searchParams,
 }: PageProps) {
-  // Workspace resolution mirrors the rest of /agency/*. The persona
-  // gate is enforced by the agency layout AND re-checked here.
   let workspaceId = getDefaultWorkspaceId();
   if (getDataSource() === "supabase") {
     const persona = await getCurrentPersona();
-    if (!persona) {
-      redirect("/login?next=/agency/creative-briefs");
-    }
+    if (!persona) redirect("/login?next=/agency/creative-briefs");
     if (persona.kind !== "operator") {
       redirect("/login?next=/agency/creative-briefs");
     }
     workspaceId = persona.workspaceIds[0] ?? getDefaultWorkspaceId();
   }
-  void workspaceId; // used by the readers indirectly via RLS
+  void workspaceId;
 
   const { contentItemId } = await params;
   const content = await getContentItemById(contentItemId);
   if (!content) notFound();
 
-  // Brand / campaign labels — same approach as /agency/jobs/[jobId].
   const campaign = await getCampaignById(content.campaignId);
   const brand = campaign ? await getBrandById(campaign.brandId) : null;
 
   const brief = parseCreativeBriefBlock(content.promptSummary);
   const approval = parseCreativeBriefApproval(content.promptSummary);
+  const qa = parseCreativePreviewQA(content.promptSummary);
+
+  // Validate ?template= / ?theme= overrides; never throw on bad input.
+  const sp = await searchParams;
+  const inferredMode = brief ? previewModeFromBriefMode(brief.mode) : "unknown";
+  const queryTemplateRaw = sp.template ?? null;
+  const queryThemeRaw = sp.theme ?? null;
+  const queryTemplateValid =
+    queryTemplateRaw && isValidTemplateForMode(inferredMode, queryTemplateRaw)
+      ? queryTemplateRaw
+      : null;
+  const queryTemplateInvalid = Boolean(queryTemplateRaw && !queryTemplateValid);
+  const queryThemeValid = isValidThemeId(queryThemeRaw) ? queryThemeRaw : null;
+  const queryThemeInvalid = Boolean(queryThemeRaw && !queryThemeValid);
 
   const preview = buildVisualPreview({
     contentItemId: content.id,
@@ -74,13 +107,27 @@ export default async function CreativePreviewPage({
     brandPrimaryColorHex: brand?.primaryColorHex ?? null,
     brandNiche: null,
     brief,
+    queryTemplateId: queryTemplateValid,
+    queryThemeId: queryThemeValid,
   });
 
-  // Phase 4D3 — slide / frame focus from querystring.
-  const sp = await searchParams;
   const focusedSlide = parsePositiveInt(sp.slide);
   const focusedFrame = parsePositiveInt(sp.frame);
   const baseHref = `/agency/creative-briefs/${content.id}/preview`;
+  const currentTemplateId =
+    preview.asset.templateId ?? resolveTemplateId(preview.asset.mode, null);
+
+  const manifest = brief
+    ? buildExportManifest({ preview, approvedInternal: Boolean(approval) })
+    : null;
+  const exportBriefText = manifest
+    ? renderExportManifestText(manifest, { previewUrl: baseHref })
+    : "";
+
+  const exportNotReadyReason =
+    manifest && manifest.exportReadiness === "ready"
+      ? null
+      : "Resolve manifest blockers before exporting.";
 
   return (
     <div className="space-y-6 max-w-6xl">
@@ -96,44 +143,94 @@ export default async function CreativePreviewPage({
         <Badge tone="neutral">content status: {content.status}</Badge>
       </div>
 
-      {!brief ? (
-        <EmptyState contentItemId={content.id} />
-      ) : (
-        <>
-          <CreativePreviewShell preview={preview}>
-            <TemplateFor
-              preview={preview}
-              focusedSlide={focusedSlide}
-              focusedFrame={focusedFrame}
-              baseHref={baseHref}
-            />
-          </CreativePreviewShell>
-
-          <div className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 space-y-2">
-            <div className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
-              Internal approval
-            </div>
-            <CreativeBriefApprovalPanel
-              contentItemId={content.id}
-              currentStatus={approval ? "approved_internal" : "none"}
-              approvedAt={approval?.approvedAt ?? null}
-            />
-          </div>
-
-          <div className="rounded-md border border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] p-3 text-xs text-[color:var(--color-ink-muted)] space-y-1">
-            <div className="font-semibold text-[color:var(--color-ink)]">
-              Next step (planned)
-            </div>
+      {(queryTemplateInvalid || queryThemeInvalid) && (
+        <div className="rounded-md border border-[color:var(--color-warn)]/40 bg-[color:var(--color-warn)]/8 p-3 text-xs space-y-1">
+          {queryTemplateInvalid && (
             <div>
-              <strong>Phase 4D</strong> will add a gated PNG/JPG export
-              path (operator-run, never automatic). <strong>Phase 4E</strong>{" "}
-              adds the client-safe visual preview lifecycle
-              (<code className="font-mono">client_safe_visual_url</code>{" "}
-              + prepare/share). Nothing is shared with the client yet —
-              this page is purely an internal planning preview.
+              ⚠️ Unknown template id{" "}
+              <code className="font-mono">{queryTemplateRaw}</code> for mode{" "}
+              <code className="font-mono">{inferredMode}</code> — falling
+              back to the default template. See the template options panel.
             </div>
+          )}
+          {queryThemeInvalid && (
+            <div>
+              ⚠️ Unknown theme id{" "}
+              <code className="font-mono">{queryThemeRaw}</code> — falling
+              back to the template default or{" "}
+              <code className="font-mono">neutral</code>.
+            </div>
+          )}
+        </div>
+      )}
+
+      {!brief ? (
+        <EmptyState />
+      ) : (
+        <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,320px)]">
+          <div className="space-y-5 min-w-0">
+            <CreativePreviewShell preview={preview}>
+              <TemplateFor
+                preview={preview}
+                focusedSlide={focusedSlide}
+                focusedFrame={focusedFrame}
+                baseHref={baseHref}
+              />
+            </CreativePreviewShell>
+
+            <div className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 space-y-2">
+              <div className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
+                Internal approval
+              </div>
+              <CreativeBriefApprovalPanel
+                contentItemId={content.id}
+                currentStatus={approval ? "approved_internal" : "none"}
+                approvedAt={approval?.approvedAt ?? null}
+                exportReadiness={manifest?.exportReadiness ?? null}
+                blockers={manifest?.blockers ?? []}
+              />
+            </div>
+
+            {manifest && (
+              <div className="space-y-2">
+                <ExportManifestPanel manifest={manifest} />
+                <CopyExportBriefButton
+                  briefText={exportBriefText}
+                  disabledReason={exportNotReadyReason}
+                />
+                <CopyExportCommandButton
+                  contentItemId={content.id}
+                  previewUrl={baseHref}
+                  templateId={currentTemplateId}
+                  themeId={preview.theme.themeId}
+                  disabledReason={exportNotReadyReason}
+                />
+              </div>
+            )}
+
+            <WhatHappensNextPanel />
           </div>
-        </>
+
+          <div className="space-y-4 min-w-0">
+            <CreativePreviewQAPanel
+              contentItemId={content.id}
+              items={QA_ITEMS}
+              initialDecisions={qa?.items ?? {}}
+              initialStatus={qa?.status ?? "none"}
+              initialCheckedAt={qa?.checkedAt ?? null}
+            />
+            <TemplateOptionsPanel
+              preview={preview}
+              baseHref={baseHref}
+              currentTemplateId={currentTemplateId}
+            />
+            <ThemeOptionsPanel
+              baseHref={baseHref}
+              preserveTemplateId={currentTemplateId}
+              currentThemeId={preview.theme.themeId}
+            />
+          </div>
+        </div>
       )}
     </div>
   );
@@ -194,8 +291,7 @@ function parsePositiveInt(raw: string | undefined): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function EmptyState({ contentItemId }: { contentItemId: string }) {
-  void contentItemId;
+function EmptyState() {
   return (
     <div className="rounded-md border border-dashed border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] p-6 space-y-3">
       <div className="font-semibold">No creative brief yet</div>
