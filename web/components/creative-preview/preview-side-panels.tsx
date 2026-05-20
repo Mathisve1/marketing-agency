@@ -248,6 +248,77 @@ export function ExportManifestPanel({ manifest }: { manifest: ExportManifest }) 
 }
 
 // ---------------------------------------------------------------------------
+// Export readiness panel — Phase 4G. Single, plain-English summary of
+// whether the future local export script will accept this preview.
+// "ready" / "blocked" / "unknown" map cleanly to the manifest's three
+// observable states. Always carries the same safety reminders so the
+// operator never has to guess whether clicking something on this page
+// will render pixels (it will not — there is no execution surface).
+
+export type ExportReadinessUiState = "ready" | "blocked" | "unknown";
+
+export function exportReadinessUiState(
+  manifest: ExportManifest | null,
+): ExportReadinessUiState {
+  if (!manifest) return "unknown";
+  if (manifest.exportReadiness === "ready") return "ready";
+  return "blocked";
+}
+
+export function ExportReadinessPanel({
+  manifest,
+}: {
+  manifest: ExportManifest | null;
+}) {
+  const state = exportReadinessUiState(manifest);
+  const tone: "success" | "warn" | "neutral" =
+    state === "ready" ? "success" : state === "blocked" ? "warn" : "neutral";
+  const heading =
+    state === "ready"
+      ? "Ready to export locally"
+      : state === "blocked"
+        ? "Export blocked"
+        : "Export readiness unknown";
+  const explainer =
+    state === "ready"
+      ? "Every manifest blocker is resolved. The local stub script will accept the planned command in dry-run mode."
+      : state === "blocked"
+        ? "Resolve the blockers in the export manifest panel before copying the local command."
+        : "No creative brief on this item yet — the manifest can't be computed.";
+  return (
+    <div className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
+          Export readiness
+        </div>
+        <Badge tone={tone}>{state}</Badge>
+      </div>
+      <div className="text-[11px] text-[color:var(--color-ink)] leading-snug">
+        <div className="font-semibold">{heading}</div>
+        <div className="text-[color:var(--color-ink-muted)] mt-0.5">
+          {explainer}
+        </div>
+      </div>
+      <ul className="text-[11px] text-[color:var(--color-ink-muted)] space-y-0.5 pl-3 list-disc">
+        <li>
+          Not executable from the website. Export runs only on the
+          operator&rsquo;s machine.
+        </li>
+        <li>
+          The local export script is{" "}
+          <strong>dry-run only</strong> in Phase 4G (it refuses{" "}
+          <code className="font-mono">--execute</code>).
+        </li>
+        <li>
+          No files are created yet. No upload. No client share. No paid
+          API.
+        </li>
+      </ul>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // "What happens next?" panel — explains 4D / 4E / 4F roadmap in-place.
 
 export function WhatHappensNextPanel() {

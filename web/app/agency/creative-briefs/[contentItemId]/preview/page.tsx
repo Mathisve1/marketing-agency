@@ -43,6 +43,7 @@ import { CopyExportBriefButton } from "@/components/creative-preview/copy-export
 import { CopyExportCommandButton } from "@/components/creative-preview/copy-export-command-button";
 import {
   ExportManifestPanel,
+  ExportReadinessPanel,
   TemplateOptionsPanel,
   ThemeOptionsPanel,
   WhatHappensNextPanel,
@@ -129,6 +130,21 @@ export default async function CreativePreviewPage({
       ? null
       : "Resolve manifest blockers before exporting.";
 
+  // Phase 4G — stable preview-URL for the local export command. The
+  // dashboard is hosted on Cloudflare Workers; server components
+  // cannot always derive the request origin without an explicit
+  // X-Forwarded-Host. We therefore emit a relative dashboard path
+  // and document on the command that the operator must prepend their
+  // dashboard origin when pasting it into a terminal. The stub
+  // validates BOTH relative and absolute URLs in dry-run mode.
+  const previewQuery = new URLSearchParams();
+  if (currentTemplateId) previewQuery.set("template", currentTemplateId);
+  if (preview.theme.themeId) previewQuery.set("theme", preview.theme.themeId);
+  const previewQs = previewQuery.toString();
+  const previewUrlForCommand = previewQs
+    ? `${baseHref}?${previewQs}`
+    : baseHref;
+
   return (
     <div className="space-y-6 max-w-6xl">
       <div className="flex flex-wrap items-center gap-3 text-sm">
@@ -193,6 +209,7 @@ export default async function CreativePreviewPage({
 
             {manifest && (
               <div className="space-y-2">
+                <ExportReadinessPanel manifest={manifest} />
                 <ExportManifestPanel manifest={manifest} />
                 <CopyExportBriefButton
                   briefText={exportBriefText}
@@ -200,12 +217,18 @@ export default async function CreativePreviewPage({
                 />
                 <CopyExportCommandButton
                   contentItemId={content.id}
-                  previewUrl={baseHref}
+                  previewUrl={previewUrlForCommand}
                   templateId={currentTemplateId}
                   themeId={preview.theme.themeId}
+                  mode={preview.asset.mode}
+                  width={manifest.recommendedWidth}
+                  height={manifest.recommendedHeight}
                   disabledReason={exportNotReadyReason}
                 />
               </div>
+            )}
+            {!manifest && (
+              <ExportReadinessPanel manifest={null} />
             )}
 
             <WhatHappensNextPanel />

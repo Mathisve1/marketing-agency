@@ -389,3 +389,132 @@ in Phase 4F. They become live only after both (a) migration 011 is
 applied AND (b) the proposed Phase 4E server actions
 (`prepareClientVisualPreviewAction` /
 `shareVisualPreviewWithClientAction`) ship — neither lands in 4F.
+
+## Phase 4G additions
+
+Phase 4G adds the **export command contract + dry-run CLI scaffold**
+on top of 4F. No execution surface — the dashboard never spawns the
+command, and the local stub script refuses to render pixels.
+
+### Export command contract (shared)
+
+`web/lib/creative/export-command.ts` — pure TS module. Exports
+`VisualExportCommandInput`, `VisualExportCommand`, plus three pure
+builders: `buildVisualExportCommand`, `buildVisualExportArgs`,
+`buildVisualExportFilenameSuggestion`. The dashboard's
+`CopyExportCommandButton`, the local stub script, and the
+script-level tests all read the same contract — adding a real
+export later only needs the stub flipped to a real implementation.
+
+### Copy local export command button (refactor)
+
+`web/components/creative-preview/copy-export-command-button.tsx`
+now reads the command via `buildVisualExportCommand(…)` and accepts
+`mode`, `width`, `height`, `format`, `outputDir` props. The button
+remains disabled when `manifest.exportReadiness !== "ready"`. A
+small disclosure shows the planned argv length and filename
+suggestion + a full command preview before the operator copies.
+
+### Dry-run CLI stub
+
+`scripts/export_visual_preview_stub.py` is a real `argparse` CLI
+scaffold with strict validation (see
+`docs/visual_preview_export_readiness.md` for the full list).
+Pinned exit codes: `0` dry-run ok, `1` validation failed, `2`
+`--execute` refused. Twenty-three unit tests in
+`scripts/test_export_visual_preview_stub.py` cover the happy path,
+each validation failure mode, the `--execute` refusal, and pin the
+stub's import graph (no puppeteer / playwright / requests / httpx).
+
+### Preview-page UI changes
+
+- New **Export readiness panel** consolidates ready / blocked /
+  unknown into a single chip + plain-English explainer + three-line
+  safety reminders ("Not executable from website / dry-run only /
+  no files created / no upload / no client share / no paid API").
+- `previewUrl` for the local command is now built from the current
+  `?template=` / `?theme=` querystrings so the operator can paste
+  the command without re-tabbing through the page.
+- The disabled `Export PNG (Phase 4D — coming soon)` placeholder
+  on the preview shell is unchanged.
+
+### Creative-briefs list readiness chip
+
+`/agency/creative-briefs` rows now carry a single readiness chip
+per item: `needs brief` → `needs approval` → `approved · export
+pending` → `export ready later`. Derived in-memory from the
+existing `listCreativeBriefQueueForWorkspace` payload — no extra DB
+read, no extra write.
+
+### Safety boundary (unchanged from 4F)
+
+Phase 4G ships zero new write surfaces and zero new external calls.
+The new module / button / panel / chip are pure render code; the
+new stub + tests live entirely under `scripts/`. The dashboard's
+existing safety contract is preserved.
+
+## Phase 4H additions
+
+Phase 4H restructures the dry-run scaffold (in
+`scripts/export_visual_preview_stub.py`) so the future real
+exporter can plug in cleanly. The dashboard still **only copies**
+commands; the script still **refuses** `--execute`.
+
+### Dataclass-based scaffold
+
+`ExportRequest` (validated input) and `ExportResult` (`exit_code +
+manifest + errors`) are the public seam. Five pure entry-points:
+`parse_args`, `validate_request`, `build_plan`, `run_dry_run`,
+`run_execute_refused`, plus the documented placeholder
+`future_export_with_browser` (always exit `3`, never imported).
+
+### Manifest schema bump (`v0` → `v1`)
+
+Adds `planned_output_path`, `html_snapshot_path`, `phase`,
+`session_requirements` (recommended workflow for the future real
+run), and three more `safety.*` flags
+(`creates_generated_assets_row / uploads / publishes /
+shares_with_client` — all `false`).
+
+### New CLI flags
+
+- `--html-snapshot-path PATH` — optional `.html` / `.htm` target
+  the future exporter would write. String-validated; no file
+  created in 4H.
+- `--json` — emits a single machine-readable JSON object on stdout
+  for future automation. Skips the prose footer.
+
+### Stronger URL allowlist
+
+Subdomain-aware: `*.workers.dev`, `*.pages.dev`, `*.yuvo.studio`,
+`*.yuvostudio.com`. Dashboard-shaped URLs that point at a non-preview
+path are rejected. External hosts are rejected unconditionally.
+
+### TS command-builder updates
+
+`web/lib/creative/export-command.ts`:
+- `VisualExportCommandInput` gains optional `htmlSnapshotPath` +
+  `emitJson` fields.
+- `VisualExportCommand` carries a new `plannedOutputPath` string
+  (deterministic `<outputDir>/<filenameSuggestion>`).
+- New helper `buildVisualExportPlannedOutputPath()`.
+- New helper `sanitizeHtmlSnapshotPath()` (mirrors the stub's
+  string-only validation).
+- `buildVisualExportArgs` appends `--html-snapshot-path …` and
+  `--json` when supplied; everything else is unchanged.
+
+`CopyExportCommandButton` now shows the planned on-disk path in the
+disclosure summary instead of the bare filename suggestion.
+
+### Tests
+
+`scripts/test_export_visual_preview_stub.py` now ships **50 tests**
+(23 carried + 27 new). Coverage is documented in detail under
+`docs/visual_preview_export_readiness.md`.
+
+### Safety boundary (unchanged from 4G)
+
+Phase 4H ships zero new write surfaces, zero new external calls,
+zero new browser-automation imports, zero new file-system writes,
+and zero new env reads. The new dataclasses + flags are pure
+metadata. The existing safety contract is preserved.

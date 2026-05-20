@@ -215,6 +215,9 @@ function BriefRow({
           {item.creativeBriefApprovalStatus === "approved_internal" && (
             <Badge tone="success">approved internal</Badge>
           )}
+          {/* Phase 4G — single readiness chip derived from the queue
+              shape. No extra DB read; pure derivation. */}
+          <ReadinessChip item={item} />
           <span className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
             {new Date(item.scheduledFor).toLocaleDateString("en-GB")}
           </span>
@@ -268,6 +271,30 @@ function BriefRow({
       </Link>
     </li>
   );
+}
+
+/** Phase 4G — single-glance readiness chip for the queue rows. All
+ *  states are derived from the existing queue payload (no extra DB
+ *  read; pure transformation). The chip mirrors the readiness states
+ *  surfaced on the preview page so the operator sees the same
+ *  language end-to-end. */
+function ReadinessChip({
+  item,
+}: {
+  item: Awaited<
+    ReturnType<typeof listCreativeBriefQueueForWorkspace>
+  >["items"][number];
+}) {
+  if (item.creativeBriefStatus === "none") {
+    return <Badge tone="neutral">needs brief</Badge>;
+  }
+  if (item.nextAction === "ready_for_export") {
+    return <Badge tone="success">export ready later</Badge>;
+  }
+  if (item.creativeBriefApprovalStatus === "approved_internal") {
+    return <Badge tone="info">approved · export pending</Badge>;
+  }
+  return <Badge tone="warn">needs approval</Badge>;
 }
 
 function Stat({
