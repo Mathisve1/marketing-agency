@@ -1,9 +1,29 @@
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { AgencySidebar } from "@/components/layout/agency-sidebar";
 import { AgencyTopbar } from "@/components/layout/agency-topbar";
 import { getCurrentPersona } from "@/lib/auth/persona";
 import { getDataSource } from "@/lib/data/_source";
 import { hasSupabaseEnv } from "@/lib/supabase/server";
+
+// Build the `?next=` value from the real requested path (injected by
+// web/middleware.ts as `x-pathname` = pathname+search). The path stays
+// literal so it satisfies the login page's `^\/[^\s]*$` check; only the
+// query string is encoded so the whole value survives as one param,
+// e.g. /agency/inbox?filter=urgent -> /agency/inbox%3Ffilter%3Durgent.
+// Falls back to "/agency" if the header is absent (unchanged behaviour).
+async function loginNextForCurrentPath(): Promise<string> {
+  const pathWithSearch = (await headers()).get("x-pathname");
+  if (!pathWithSearch || !pathWithSearch.startsWith("/agency")) {
+    return "/agency";
+  }
+  const q = pathWithSearch.indexOf("?");
+  if (q === -1) return pathWithSearch;
+  return (
+    pathWithSearch.slice(0, q) +
+    encodeURIComponent(pathWithSearch.slice(q))
+  );
+}
 
 export default async function AgencyLayout({
   children,
@@ -16,15 +36,14 @@ export default async function AgencyLayout({
   const requireAuth = getDataSource() === "supabase" && hasSupabaseEnv();
   if (requireAuth) {
     const persona = await getCurrentPersona();
-    if (!persona) redirect("/login?next=/agency");
+    if (!persona) {
+      redirect(`/login?next=${await loginNextForCurrentPath()}`);
+    }
     if (persona.kind !== "operator") {
-      // Signed-in but not an operator. If they're a client member,
-      // bounce them to their portal; otherwise to login.
-      if (persona.kind === "client" && persona.portalIds.length > 0) {
-        redirect("/login?next=/agency");
-      } else {
-        redirect("/login?next=/agency");
-      }
+      // Signed-in but not an operator (client member or unaffiliated).
+      // Either way, bounce to the operator login, preserving the
+      // originally requested deep path.
+      redirect(`/login?next=${await loginNextForCurrentPath()}`);
     }
   }
 

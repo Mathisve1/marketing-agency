@@ -1,6 +1,5 @@
 import { notFound } from "next/navigation";
 import { ClientTopbar } from "@/components/layout/client-topbar";
-import { LogoutButton } from "@/components/auth/logout-button";
 import { getClientPortalBySlug } from "@/lib/data/content";
 import { getDataSource } from "@/lib/data/_source";
 import { hasSupabaseEnv } from "@/lib/supabase/server";
@@ -27,14 +26,17 @@ export default async function ClientPortalLayout({ children, params }: LayoutPro
 
   return (
     <div className="min-h-screen bg-[color:var(--color-cream-soft)]">
-      <ClientTopbar brandName={portal.brand.name} portalSlug={portalSlug} />
+      <ClientTopbar
+        brandName={portal.brand.name}
+        portalSlug={portalSlug}
+        authEnabled={authEnabled}
+      />
       <main className="max-w-4xl mx-auto px-6 py-6">{children}</main>
-      <footer className="max-w-4xl mx-auto px-6 py-8 text-xs text-[color:var(--color-ink-faint)] flex items-center justify-between">
+      <footer className="max-w-4xl mx-auto px-6 py-8 text-xs text-[color:var(--color-ink-faint)]">
         <span>
           Private review portal for {portal.brand.name}. Do not share this link
           publicly.
         </span>
-        {authEnabled && <LogoutButton />}
       </footer>
     </div>
   );

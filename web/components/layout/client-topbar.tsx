@@ -1,13 +1,18 @@
 import Link from "next/link";
+import { LogoutButton } from "@/components/auth/logout-button";
 
 /** Client-portal topbar. Deliberately minimal: brand name only, no
- *  "Operator" / "Yuvo OS" framing, no role-switch link. */
+ *  "Operator" / "Yuvo OS" framing, no role-switch link. Sign-out lives
+ *  here (when auth is live) so it is discoverable instead of buried in
+ *  the footer. */
 export function ClientTopbar({
   brandName,
   portalSlug,
+  authEnabled = false,
 }: {
   brandName: string;
   portalSlug: string;
+  authEnabled?: boolean;
 }) {
   return (
     <header className="h-14 border-b border-[color:var(--color-hairline)] bg-white px-6 flex items-center justify-between">
@@ -30,6 +35,7 @@ export function ClientTopbar({
         >
           Content calendar
         </Link>
+        {authEnabled && <LogoutButton />}
       </nav>
     </header>
   );
