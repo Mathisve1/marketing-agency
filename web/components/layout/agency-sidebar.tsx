@@ -52,6 +52,12 @@ export function AgencySidebar() {
           Copy drafts (non-video)
         </Link>
         <Link
+          href="/agency/creative-briefs"
+          className="block px-3 py-2 rounded-md hover:bg-[color:var(--color-hairline)]"
+        >
+          Creative briefs (social)
+        </Link>
+        <Link
           href="/agency/jobs"
           className="block px-3 py-2 rounded-md hover:bg-[color:var(--color-hairline)]"
         >
