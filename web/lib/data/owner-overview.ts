@@ -1387,6 +1387,26 @@ const COPY_FORMATS: ReadonlySet<string> = new Set([
   "blog_snippet",
 ]);
 
+// Phase 4A — formats that benefit from a structured visual planning
+// brief. A superset of COPY_FORMATS: also includes the two video
+// support paths (reel + UGC), which the brief covers as
+// reel_support / video_visual_support (the agent never produces
+// video; it only specs the cover frame + beats + props).
+const CREATIVE_BRIEF_FORMATS: ReadonlySet<string> = new Set([
+  "feed_post",
+  "static_image",
+  "story",
+  "carousel",
+  "text_post",
+  "organic_reel",
+  "short_video",
+  "ugc_video_ad",
+  "long_video",
+]);
+
+// Email and blog formats are deliberately excluded — they are pure copy
+// channels and have no visual layout.
+
 export interface CopyDraftQueueItem {
   contentItemId: string;
   title: string;
@@ -2212,4 +2232,161 @@ export async function listAgencyInboxItemsForWorkspace(
   };
 
   return { items: out, summary };
+}
+
+// ===========================================================================
+// Phase 4A — Creative Brief queue (READ-ONLY).
+//
+// Lists workspace content items that benefit from a structured visual
+// planning brief (carousel / story / feed_post / static_image /
+// linkedin text / reel-support / video-support). Parses creative brief
+// status from prompt_summary; never writes. Mirrors the shape of
+// listCopyDraftQueueForWorkspace so the UI patterns line up.
+// ===========================================================================
+
+export type CreativeBriefStatus = "none" | "drafted";
+
+export type CreativeBriefNextAction =
+  | "create_creative_brief"
+  | "review_creative_brief"
+  | "skip_email_or_blog";
+
+export interface CreativeBriefQueueItem {
+  contentItemId: string;
+  title: string;
+  campaignId: string;
+  campaignName: string | null;
+  brandName: string | null;
+  channel: string | null;
+  format: string | null;
+  contentStatus: ContentStatus;
+  scheduledFor: string;
+  /** "none" until the Social Creative Brief Agent runs, then "drafted". */
+  creativeBriefStatus: CreativeBriefStatus;
+  /** ISO timestamp from the `[creative brief]` block, when present. */
+  creativeBriefCreatedAt: string | null;
+  /** Mode chosen by the agent (carousel / story / feed_post / …). Null
+   *  when no brief has been drafted yet. */
+  creativeBriefMode: string | null;
+  nextAction: CreativeBriefNextAction;
+  /** Short preview of the current caption_draft, if any (helps the
+   *  operator decide whether they need the brief at all). */
+  captionPreview: string;
+}
+
+export interface CreativeBriefQueueSummary {
+  total: number;
+  none: number;
+  drafted: number;
+}
+
+function parseCreativeBriefStatus(
+  promptSummary: string | null | undefined,
+): { status: CreativeBriefStatus; createdAt: string | null; mode: string | null } {
+  if (!promptSummary || !promptSummary.includes("[creative brief]")) {
+    return { status: "none", createdAt: null, mode: null };
+  }
+  // The block sits behind a "\n\n[creative brief]\n" marker. Match
+  // each key independently — the structured keys live at the top of
+  // the block, the readable markdown follows after a blank line.
+  const block = promptSummary.split("\n\n[creative brief]\n").slice(1).join("");
+  const statusMatch = block.match(/(?:^|\n)creative_brief_status:\s*([a-z_]+)/i);
+  const createdAtMatch = block.match(
+    /(?:^|\n)creative_brief_created_at:\s*([0-9T:\-.Z]+)/i,
+  );
+  const modeMatch = block.match(/(?:^|\n)creative_brief_mode:\s*([a-z_]+)/i);
+  return {
+    status: statusMatch && statusMatch[1] === "drafted" ? "drafted" : "none",
+    createdAt: createdAtMatch ? createdAtMatch[1] : null,
+    mode: modeMatch ? modeMatch[1] : null,
+  };
+}
+
+export async function listCreativeBriefQueueForWorkspace(
+  workspaceId: string,
+): Promise<{
+  items: CreativeBriefQueueItem[];
+  summary: CreativeBriefQueueSummary;
+}> {
+  const [brands, campaigns, contentItems] = await Promise.all([
+    listBrandsForWorkspace(workspaceId),
+    listCampaignsForWorkspace(workspaceId),
+    listContentItemsForWorkspace(workspaceId),
+  ]);
+  const brandById = new Map(brands.map((b) => [b.id, b.name] as const));
+  const campaignById = new Map(
+    campaigns.map((c) => [c.id, { title: c.title, brandId: c.brandId }] as const),
+  );
+
+  const out: CreativeBriefQueueItem[] = [];
+  for (const ci of contentItems) {
+    const fmt = parseFormatFromPromptSummary(ci.promptSummary);
+    if (!fmt || !CREATIVE_BRIEF_FORMATS.has(fmt)) continue;
+
+    // Only surface items the operator can still edit — never items the
+    // client has signed off on. Same gate as the copy-draft queue.
+    const editable =
+      ci.status === "draft" ||
+      ci.status === "generating" ||
+      ci.status === "raw_ready" ||
+      ci.status === "audio_fixer_pending" ||
+      ci.status === "audio_fixed" ||
+      ci.status === "ready_for_client_review" ||
+      ci.status === "changes_requested_by_client" ||
+      ci.status === "failed";
+    if (!editable) continue;
+
+    const ch = parseChannel(ci.promptSummary) ?? ci.platforms[0] ?? null;
+    const camp = campaignById.get(ci.campaignId) ?? null;
+    const brandName = camp ? brandById.get(camp.brandId) ?? null : null;
+    const briefMeta = parseCreativeBriefStatus(ci.promptSummary);
+
+    let nextAction: CreativeBriefNextAction = "create_creative_brief";
+    if (briefMeta.status === "drafted") nextAction = "review_creative_brief";
+
+    const captionPreview = (ci.captionDraft ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 140);
+
+    out.push({
+      contentItemId: ci.id,
+      title: ci.title,
+      campaignId: ci.campaignId,
+      campaignName: camp?.title ?? null,
+      brandName,
+      channel: ch,
+      format: fmt,
+      contentStatus: ci.status,
+      scheduledFor: ci.scheduledFor,
+      creativeBriefStatus: briefMeta.status,
+      creativeBriefCreatedAt: briefMeta.createdAt,
+      creativeBriefMode: briefMeta.mode,
+      nextAction,
+      captionPreview,
+    });
+  }
+
+  // Sort: items that need a brief first, then drafted (newest first), then
+  // by scheduled_for desc within each group.
+  out.sort((a, b) => {
+    if (a.creativeBriefStatus !== b.creativeBriefStatus) {
+      return a.creativeBriefStatus === "none" ? -1 : 1;
+    }
+    return b.scheduledFor.localeCompare(a.scheduledFor);
+  });
+
+  const summary: CreativeBriefQueueSummary = {
+    total: out.length,
+    none: out.filter((i) => i.creativeBriefStatus === "none").length,
+    drafted: out.filter((i) => i.creativeBriefStatus === "drafted").length,
+  };
+
+  return { items: out, summary };
+}
+
+function parseChannel(promptSummary: string | null | undefined): string | null {
+  if (!promptSummary) return null;
+  const m = promptSummary.match(/(?:^|\n)channel:\s*([a-z_]+)/i);
+  return m ? m[1] : null;
 }
