@@ -38,6 +38,8 @@ import {
   planSocialCreativeBrief,
   type CreativeBrief,
 } from "@/lib/agents/social-creative-brief";
+import { getDefaultTemplateId } from "@/lib/creative/templates";
+import type { VisualPreviewMode } from "@/lib/creative/visual-preview-types";
 
 export interface CreativeBriefActionInput {
   contentItemId: string;
@@ -197,6 +199,21 @@ export async function createSocialCreativeBriefAction(
     // cleanly.
     const nowIso = new Date().toISOString();
     const baseSummary = stripCreativeBriefBlock(ci.prompt_summary ?? "");
+    // Resolve a default template id for the preview mode (Phase 4D2).
+    // The preview mode maps deterministically from the brief mode.
+    const previewModeMap: Record<string, VisualPreviewMode> = {
+      carousel: "carousel",
+      story: "story",
+      feed_post: "feed_post",
+      static_image: "static_image",
+      linkedin_text: "linkedin_image",
+      reel_support: "reel_thumbnail",
+      video_visual_support: "video_thumbnail",
+      copy_only: "unknown",
+    };
+    const previewMode = previewModeMap[brief.mode] ?? "unknown";
+    const templateId = getDefaultTemplateId(previewMode);
+
     const briefBlock =
       BRIEF_BLOCK_MARKER +
       [
@@ -205,6 +222,7 @@ export async function createSocialCreativeBriefAction(
         `creative_brief_format: ${format}`,
         `creative_brief_channel: ${channel}`,
         `creative_brief_mode: ${brief.mode}`,
+        templateId ? `creative_brief_template_id: ${templateId}` : null,
         `creative_brief_created_at: ${nowIso}`,
         input.operatorNotes
           ? `creative_brief_operator_note: ${input.operatorNotes}`

@@ -118,6 +118,12 @@ function BriefRow({
           {item.creativeBriefMode && (
             <Badge tone="neutral">mode: {item.creativeBriefMode}</Badge>
           )}
+          {item.creativeBriefTemplateId && (
+            <Badge tone="neutral">tpl: {item.creativeBriefTemplateId}</Badge>
+          )}
+          {item.creativeBriefApprovalStatus === "approved_internal" && (
+            <Badge tone="success">approved internal</Badge>
+          )}
           <span className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
             {new Date(item.scheduledFor).toLocaleDateString("en-GB")}
           </span>
@@ -137,11 +143,19 @@ function BriefRow({
             brief drafted {new Date(item.creativeBriefCreatedAt).toLocaleString("en-GB")}
           </div>
         )}
-        <div className="mt-3">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <CreativeBriefPanel
             contentItemId={item.contentItemId}
             currentStatus={item.creativeBriefStatus}
           />
+          {item.creativeBriefStatus === "drafted" && (
+            <Link
+              href={`/agency/creative-briefs/${item.contentItemId}/preview`}
+              className="text-xs px-2.5 py-1.5 rounded-md border border-[color:var(--color-accent)]/40 bg-[color:var(--color-accent)]/8 text-[color:var(--color-accent)] hover:bg-[color:var(--color-accent)]/15 font-semibold"
+            >
+              Preview visuals →
+            </Link>
+          )}
         </div>
       </div>
       <Link
