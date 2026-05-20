@@ -164,6 +164,26 @@ export async function listContentItemsForWorkspace(
   return (data as unknown as ContentItemRow[]).map(contentItemRowToContentItem);
 }
 
+/** Single content_item by id. Phase 3F — added so /agency/jobs/[jobId]
+ *  can resolve the parent content item without depending on the
+ *  in-memory demo store. Read-only. Returns null if not found. */
+export async function getContentItemById(
+  contentItemId: string,
+): Promise<ContentItem | null> {
+  if (getDataSource() === "demo") {
+    return DEMO_CONTENT.find((c) => c.id === contentItemId) ?? null;
+  }
+  const supabase = getSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("content_items")
+    .select(CONTENT_ITEM_SELECT)
+    .eq("id", contentItemId)
+    .maybeSingle();
+  if (error) throw new SupabaseDataError("getContentItemById", error);
+  if (!data) return null;
+  return contentItemRowToContentItem(data as unknown as ContentItemRow);
+}
+
 /** Every regeneration_request visible to the workspace, newest first. */
 export async function listRegenerationRequestsForWorkspace(
   workspaceId: string,
