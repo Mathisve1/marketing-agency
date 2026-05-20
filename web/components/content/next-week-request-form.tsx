@@ -73,7 +73,12 @@ export function NextWeekRequestForm({ portalSlug, isLive }: Props) {
           {flash.error}
         </div>
       )}
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-3">
+        {!body.trim() && !pending && (
+          <span className="text-xs text-[color:var(--color-ink-faint)]">
+            Write a request to enable sending
+          </span>
+        )}
         <Button
           type="submit"
           variant="primary"
