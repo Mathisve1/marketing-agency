@@ -32,7 +32,11 @@ export function LinkedInPreviewTemplate({
             <PreviewMetaRow label="CTA" value={a.callToAction ?? undefined} />
           </div>
         </div>
-        <PreviewCard aspect="square" themeId={preview.theme.themeId}>
+        <PreviewCard
+          aspect="square"
+          themeId={preview.theme.themeId}
+          exportSlide={1}
+        >
           <div className="text-[10px] uppercase tracking-[0.18em] text-white/60">
             Optional 1:1 companion
           </div>

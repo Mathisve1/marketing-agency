@@ -456,3 +456,137 @@ anything visual.
 - No `child_process` / `spawn` / `exec`. No server-side Puppeteer
   execution.
 - The dashboard never auto-runs the export stub.
+
+## Phase 5A — local-only real-export scaffold (shipped, gated)
+
+Phase 5A keeps the CLI dry-run by default AND finalises the surface
+the future real-screenshot commit plugs into. **No pixels are
+rendered today**, even if Playwright/pyppeteer is already installed
+on the operator's machine.
+
+### What's new
+
+- New CLI flag `--confirm-local-export PHRASE`. To even attempt the
+  real-export branch, the operator MUST pass the EXACT phrase
+  `"I UNDERSTAND THIS CREATES A LOCAL FILE ONLY"` alongside
+  `--execute`. Missing or wrong phrase → exit 2 with a clear
+  pointer to the right invocation.
+- New exit code `EXIT_DEPENDENCY_MISSING = 4`. Returned when
+  `--execute` reached the real branch with the correct
+  confirmation phrase but no approved browser-automation runtime
+  is available.
+- New constants:
+  - `APPROVED_BROWSER_RUNTIMES` — the runtimes the system can ever
+    use (`playwright.sync_api`, `pyppeteer`).
+  - `APPROVED_BROWSER_RUNTIMES_PERMITTED_FOR_EXECUTE` — currently
+    `()`. The **second gate**. Even if a runtime is installed, it
+    must also be listed here for `_detect_browser_runtime()` to
+    return it. A future commit (gated on operator approval) flips
+    an entry into this tuple.
+- New runtime probe `_detect_browser_runtime()`. Uses
+  `importlib.util.find_spec` (no actual import; no side-effects)
+  and the permit gate above. Returns the chosen runtime name or
+  None.
+- New dispatch helper `run_local_browser_export(req)`. Reachable
+  only when `--execute` AND the correct confirmation phrase are
+  both present. Probes for a runtime; on miss → exit 4; on hit →
+  defers to `future_export_with_browser(req, runtime=...)` which
+  still returns exit 3 (`EXIT_NOT_IMPLEMENTED`) until the real
+  screenshot code lands in a dependency-approved commit.
+- Manifest grows two blocks:
+  - `runtime` — `execute_requested`, `confirmation_phrase_passed`,
+    `confirmation_phrase_matches`, `approved_runtimes`,
+    `detected_runtime`, `real_export_attempted`.
+  - `export_target_selectors` — names the stable `data-export-*`
+    attributes the future exporter will use as locators (see
+    below).
+- Manifest `phase` re-tagged `5a_local_exporter_scaffold`.
+- Manifest `real_export_status` now reports
+  `"dependency_missing"` (today, with the empty permit list) or
+  `"dependency_present_impl_pending"` (future, once an entry is
+  permitted).
+
+### Export target DOM markers
+
+The preview templates render stable `data-export-*` attributes the
+future real exporter uses as locators. Pure DOM markers — no
+visual change, no client-facing exposure (the brief + approval
+blocks still live in `prompt_summary`, invisible to the client
+portal).
+
+| Attribute | Carrier | Value |
+|---|---|---|
+| `data-export-root` | preview shell `<div>` wrapping the templates | (boolean) |
+| `data-export-mode` | same wrapper | `carousel \| story \| feed_post \| static_image \| linkedin_image \| reel_thumbnail \| video_thumbnail \| unknown` |
+| `data-export-slide` | `PreviewCard` in carousel grid (and the single card in feed/linkedin/thumbnail modes) | `1..N` |
+| `data-export-frame` | `PreviewCard` in story grid | `1..N` |
+
+The focused/large carousel + story cards (the inline expanded
+view) deliberately carry NO data-export-* attributes so the
+locator is always unique inside a single preview.
+
+### Required confirmation phrase
+
+```
+--confirm-local-export "I UNDERSTAND THIS CREATES A LOCAL FILE ONLY"
+```
+
+Case-sensitive. Missing or wrong → exit 2.
+
+### Local-only contract (no upload, no Supabase, no client share)
+
+The real-export branch will:
+
+1. Open `req.preview_url` in the operator's logged-in browser
+   session (via the detected runtime).
+2. Locate `[data-export-root]` then `[data-export-slide="N"]` /
+   `[data-export-frame="N"]` / fallback `[data-export-slide="1"]`.
+3. Screenshot the target at the template's recommended export
+   size.
+4. Save PNG/JPG to the manifest's `planned_output_path`.
+
+The real-export branch will NEVER:
+
+- Upload the file anywhere (Phase 5B decides storage; until then
+  the file stays local).
+- Call Supabase. No `generated_assets` row is inserted.
+- Share with the client. `client_safe_visual_url` does not exist
+  until migration 011 is applied (proposal only).
+- Publish anything. The dashboard has no publishing surface.
+- Call OpenAI / Anthropic / DALL·E / Imagen / Stable Diffusion /
+  Seedance / Enhancor / Audio Fixer.
+
+### Future storage / share / publish phases
+
+- **Phase 5B** — choose storage (R2 vs Supabase Storage vs local).
+- **Phase 5C** — apply migration 011 (or its successor) and ship
+  `prepareClientVisualPreviewAction` /
+  `shareVisualPreviewWithClientAction`.
+- **Phase 5D** — client-side approval / change-request loop.
+- **Phase 5E** — publishing planning only (no real posting).
+
+Each step keeps the same contract: nothing reaches the client
+without an explicit operator action; nothing paid runs without an
+explicit operator confirmation phrase; nothing irreversible can
+happen by loading a page.
+
+## Phase 5C — client-share lifecycle scaffold (shipped, fail-soft)
+
+Phase 5C does not change export readiness itself. It adds the
+client-share lifecycle scaffold *next to* the existing export
+manifest panel:
+
+- A new `ClientVisualPreviewPanel` on the preview page renders
+  schema status + internal-approval state + manifest readiness +
+  whether an uploaded asset exists. Today the uploaded-asset
+  signal is always `false` (no upload pipe yet); the panel reports
+  it that way.
+- The "next step" line picks the single next missing prerequisite
+  so the operator sees one unambiguous action: usually "Apply
+  migration 012 + configure R2 binding (Phase 5C+)".
+- Two disabled buttons ("Prepare client preview (Phase 5D)" and
+  "Share with client (Phase 5D)") sit underneath. Neither is wired
+  to anything. The real prepare/share flow lands in Phase 5D.
+
+The Phase 5A export contract is unchanged. The Phase 5B storage
+plan is unchanged. Phase 5C only adds the client-share gate on top.

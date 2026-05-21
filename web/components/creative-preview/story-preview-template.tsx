@@ -88,6 +88,7 @@ export function StoryPreviewTemplate({
             <PreviewCard
               aspect="story"
               themeId={preview.theme.themeId}
+              exportFrame={f.frameNumber}
               className={
                 isFocused ? "ring-2 ring-[color:var(--color-accent)]" : ""
               }

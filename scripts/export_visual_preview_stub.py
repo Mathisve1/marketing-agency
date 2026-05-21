@@ -1,37 +1,59 @@
-"""Yuvo Studio - Phase 4H local visual preview export scaffold.
+"""Yuvo Studio - Phase 4H/5A local visual preview export scaffold.
 
-DRY-RUN ONLY. This script validates the export command that the
-dashboard's `Copy local export command` button hands to the operator,
-plans the deterministic output path, and prints a manifest. It NEVER
-renders pixels, opens a browser, makes a network request, reads an
-env var, or writes a file.
+DRY-RUN BY DEFAULT. This script validates the export command that
+the dashboard's `Copy local export command` button hands to the
+operator, plans the deterministic output path, prints a manifest,
+and — when a browser-automation runtime is approved + installed —
+will dispatch into a local-only real-export branch. It NEVER
+performs paid calls, uploads anything, writes Supabase, creates
+`generated_assets` rows, or shares anything with a client.
 
-What changed in Phase 4H (vs Phase 4G stub):
+What changed in Phase 5A (vs Phase 4H stub):
 
-  - The CLI is now a small structured scaffold around two dataclasses
-    (`ExportRequest`, `ExportResult`). The future real implementation
-    plugs in behind `future_export_with_browser()` without touching
-    the argparse contract or the dashboard.
-  - New `--html-snapshot-path` arg. In dry-run mode the path is
-    validated and surfaced on the manifest. No file is created.
-  - The manifest now carries `planned_output_path` (deterministic
-    `<output_dir>/<filename_suggestion>`).
-  - URL validation is tightened to explicitly accept the
-    `yuvo-dashboard.*.workers.dev` host plus localhost / relative
-    dashboard paths. Unrelated external URLs are rejected.
-  - New `--json` flag prints machine-readable JSON only (no prose).
+  - New `--confirm-local-export PHRASE` arg. To even *attempt* a
+    real local export the operator must pass the EXACT phrase
+      "I UNDERSTAND THIS CREATES A LOCAL FILE ONLY"
+    alongside `--execute`. Missing / wrong phrase → exit 2 with a
+    clear message.
+  - New runtime probe `_detect_browser_runtime()`. Uses
+    `importlib.util.find_spec` (no actual import side-effects) to
+    look for `playwright.sync_api` then `pyppeteer`. Returns the
+    chosen module name or `None`.
+  - New dispatch `run_local_browser_export(req)`. When `--execute`
+    is passed WITH the confirmation phrase:
+      * If no runtime is detected → exit 4 (EXIT_DEPENDENCY_MISSING)
+        with a message that names the missing package and explicitly
+        says it must be operator-approved before install.
+      * If a runtime is detected → defer to
+        `future_export_with_browser(req, runtime=<name>)` which today
+        still returns exit 3 (EXIT_NOT_IMPLEMENTED). The real
+        screenshot code lives in a separate, dependency-approved
+        commit; the surface this script exposes for it is now final.
+  - The manifest grows a `runtime` block describing what was
+    detected, what was attempted, and whether the confirmation phrase
+    was passed.
+  - All existing Phase 4H behaviour preserved: dry-run is default,
+    `--execute` without confirmation is refused, exit codes 0/1/2/3
+    keep their meanings, JSON mode is unchanged.
 
 What still does NOT happen:
 
   - No `import puppeteer`, `playwright`, `pyppeteer`, `selenium`.
+    `importlib.util.find_spec` only inspects sys.path; it does not
+    import or execute the modules.
   - No `import requests`, `httpx`, `aiohttp`. No `urllib.request`
     network call. (`urllib.parse.urlparse` is imported for parsing.)
   - No filesystem writes (output dir / html snapshot path are
     validated as strings; no `os.makedirs` / `Path.write_*`).
   - No env vars read (`os.environ` not imported anywhere).
   - No subprocess (`subprocess` not imported).
-  - `--execute` is refused with exit code 2 until Phase 4I lands a
-    real local browser-based exporter behind the same contract.
+  - `--execute` is refused (exit 2 or 4) on every code path until
+    the operator EXPLICITLY approves a browser-automation dependency
+    AND a future phase lands the screenshot implementation behind
+    the same `ExportRequest` contract.
+  - Even when the future real path lands, it will NOT upload,
+    publish, share with the client, or write any Supabase business
+    table.
 
 A pytest test pins the script's import graph so any future drift on
 these guarantees fails CI.
@@ -41,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.util
 import json
 import re
 import sys
@@ -96,8 +119,47 @@ ALLOWED_DASHBOARD_HOST_RE = re.compile(
 # Sentinel exit codes — pinned so the dashboard / CI can match on them.
 EXIT_OK_DRY_RUN = 0
 EXIT_VALIDATION_FAILED = 1
+# 2: --execute was passed but the run was refused for an operator-
+# facing reason (missing confirmation phrase OR no real impl yet on
+# the legacy Phase 4H path). Always recoverable by re-invoking with
+# the right flags.
 EXIT_EXECUTE_REFUSED = 2
-EXIT_NOT_IMPLEMENTED = 3  # reserved for the future real path
+# 3: --execute reached the future real-impl branch (dependency was
+# detected) but the screenshot code has not yet been landed in a
+# dependency-approved phase. Distinct from "dependency missing" so
+# the operator knows install was successful but they're waiting on a
+# future commit. Reserved.
+EXIT_NOT_IMPLEMENTED = 3
+# Phase 5A — 4: --execute reached the real branch with a valid
+# confirmation phrase, but no approved browser-automation runtime
+# (playwright / pyppeteer) is installed yet. The operator must
+# explicitly approve the dependency before re-running.
+EXIT_DEPENDENCY_MISSING = 4
+
+# Phase 5A — exact confirmation phrase the operator MUST pass to even
+# attempt a real local export. Wrong phrase / missing phrase → exit 2.
+LOCAL_EXPORT_CONFIRMATION_PHRASE = (
+    "I UNDERSTAND THIS CREATES A LOCAL FILE ONLY"
+)
+
+# Phase 5A — ordered list of browser-automation runtimes the future
+# real exporter will accept. `importlib.util.find_spec` is used to
+# probe without importing (no side-effects). New entries should be
+# added at the END so detection stays deterministic.
+APPROVED_BROWSER_RUNTIMES = (
+    "playwright.sync_api",
+    "pyppeteer",
+)
+
+# Phase 5A — runtimes that an operator has EXPLICITLY approved for
+# use in the real-export branch. Currently empty by design. A future
+# commit (gated on operator approval) will flip one of the entries in
+# `APPROVED_BROWSER_RUNTIMES` into this tuple. Until that happens,
+# `_detect_browser_runtime` returns None even if Playwright /
+# pyppeteer happens to be installed on the dev machine — preventing
+# the real-export branch from ever firing by accident on a developer
+# laptop that already has Playwright in its pip env.
+APPROVED_BROWSER_RUNTIMES_PERMITTED_FOR_EXECUTE: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +192,11 @@ class ExportRequest:
     execute: bool
     html_snapshot_path: str | None
     emit_json: bool
+    # Phase 5A — the operator-supplied confirmation phrase. When
+    # `--execute` is set, this MUST be exactly
+    # `LOCAL_EXPORT_CONFIRMATION_PHRASE` for the real branch to be
+    # attempted. Outside `--execute` the field is informational.
+    confirm_local_export: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,6 +266,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Optional local .html / .htm path the future exporter "
             "will save the rendered preview into. Validated as a "
             "string only — no file is written in dry-run mode."
+        ),
+    )
+    p.add_argument(
+        "--confirm-local-export",
+        default=None,
+        metavar="PHRASE",
+        help=(
+            "Phase 5A — explicit operator confirmation phrase. To even "
+            "attempt a real local export the operator MUST pass: "
+            f"\"{LOCAL_EXPORT_CONFIRMATION_PHRASE}\". Missing or wrong "
+            "phrase paired with --execute → exit 2."
         ),
     )
     p.add_argument(
@@ -372,8 +450,61 @@ def validate_request(args: argparse.Namespace) -> tuple[ExportRequest | None, li
         execute=bool(args.execute),
         html_snapshot_path=snapshot,
         emit_json=bool(args.emit_json),
+        confirm_local_export=getattr(args, "confirm_local_export", None),
     )
     return req, []
+
+
+# ---------------------------------------------------------------------------
+# Phase 5A — runtime detection + real-branch dispatch
+# ---------------------------------------------------------------------------
+
+
+def _detect_browser_runtime() -> str | None:
+    """Return the first APPROVED-AND-PERMITTED runtime spec that is
+    importable, or None. Uses `importlib.util.find_spec` — DOES NOT
+    import the module (no side-effects, no actual browser launched,
+    no env var read).
+
+    Phase 5A safety: even if a runtime in `APPROVED_BROWSER_RUNTIMES`
+    is installed on the operator's machine, this helper returns None
+    unless that runtime is ALSO listed in
+    `APPROVED_BROWSER_RUNTIMES_PERMITTED_FOR_EXECUTE` (currently `()`).
+    This double-gate prevents the real-export branch from firing on
+    a developer laptop that happens to have Playwright in its pip env.
+    A future commit explicitly flips a permitted entry.
+    """
+    for spec_name in APPROVED_BROWSER_RUNTIMES:
+        try:
+            if importlib.util.find_spec(spec_name) is None:
+                continue
+        except (ImportError, ValueError):
+            # Bad sys.path entries / partially-installed packages —
+            # treat as "not installed" rather than crashing the CLI.
+            continue
+        # The spec is importable. Now apply the permit gate.
+        if spec_name not in APPROVED_BROWSER_RUNTIMES_PERMITTED_FOR_EXECUTE:
+            continue
+        return spec_name
+    return None
+
+
+def _runtime_status_block(
+    req: ExportRequest, detected: str | None
+) -> dict[str, Any]:
+    """Manifest sub-block describing where Phase 5A landed. Lets the
+    operator (and the dashboard's `Copy export brief` plaintext) read
+    exactly what the script saw."""
+    return {
+        "execute_requested": req.execute,
+        "confirmation_phrase_passed": req.confirm_local_export is not None,
+        "confirmation_phrase_matches": (
+            req.confirm_local_export == LOCAL_EXPORT_CONFIRMATION_PHRASE
+        ),
+        "approved_runtimes": list(APPROVED_BROWSER_RUNTIMES),
+        "detected_runtime": detected,
+        "real_export_attempted": False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +517,10 @@ def build_plan(req: ExportRequest) -> dict[str, Any]:
     function; safe to call from tests / future automation."""
     filename = _filename_suggestion(req)
     planned_output_path = _planned_output_path(req)
+    detected_runtime = _detect_browser_runtime()
     return {
         "schema": "yuvo.studio/visual_export_manifest/v1",
-        "phase": "4h_local_exporter_scaffold",
+        "phase": "5a_local_exporter_scaffold",
         "content_item_id": req.content_item_id,
         "preview_url": req.preview_url,
         "mode": req.mode,
@@ -405,8 +537,14 @@ def build_plan(req: ExportRequest) -> dict[str, Any]:
         "filename_suggestion": filename,
         "planned_output_path": planned_output_path,
         "html_snapshot_path": req.html_snapshot_path,
-        "real_export_status": "not_implemented_in_phase_4h",
-        "next_phase": "phase_4i_local_browser_exporter",
+        "real_export_status": (
+            "dependency_missing"
+            if detected_runtime is None
+            else "dependency_present_impl_pending"
+        ),
+        "next_phase": "phase_5a_followup_real_screenshot_impl",
+        "runtime": _runtime_status_block(req, detected_runtime),
+        "export_target_selectors": _export_target_selectors(req),
         "session_requirements": {
             "needs_authenticated_browser_session": True,
             "production_cookies_handled_by_this_script": False,
@@ -415,8 +553,9 @@ def build_plan(req: ExportRequest) -> dict[str, Any]:
                 "everyday browser.",
                 "Open the preview URL in that authenticated browser.",
                 "Wait for fonts + radial highlight to fully render.",
-                "Once Phase 4I ships, this script will reuse your "
-                "browser's session cookie to screenshot the same URL.",
+                "Once a browser-automation dependency is approved + "
+                "installed, this script will reuse your browser's "
+                "session cookie to screenshot the same URL.",
             ],
         },
         "safety": {
@@ -433,6 +572,29 @@ def build_plan(req: ExportRequest) -> dict[str, Any]:
     }
 
 
+def _export_target_selectors(req: ExportRequest) -> dict[str, str]:
+    """Phase 5A — names the stable data-* attributes the future real
+    exporter will use to locate the screenshot target on the preview
+    page. The dashboard renders these on its React templates so the
+    operator + exporter agree on the selector vocabulary even before
+    the browser runtime lands."""
+    root = '[data-export-root]'
+    selectors: dict[str, str] = {
+        "root": root,
+        "mode_attribute": f'[data-export-mode="{req.mode}"]',
+    }
+    if req.slide_number and req.slide_number > 0:
+        selectors["target"] = f'[data-export-slide="{req.slide_number}"]'
+    elif req.frame_number and req.frame_number > 0:
+        selectors["target"] = f'[data-export-frame="{req.frame_number}"]'
+    else:
+        # Single-card modes (feed_post / static_image / linkedin /
+        # thumbnails) render exactly one PreviewCard with
+        # data-export-slide="1".
+        selectors["target"] = '[data-export-slide="1"]'
+    return selectors
+
+
 def run_dry_run(req: ExportRequest) -> ExportResult:
     return ExportResult(
         exit_code=EXIT_OK_DRY_RUN,
@@ -442,43 +604,98 @@ def run_dry_run(req: ExportRequest) -> ExportResult:
 
 
 def run_execute_refused(req: ExportRequest) -> ExportResult:
+    """Phase 4H semantics, preserved. Used when `--execute` was passed
+    WITHOUT the Phase 5A confirmation phrase, or with a wrong phrase.
+    """
     return ExportResult(
         exit_code=EXIT_EXECUTE_REFUSED,
         manifest=build_plan(req),
         errors=[
-            "--execute is not implemented in Phase 4H. The real "
-            "export pipeline lands in Phase 4I+ (operator-run "
-            "Playwright/Puppeteer against the dashboard preview URL, "
-            "behind the same Seedance-style confirmation gate). "
-            "Re-run without --execute."
+            "--execute requires the explicit confirmation phrase. "
+            "Re-run with:  --confirm-local-export "
+            f"\"{LOCAL_EXPORT_CONFIRMATION_PHRASE}\". "
+            "No browser was opened, no network call was made, no file "
+            "was written."
         ],
     )
 
 
-def future_export_with_browser(req: ExportRequest) -> ExportResult:
-    """Placeholder for the Phase 4I+ real implementation.
+def run_local_browser_export(req: ExportRequest) -> ExportResult:
+    """Phase 5A — real local-export dispatch. Only reachable when
+    `--execute` AND the correct `--confirm-local-export` phrase are
+    BOTH present.
+
+    Probes for an approved browser-automation runtime via
+    `_detect_browser_runtime()`. If none is installed → exit 4
+    (`EXIT_DEPENDENCY_MISSING`) with a friendly message naming the
+    accepted runtimes. If a runtime IS installed → defer to
+    `future_export_with_browser(req, runtime=...)` which still
+    returns `EXIT_NOT_IMPLEMENTED` today; the actual screenshot
+    code lives in a future dependency-approved commit.
+
+    This function itself NEVER imports the runtime — it only probes.
+    """
+    detected = _detect_browser_runtime()
+    if detected is None:
+        return ExportResult(
+            exit_code=EXIT_DEPENDENCY_MISSING,
+            manifest=build_plan(req),
+            errors=[
+                "Real export requires an approved browser-automation "
+                "dependency (one of: "
+                f"{', '.join(APPROVED_BROWSER_RUNTIMES)}). None was "
+                "detected. Operator approval is REQUIRED before "
+                "installing — this script does NOT install anything. "
+                "No browser was opened, no network call was made, no "
+                "file was written.",
+            ],
+        )
+    # Dependency present — defer to the placeholder. The placeholder
+    # NEVER imports the runtime either; it only carries the dispatch
+    # contract for the future commit that ships the real screenshot
+    # code behind a freshly approved dependency.
+    return future_export_with_browser(req, runtime=detected)
+
+
+def future_export_with_browser(
+    req: ExportRequest, runtime: str | None = None
+) -> ExportResult:
+    """Placeholder for the Phase 5A-followup real implementation.
 
     DO NOT add a browser-automation import to satisfy this stub.
-    Future phases will:
+    Future commits (gated on explicit operator approval of the
+    dependency) will:
       1. Confirm the operator has a logged-in dashboard session.
-      2. Use a vendored or locally-installed browser-automation
-         library to open `req.preview_url` and screenshot at
-         `req.width` x `req.height`.
+      2. Use the detected runtime (passed in via `runtime`) to open
+         `req.preview_url` and screenshot the element matching the
+         export-target selector (`data-export-slide` /
+         `data-export-frame` / fallback `[data-export-slide="1"]`).
       3. Save PNG/JPG to `planned_output_path`.
       4. NEVER auto-upload, auto-share, or auto-publish.
+      5. NEVER write Supabase. NEVER create `generated_assets` rows.
 
-    Today this function unconditionally returns an EXIT_NOT_IMPLEMENTED
-    result so any accidental call site (e.g. a future server action
-    that wires the script through `subprocess`) surfaces clearly
-    instead of silently succeeding.
+    Today this function unconditionally returns an
+    EXIT_NOT_IMPLEMENTED result so any accidental call site (e.g. a
+    future server action that wires the script through `subprocess`)
+    surfaces clearly instead of silently succeeding.
     """
+    manifest = build_plan(req)
+    # Annotate the runtime block to make the "I got past the dep
+    # check but the real code isn't landed" state observable.
+    manifest = dict(manifest)
+    runtime_block = dict(manifest.get("runtime", {}))
+    runtime_block["real_export_attempted"] = True
+    runtime_block["detected_runtime"] = runtime
+    manifest["runtime"] = runtime_block
     return ExportResult(
         exit_code=EXIT_NOT_IMPLEMENTED,
-        manifest=build_plan(req),
+        manifest=manifest,
         errors=[
-            "future_export_with_browser() is a placeholder. The real "
-            "implementation arrives in Phase 4I+ and lives behind the "
-            "same ExportRequest contract."
+            "future_export_with_browser() is a placeholder. A browser-"
+            "automation runtime is installed (detected: "
+            f"{runtime}), but the real screenshot code has not yet "
+            "been landed in a dependency-approved commit. Stop here "
+            "and ask the operator before adding the implementation.",
         ],
     )
 
@@ -539,7 +756,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_VALIDATION_FAILED
 
     if req.execute:
-        result = run_execute_refused(req)
+        # Phase 5A gate: require the exact confirmation phrase before
+        # we even probe for a runtime. Without it → exit 2.
+        if req.confirm_local_export != LOCAL_EXPORT_CONFIRMATION_PHRASE:
+            result = run_execute_refused(req)
+        else:
+            # Phrase OK → dispatch into the real-branch helper. That
+            # helper probes for an approved runtime and either exits
+            # 4 (missing) or defers to the placeholder (exit 3).
+            result = run_local_browser_export(req)
     else:
         result = run_dry_run(req)
     _emit(result, req=req)

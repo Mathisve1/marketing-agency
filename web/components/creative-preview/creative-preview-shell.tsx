@@ -86,7 +86,12 @@ export function CreativePreviewShell({
         </div>
       </div>
 
-      <div>{children}</div>
+      {/* Phase 5A — stable export-root wrapper for the future local
+          screenshot pipe. Carries `data-export-root` and
+          `data-export-mode` so a Playwright/Puppeteer locator can
+          scope into a single preview surface. Pure DOM marker; no
+          visual change. */}
+      <div data-export-root data-export-mode={asset.mode}>{children}</div>
 
       {warnings.length > 0 && (
         <div className="rounded-md border border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] p-3 text-[11px] text-[color:var(--color-ink-muted)] space-y-0.5">
@@ -101,15 +106,25 @@ export function CreativePreviewShell({
 
 /** Reusable themed card surface shared across templates. The theme
  *  is passed explicitly so this can stay a server component (no
- *  `React.createContext`, which is client-only). */
+ *  `React.createContext`, which is client-only).
+ *
+ *  Phase 5A — optional `exportSlide` / `exportFrame` props become
+ *  `data-export-slide` / `data-export-frame` on the rendered
+ *  surface. The future local exporter uses these as locators (see
+ *  `_export_target_selectors` in
+ *  `scripts/export_visual_preview_stub.py`). No visual change. */
 export function PreviewCard({
   aspect = "square",
   themeId = "neutral",
+  exportSlide,
+  exportFrame,
   children,
   className = "",
 }: {
   aspect?: "square" | "portrait" | "story";
   themeId?: string;
+  exportSlide?: number;
+  exportFrame?: number;
   children: React.ReactNode;
   className?: string;
 }) {
@@ -120,9 +135,17 @@ export function PreviewCard({
       : aspect === "portrait"
         ? "aspect-[4/5]"
         : "aspect-square";
+  const exportAttrs: Record<string, string> = {};
+  if (typeof exportSlide === "number" && exportSlide > 0) {
+    exportAttrs["data-export-slide"] = String(exportSlide);
+  }
+  if (typeof exportFrame === "number" && exportFrame > 0) {
+    exportAttrs["data-export-frame"] = String(exportFrame);
+  }
   return (
     <div
       className={`relative w-full ${aspectClass} rounded-lg overflow-hidden shadow-sm ${preset.surfaceClass} ${className}`}
+      {...exportAttrs}
     >
       <div className={`absolute inset-0 opacity-60 ${preset.highlightClass}`} />
       <div className="relative h-full w-full p-4 flex flex-col">{children}</div>

@@ -295,3 +295,72 @@ Application code in Phase 4F does NOT read or write the proposed
 columns; they will be wired only after both the migration AND the
 proposed server actions (`prepareClientVisualPreviewAction` /
 `shareVisualPreviewWithClientAction`) ship in a later phase.
+
+## Phase 5C decision (shipped, fail-soft)
+
+Phase 5C picks the canonical model. Migration **012** is now the
+preferred path; **011 is marked SUPERSEDED** in its header and kept
+only as a fallback "Option A — MVP" if a future phase ever decides
+that one-visual-per-content-item is enough.
+
+### Why creative_assets wins
+
+| Concern | Option A (011, content_items extension) | Option B (012, creative_assets) |
+|---|---|---|
+| Carousel slides (5×) | ✗ collapses 5 slides into 1 column | ✓ one row per slide |
+| Story frames (3×) | ✗ same problem | ✓ one row per frame |
+| Variant re-export | ✗ overwrites | ✓ `variant_number` |
+| Internal vs client URL | ✗ both go on `content_items` | ✓ two columns on `creative_assets` |
+| Client view projection | re-extend `client_content_items_v` | new `client_creative_assets_v` (only client-safe columns) |
+| Schema drift risk | mixes visual lifecycle with content lifecycle | isolated table |
+
+### Phase 5C additions (no schema, no R2, no upload)
+
+- **`web/lib/data/visual-preview-schema.ts`** — fail-soft readiness
+  detector. Returns `{ ready, strategy, missing[], message, detection }`.
+  Probes `creative_assets` first (Option B), falls back to
+  `content_items` visual columns (Option A). Treats every
+  missing-relation / missing-column error code (`42P01`, `42703`,
+  `PGRST204`, `PGRST205`) as "schema not applied" — never throws.
+  Demo mode short-circuits to `not_configured` before any PostgREST
+  round-trip.
+- **`web/lib/actions/client-visual-preview.ts`** — three fail-soft
+  server actions:
+  - `prepareClientVisualPreviewAction(input)`
+  - `shareVisualPreviewWithClientAction(input)`
+  - `resetClientVisualPreviewAction(input)`
+  Each requires operator persona, then calls the readiness detector.
+  If the schema isn't applied → returns a structured failure with
+  `schema.message`. If the schema IS applied (future state) → still
+  refuses with "not implemented in Phase 5C" so a half-configured
+  environment never accidentally writes a row.
+- **`ClientVisualPreviewPanel`** in
+  `web/components/creative-preview/preview-side-panels.tsx` — server
+  component on the preview page. Disabled by design: no real share
+  button, no file picker, no form submit. Renders the schema /
+  approval / manifest / uploaded-asset state and a single "next
+  step" line so the operator knows what's missing.
+
+### Boundary
+
+No `/client/*` file imports any Phase 5C module. `client_content_items_v`
+remains untouched and still does not project `prompt_summary`. The
+proposed `client_creative_assets_v` view is in 012 but NOT applied,
+so there is no client surface for the visual lifecycle yet.
+
+### What still has to happen before real sharing
+
+1. Apply migration 012 (operator-approved, paste into Supabase SQL
+   editor; runs idempotent).
+2. Add R2 binding to `wrangler.jsonc` (`VISUAL_ASSETS_BUCKET` →
+   `yuvo-visual-assets`).
+3. Implement the upload pipe — Phase 5A real export + Phase 5C
+   `uploadVisualAssetAction` (still not built; the `upload_visual_asset_stub.py`
+   script's `--execute` refuses today).
+4. Implement the real `prepareClientVisualPreviewAction` body.
+5. Implement the real `shareVisualPreviewWithClientAction` body.
+6. Apply the `client_creative_assets_v` view block from 012.
+7. Add the portal page section that renders the shared visual.
+
+Phase 5D + 5E remain plan-only until 5C is checkpointed and 5D
+explicitly starts.

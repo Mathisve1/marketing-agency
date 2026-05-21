@@ -89,18 +89,23 @@ def test_dry_run_relative_url_exits_ok(stub, capsys):
     code, out, err = _run(stub, _base_argv(), capsys)
     assert code == stub.EXIT_OK_DRY_RUN, err
     payload = json.loads(out.split("\n\n")[0])
-    # Phase 4H bumped the schema version. Pin both `v1` and the
-    # phase tag so future drift surfaces clearly.
+    # Phase 5A re-tagged the manifest phase to advertise the new
+    # gated real-branch dispatch. Pin both `v1` and the phase tag so
+    # future drift surfaces clearly.
     assert payload["schema"] == "yuvo.studio/visual_export_manifest/v1"
-    assert payload["phase"] == "4h_local_exporter_scaffold"
+    assert payload["phase"] == "5a_local_exporter_scaffold"
     assert payload["content_item_id"] == VALID_UUID
     assert payload["preview_url"] == VALID_REL_URL
     assert payload["mode"] == "feed_post"
     assert payload["format"] == "png"
     assert payload["dry_run"] is True
     assert payload["would_execute"] is False
-    assert payload["real_export_status"] == "not_implemented_in_phase_4h"
-    assert payload["next_phase"] == "phase_4i_local_browser_exporter"
+    # Phase 5A — the manifest now reflects detection state. With the
+    # PERMITTED-list double-gate (currently empty), the status is
+    # always `dependency_missing` even on dev machines that already
+    # have Playwright installed.
+    assert payload["real_export_status"] == "dependency_missing"
+    assert payload["next_phase"] == "phase_5a_followup_real_screenshot_impl"
     safety = payload["safety"]
     assert safety["imports_browser_automation"] is False
     assert safety["makes_network_requests"] is False
@@ -216,10 +221,13 @@ def test_invalid_theme_id_fails(stub, capsys):
 
 
 def test_execute_refused_with_validation_pass(stub, capsys):
+    """Phase 5A — `--execute` without the confirmation phrase still
+    exits 2 (`EXIT_EXECUTE_REFUSED`). The refusal message now points
+    the operator at `--confirm-local-export`."""
     code, _out, err = _run(stub, _base_argv() + ["--execute"], capsys)
     assert code == stub.EXIT_EXECUTE_REFUSED
     assert "--execute" in err
-    assert "Phase 4H" in err
+    assert "--confirm-local-export" in err
     assert "[refused]" in err
 
 
@@ -310,7 +318,7 @@ def test_planned_output_path_in_manifest(stub, capsys):
     assert payload["planned_output_path"].endswith(".png")
     assert payload["planned_output_path"].startswith("./exports/")
     assert payload["schema"] == "yuvo.studio/visual_export_manifest/v1"
-    assert payload["phase"] == "4h_local_exporter_scaffold"
+    assert payload["phase"] == "5a_local_exporter_scaffold"
 
 
 def test_planned_output_path_combines_outputdir_and_filename(stub, capsys):
@@ -538,3 +546,233 @@ def test_phase_4h_stub_does_not_import_urllib_request():
         "let future drift add a network call without changing the "
         "visible import line."
     )
+
+
+# =========================================================================== #
+# Phase 5A additions
+# =========================================================================== #
+
+
+CORRECT_CONFIRMATION_PHRASE = "I UNDERSTAND THIS CREATES A LOCAL FILE ONLY"
+WRONG_CONFIRMATION_PHRASE = "i understand this creates a local file only"  # case-sensitive
+
+
+def test_phase_5a_constants_present(stub):
+    """Pin the new sentinel exit code + confirmation phrase + runtime
+    list so accidental drift in the contract surfaces clearly."""
+    assert stub.EXIT_DEPENDENCY_MISSING == 4
+    assert stub.LOCAL_EXPORT_CONFIRMATION_PHRASE == CORRECT_CONFIRMATION_PHRASE
+    assert isinstance(stub.APPROVED_BROWSER_RUNTIMES, tuple)
+    assert "playwright.sync_api" in stub.APPROVED_BROWSER_RUNTIMES
+    assert "pyppeteer" in stub.APPROVED_BROWSER_RUNTIMES
+
+
+def test_execute_without_confirmation_refused(stub, capsys):
+    code, out, err = _run(stub, _base_argv() + ["--execute"], capsys)
+    assert code == stub.EXIT_EXECUTE_REFUSED
+    assert "--confirm-local-export" in err
+    # Manifest is still emitted on stdout; pull the runtime block and
+    # confirm no real-branch side effects.
+    payload = json.loads(out.split("\n\n")[0])
+    rt = payload["runtime"]
+    assert rt["execute_requested"] is True
+    assert rt["confirmation_phrase_passed"] is False
+    assert rt["confirmation_phrase_matches"] is False
+    assert rt["real_export_attempted"] is False
+
+
+def test_execute_with_wrong_confirmation_refused(stub, capsys):
+    code, _out, err = _run(
+        stub,
+        _base_argv() + ["--execute", "--confirm-local-export", WRONG_CONFIRMATION_PHRASE],
+        capsys,
+    )
+    assert code == stub.EXIT_EXECUTE_REFUSED, err
+    assert "--confirm-local-export" in err
+
+
+def test_execute_with_correct_confirmation_no_runtime_exits_dependency_missing(
+    stub, capsys, monkeypatch
+):
+    """Force `_detect_browser_runtime` to return None so the test is
+    deterministic even if a runtime is later installed on the dev
+    machine. Asserts the new EXIT_DEPENDENCY_MISSING path."""
+    monkeypatch.setattr(stub, "_detect_browser_runtime", lambda: None)
+    code, out, err = _run(
+        stub,
+        _base_argv() + [
+            "--execute",
+            "--confirm-local-export",
+            CORRECT_CONFIRMATION_PHRASE,
+        ],
+        capsys,
+    )
+    assert code == stub.EXIT_DEPENDENCY_MISSING, err
+    assert "browser-automation dependency" in err.lower()
+    # Manifest still printed; pull the runtime block out.
+    payload = json.loads(out.split("\n\n")[0])
+    rt = payload["runtime"]
+    assert rt["execute_requested"] is True
+    assert rt["confirmation_phrase_passed"] is True
+    assert rt["confirmation_phrase_matches"] is True
+    assert rt["detected_runtime"] is None
+    assert rt["real_export_attempted"] is False
+
+
+def test_execute_with_correct_confirmation_runtime_present_defers_to_placeholder(
+    stub, capsys, monkeypatch
+):
+    """Simulate a future state where Playwright IS installed. The CLI
+    must NOT silently succeed — it defers to
+    `future_export_with_browser` which exits 3 (NOT_IMPLEMENTED) until
+    the real screenshot code is landed in a dependency-approved
+    commit."""
+    monkeypatch.setattr(
+        stub, "_detect_browser_runtime", lambda: "playwright.sync_api"
+    )
+    code, out, err = _run(
+        stub,
+        _base_argv() + [
+            "--execute",
+            "--confirm-local-export",
+            CORRECT_CONFIRMATION_PHRASE,
+        ],
+        capsys,
+    )
+    assert code == stub.EXIT_NOT_IMPLEMENTED, err
+    assert "future_export_with_browser" in err
+    payload = json.loads(out.split("\n\n")[0])
+    rt = payload["runtime"]
+    assert rt["detected_runtime"] == "playwright.sync_api"
+    assert rt["real_export_attempted"] is True
+
+
+def test_detect_browser_runtime_returns_none_today(stub):
+    """Today no approved runtime is installed in the repo. Pinned so a
+    future accidental install fires this test instead of silently
+    flipping the runtime branch."""
+    detected = stub._detect_browser_runtime()
+    assert detected is None, (
+        "An approved browser-automation runtime appears to be "
+        f"installed ({detected!r}). This is a real safety event: the "
+        "next commit must NOT enable the real-screenshot branch "
+        "without operator approval."
+    )
+
+
+def test_export_target_selectors_carousel_slide(stub, capsys):
+    code, out, _err = _run(
+        stub,
+        _base_argv() + ["--mode", "carousel", "--slide-number", "3"],
+        capsys,
+    )
+    assert code == stub.EXIT_OK_DRY_RUN
+    payload = json.loads(out.split("\n\n")[0])
+    sel = payload["export_target_selectors"]
+    assert sel["root"] == "[data-export-root]"
+    assert sel["mode_attribute"] == '[data-export-mode="carousel"]'
+    assert sel["target"] == '[data-export-slide="3"]'
+
+
+def test_export_target_selectors_story_frame(stub, capsys):
+    code, out, _err = _run(
+        stub,
+        _base_argv() + ["--mode", "story", "--frame-number", "2"],
+        capsys,
+    )
+    assert code == stub.EXIT_OK_DRY_RUN
+    payload = json.loads(out.split("\n\n")[0])
+    sel = payload["export_target_selectors"]
+    assert sel["mode_attribute"] == '[data-export-mode="story"]'
+    assert sel["target"] == '[data-export-frame="2"]'
+
+
+def test_export_target_selectors_single_card_modes_default_to_slide_one(stub, capsys):
+    for mode in ("feed_post", "static_image", "linkedin_image", "reel_thumbnail", "video_thumbnail"):
+        code, out, err = _run(stub, _base_argv() + ["--mode", mode], capsys)
+        assert code == stub.EXIT_OK_DRY_RUN, f"{mode}: {err}"
+        payload = json.loads(out.split("\n\n")[0])
+        sel = payload["export_target_selectors"]
+        assert sel["mode_attribute"] == f'[data-export-mode="{mode}"]'
+        assert sel["target"] == '[data-export-slide="1"]', mode
+
+
+def test_dry_run_runtime_block_reports_no_execute(stub, capsys):
+    code, out, _err = _run(stub, _base_argv(), capsys)
+    assert code == stub.EXIT_OK_DRY_RUN
+    payload = json.loads(out.split("\n\n")[0])
+    rt = payload["runtime"]
+    assert rt["execute_requested"] is False
+    assert rt["confirmation_phrase_passed"] is False
+    assert rt["confirmation_phrase_matches"] is False
+    assert rt["real_export_attempted"] is False
+
+
+def test_real_export_status_reflects_detection(stub, capsys, monkeypatch):
+    # No runtime → "dependency_missing"
+    monkeypatch.setattr(stub, "_detect_browser_runtime", lambda: None)
+    code, out, _err = _run(stub, _base_argv(), capsys)
+    assert code == stub.EXIT_OK_DRY_RUN
+    assert json.loads(out.split("\n\n")[0])["real_export_status"] == "dependency_missing"
+    # Simulated dep → "dependency_present_impl_pending"
+    monkeypatch.setattr(stub, "_detect_browser_runtime", lambda: "pyppeteer")
+    code, out, _err = _run(stub, _base_argv(), capsys)
+    assert code == stub.EXIT_OK_DRY_RUN
+    assert (
+        json.loads(out.split("\n\n")[0])["real_export_status"]
+        == "dependency_present_impl_pending"
+    )
+
+
+def test_runtime_detection_uses_find_spec_not_import(stub, monkeypatch):
+    """Pin that `_detect_browser_runtime` does NOT import the
+    candidate modules — it only calls `importlib.util.find_spec`. We
+    verify by patching `find_spec` to track calls and asserting the
+    module is not added to sys.modules."""
+    calls: list[str] = []
+
+    def fake_find_spec(name: str) -> object | None:
+        calls.append(name)
+        return None  # always missing
+
+    monkeypatch.setattr(
+        "importlib.util.find_spec", fake_find_spec, raising=True
+    )
+    # Make sure we start clean.
+    sys.modules.pop("playwright", None)
+    sys.modules.pop("playwright.sync_api", None)
+    sys.modules.pop("pyppeteer", None)
+
+    detected = stub._detect_browser_runtime()
+    assert detected is None
+    # Every approved runtime spec was probed via find_spec.
+    for spec_name in stub.APPROVED_BROWSER_RUNTIMES:
+        assert spec_name in calls
+    # And nothing was actually imported.
+    assert "playwright" not in sys.modules
+    assert "playwright.sync_api" not in sys.modules
+    assert "pyppeteer" not in sys.modules
+
+
+def test_execute_with_correct_confirmation_no_runtime_writes_no_file(
+    stub, capsys, monkeypatch, tmp_path
+):
+    """Belt-and-braces: even on the dependency-missing branch, the
+    output dir must remain untouched."""
+    monkeypatch.setattr(stub, "_detect_browser_runtime", lambda: None)
+    out_dir = tmp_path / "exports"
+    assert not out_dir.exists()
+    code, _out, _err = _run(
+        stub,
+        _base_argv() + [
+            "--output-dir",
+            str(out_dir),
+            "--execute",
+            "--confirm-local-export",
+            CORRECT_CONFIRMATION_PHRASE,
+        ],
+        capsys,
+    )
+    assert code == stub.EXIT_DEPENDENCY_MISSING, _err
+    assert not out_dir.exists()
+

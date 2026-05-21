@@ -518,3 +518,24 @@ Phase 4H ships zero new write surfaces, zero new external calls,
 zero new browser-automation imports, zero new file-system writes,
 and zero new env reads. The new dataclasses + flags are pure
 metadata. The existing safety contract is preserved.
+
+## Phase 5A additions (preview-side)
+
+Each `PreviewCard` rendered in the grid now carries a stable
+`data-export-slide` (carousel + single-card modes) or
+`data-export-frame` (story) attribute. `CreativePreviewShell`'s
+inner wrapper carries `data-export-root` + `data-export-mode`.
+These markers are pure DOM additions — no visual change, no
+client-facing exposure — and let the future local exporter (Phase
+5A-followup + Phase 5B) locate the screenshot target without
+relying on Tailwind class names.
+
+Note that the **focused** carousel slide / story frame (the
+expanded inline view) deliberately does NOT carry an export
+attribute so a Playwright/Puppeteer locator on
+`[data-export-slide="N"]` always matches exactly one element per
+preview. The grid cards remain the canonical screenshot targets.
+
+See `docs/visual_preview_export_readiness.md` for the full Phase 5A
+section — runtime detection, confirmation phrase, the double-gate
+permit list, manifest changes, and the safety boundaries.

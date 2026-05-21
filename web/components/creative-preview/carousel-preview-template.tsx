@@ -103,6 +103,7 @@ export function CarouselPreviewTemplate({
             <PreviewCard
               aspect="portrait"
               themeId={preview.theme.themeId}
+              exportSlide={s.slideNumber}
               className={
                 isFocused ? "ring-2 ring-[color:var(--color-accent)]" : ""
               }

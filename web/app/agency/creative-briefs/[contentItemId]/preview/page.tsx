@@ -42,12 +42,15 @@ import { CreativePreviewQAPanel } from "@/components/agents/creative-preview-qa-
 import { CopyExportBriefButton } from "@/components/creative-preview/copy-export-brief-button";
 import { CopyExportCommandButton } from "@/components/creative-preview/copy-export-command-button";
 import {
+  ClientVisualPreviewPanel,
   ExportManifestPanel,
   ExportReadinessPanel,
+  StorageStatusPanel,
   TemplateOptionsPanel,
   ThemeOptionsPanel,
   WhatHappensNextPanel,
 } from "@/components/creative-preview/preview-side-panels";
+import { checkVisualPreviewSchemaReadiness } from "@/lib/data/visual-preview-schema";
 
 export const dynamic = "force-dynamic";
 
@@ -121,6 +124,16 @@ export default async function CreativePreviewPage({
   const manifest = brief
     ? buildExportManifest({ preview, approvedInternal: Boolean(approval) })
     : null;
+
+  // Phase 5C — fail-soft schema readiness probe for the client-share
+  // panel. The detector NEVER throws; it returns "not_configured"
+  // on any missing-relation error, so the panel always renders.
+  const visualSchema = await checkVisualPreviewSchemaReadiness();
+  const hasInternalApproval = Boolean(approval);
+  const hasExportManifestReady =
+    manifest != null && manifest.exportReadiness === "ready";
+  // Phase 5C has no upload pipe yet; this stays false by definition.
+  const hasUploadedAsset = false;
   const exportBriefText = manifest
     ? renderExportManifestText(manifest, { previewUrl: baseHref })
     : "";
@@ -251,6 +264,13 @@ export default async function CreativePreviewPage({
               baseHref={baseHref}
               preserveTemplateId={currentTemplateId}
               currentThemeId={preview.theme.themeId}
+            />
+            <StorageStatusPanel />
+            <ClientVisualPreviewPanel
+              schema={visualSchema}
+              hasInternalApproval={hasInternalApproval}
+              hasExportManifestReady={hasExportManifestReady}
+              hasUploadedAsset={hasUploadedAsset}
             />
           </div>
         </div>

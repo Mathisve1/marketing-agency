@@ -319,6 +319,196 @@ export function ExportReadinessPanel({
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5C — Client visual preview status panel (read-only).
+//
+// Server component. Renders the lifecycle gate the future Phase 5D
+// client-share UI will plug into. ALWAYS disabled in Phase 5C: no
+// share button, no prepare button, no file picker, no server-action
+// form submit. The panel only explains what would be required for
+// real sharing to become available.
+
+import type { VisualPreviewSchemaStatus } from "@/lib/data/visual-preview-schema";
+
+export function ClientVisualPreviewPanel({
+  schema,
+  hasInternalApproval,
+  hasExportManifestReady,
+  hasUploadedAsset,
+}: {
+  schema: VisualPreviewSchemaStatus;
+  hasInternalApproval: boolean;
+  hasExportManifestReady: boolean;
+  hasUploadedAsset: boolean;
+}) {
+  // The next-required-step ladder. Order matters — show the FIRST
+  // missing prerequisite, not all of them, so the operator has one
+  // unambiguous action.
+  let nextStep: string;
+  if (schema.strategy === "not_configured") {
+    nextStep = "Apply migration 012 + configure R2 binding (Phase 5C+).";
+  } else if (schema.strategy === "content_items_extension") {
+    nextStep = "Migrate to creative_assets (migration 012) — Option A is superseded.";
+  } else if (!hasInternalApproval) {
+    nextStep = "Approve the creative brief internally before sharing.";
+  } else if (!hasExportManifestReady) {
+    nextStep = "Resolve the export manifest blockers (see manifest panel).";
+  } else if (!hasUploadedAsset) {
+    nextStep =
+      "Export + upload a PNG/JPG (Phase 5A real export + Phase 5C upload pipe).";
+  } else {
+    nextStep = "Phase 5D ships the actual prepare/share flow.";
+  }
+
+  return (
+    <div className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
+          Client visual preview
+        </div>
+        <Badge tone="neutral">phase 5C</Badge>
+      </div>
+      <div className="text-xs text-[color:var(--color-ink-muted)]">
+        Visual sharing is <strong>not enabled yet</strong>. This
+        preview is internal-only. Migration 012 and R2 storage must be
+        enabled before client visual sharing.
+      </div>
+      <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 text-[11px]">
+        <dt className="text-[color:var(--color-ink-faint)]">schema</dt>
+        <dd className="font-mono">
+          {schema.strategy}
+          {schema.ready ? (
+            <Badge tone="success">ready</Badge>
+          ) : (
+            <Badge tone="warn">not ready</Badge>
+          )}
+        </dd>
+        <dt className="text-[color:var(--color-ink-faint)]">approval</dt>
+        <dd>
+          {hasInternalApproval ? (
+            <Badge tone="success">approved internal</Badge>
+          ) : (
+            <Badge tone="neutral">not approved</Badge>
+          )}
+        </dd>
+        <dt className="text-[color:var(--color-ink-faint)]">manifest</dt>
+        <dd>
+          {hasExportManifestReady ? (
+            <Badge tone="success">ready</Badge>
+          ) : (
+            <Badge tone="warn">blockers</Badge>
+          )}
+        </dd>
+        <dt className="text-[color:var(--color-ink-faint)]">uploaded asset</dt>
+        <dd>
+          {hasUploadedAsset ? (
+            <Badge tone="success">present</Badge>
+          ) : (
+            <Badge tone="neutral">not yet</Badge>
+          )}
+        </dd>
+      </dl>
+      <div className="text-[11px] rounded-md border border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] px-2 py-1.5">
+        <span className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
+          next step
+        </span>{" "}
+        {nextStep}
+      </div>
+
+      {/*
+        DISABLED PHASE 5C controls — pure UI, never wired. The future
+        Phase 5D panel will mount real client components in their
+        place, each gated on `schema.ready` + approval + uploaded
+        asset.
+      */}
+      <div className="flex flex-wrap items-center gap-2 pt-1">
+        <button
+          type="button"
+          disabled
+          aria-disabled="true"
+          title="Disabled in Phase 5C. Phase 5D ships the real prepare action."
+          className="text-xs px-2.5 py-1.5 rounded-md border border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] text-[color:var(--color-ink-muted)] cursor-not-allowed opacity-70"
+        >
+          Prepare client preview (Phase 5D)
+        </button>
+        <button
+          type="button"
+          disabled
+          aria-disabled="true"
+          title="Disabled in Phase 5C. Sharing flips a row in creative_assets — migration 012 must be applied first."
+          className="text-xs px-2.5 py-1.5 rounded-md border border-[color:var(--color-hairline)] bg-[color:var(--color-cream-soft)] text-[color:var(--color-ink-muted)] cursor-not-allowed opacity-70"
+        >
+          Share with client (Phase 5D)
+        </button>
+        <span className="text-[11px] text-[color:var(--color-ink-faint)] italic">
+          No share button is wired. The client portal cannot see this
+          preview.
+        </span>
+      </div>
+
+      {schema.missing.length > 0 && (
+        <details className="text-[11px]">
+          <summary className="cursor-pointer text-[color:var(--color-ink-muted)]">
+            Missing prerequisites ({schema.missing.length})
+          </summary>
+          <ul className="mt-1 space-y-0.5 text-[color:var(--color-ink-muted)]">
+            {schema.missing.map((m) => (
+              <li key={m}>· {m}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5B — Storage / Upload status panel (placeholder only).
+//
+// Pure display. No buttons, no file picker, no server action, no
+// fetch. Explains the storage decision (R2, planned) and where the
+// future upload command will plug in.
+
+export function StorageStatusPanel() {
+  return (
+    <div className="rounded-md border border-[color:var(--color-hairline)] bg-white p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-faint)]">
+          Storage · Upload status
+        </div>
+        <Badge tone="neutral">phase 5B</Badge>
+      </div>
+      <div className="text-xs text-[color:var(--color-ink-muted)] space-y-1">
+        <div>
+          <strong>Upload is not enabled yet.</strong> Phase 5B only
+          defines the storage path and upload plan — no file is sent
+          anywhere from this page.
+        </div>
+        <div>
+          <strong>Planned storage:</strong> Cloudflare R2 bucket{" "}
+          <code className="font-mono">yuvo-visual-assets</code>{" "}
+          (binding <code className="font-mono">VISUAL_ASSETS_BUCKET</code>).
+        </div>
+        <div>
+          <strong>Object key shape:</strong>{" "}
+          <code className="font-mono text-[10px]">
+            visual-assets/&#123;workspace_id&#125;/&#123;content_item_id&#125;/&#123;template_id&#125;/&#123;theme_id&#125;/&#123;filename&#125;
+          </code>
+        </div>
+        <div>
+          <strong>Lifecycle today:</strong> local export only (Phase
+          5A). Upload + <code className="font-mono">creative_assets</code>{" "}
+          row + client share land in Phase 5C under explicit operator
+          approval.
+        </div>
+      </div>
+      <div className="text-[10px] text-[color:var(--color-ink-faint)] italic">
+        No file picker, no upload button, no client share on this page.
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // "What happens next?" panel — explains 4D / 4E / 4F roadmap in-place.
 
 export function WhatHappensNextPanel() {

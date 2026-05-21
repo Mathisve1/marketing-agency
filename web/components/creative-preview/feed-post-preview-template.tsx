@@ -19,7 +19,11 @@ export function FeedPostPreviewTemplate({
         1 × 4:5 ({a.channel ?? "feed"} post)
       </div>
       <div className="grid gap-3 max-w-md">
-        <PreviewCard aspect="portrait" themeId={preview.theme.themeId}>
+        <PreviewCard
+          aspect="portrait"
+          themeId={preview.theme.themeId}
+          exportSlide={1}
+        >
           <div className="text-[10px] uppercase tracking-[0.18em] text-white/60">
             {a.channel ?? "feed"} · {a.format ?? "feed_post"}
           </div>

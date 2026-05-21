@@ -2,12 +2,29 @@
 -- MIGRATION 011 — Client-safe visual preview lifecycle (Phase 4F PROPOSAL)
 -- =============================================================================
 --
---   STATUS: **PROPOSAL ONLY — DO NOT APPLY YET.**
+--   STATUS: **PROPOSAL ONLY — DO NOT APPLY.**
+--           **SUPERSEDED BY MIGRATION 012 (Phase 5C decision).**
 --
---   This file documents the schema change Phase 4F is proposing to ship
---   when client-visible visual sharing lands. It is NOT applied in the
---   current Phase 4F build chunk. To apply it later, the operator must
---   paste it manually into the Supabase SQL editor and confirm.
+--   This file remains in the repo for two reasons:
+--     1. Audit trail of the Phase 4F design conversation.
+--     2. Fallback "Option A — MVP" path if Phase 5D ever decides that
+--        a one-visual-per-content-item shape is enough and a per-slide
+--        `creative_assets` table is overkill.
+--
+--   Phase 5C chose Option B instead. Carousels (5 slides) and stories
+--   (3 frames) cannot be modeled cleanly by a single
+--   `client_safe_visual_url` column on `content_items`. The canonical
+--   schema lands in:
+--
+--     supabase/migrations/012_creative_assets_proposal.sql
+--
+--   The dashboard's schema-readiness detector
+--   (`web/lib/data/visual-preview-schema.ts`) checks for `creative_assets`
+--   first; this 011 path is only considered if 012 is intentionally
+--   shelved.
+--
+--   The rest of this file is the original Phase 4F proposal text, kept
+--   verbatim so the decision history is searchable.
 --
 --   Implements Option A from `docs/client_safe_visual_preview_plan.md`:
 --   extend `content_items` with three columns that mirror the existing
